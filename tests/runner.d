@@ -18,5 +18,10 @@ int main(string[] args)
 		"tests.harness_test",
 		"tests.core.ending_test",
 		"tests.util.select_test",
+		"tests.multiformats.varint_test",
+		"tests.multiformats.base58_test",
+		"tests.multiformats.multihash_test",
+		"tests.multiformats.multibase_test",
+		"tests.multiformats.multiaddr_test",
 	);
 }
