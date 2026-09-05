@@ -1,6 +1,6 @@
 module tests.transport.webrtc.state_test;
 
-import libp2p.transport.webrtc.stream.state;
+import libp2p.transport.webrtc.state;
 import fluent.asserts;
 
 // Runs `f` (expected to throw a StreamStateException) and returns its io kind.

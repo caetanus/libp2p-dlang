@@ -6,11 +6,11 @@ import std.digest : toHexString;
 
 import libp2p.transport.webrtc.noise;
 import libp2p.transport.webrtc.fingerprint : Fingerprint;
-import libp2p.core.stream : ByteStream;
+import libp2p.core.stream;
 import libp2p.core.peer_id : PeerId;
 import libp2p.crypto.keys : Keypair;
 import fluent.asserts;
-import tests.util.fiberpipe : runPair;
+import tests.util.pipe : runPair;
 
 private ubyte[32] fromHex(string h)
 {
@@ -43,10 +43,10 @@ unittest
 
 	PeerId serverSawClient, clientSawServer;
 
-	runPair((ByteStream a) {
+	runPair((Stream a) {
 		// WebRTC server = Noise initiator.
 		serverSawClient = inbound(serverKp, a, clientFp, serverFp);
-	}, (ByteStream b) {
+	}, (Stream b) {
 		// WebRTC client = Noise responder.
 		clientSawServer = outbound(clientKp, b, serverFp, clientFp);
 	});

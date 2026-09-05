@@ -58,5 +58,13 @@ int main(string[] args)
 		"tests.discovery.mdns_service_test",
 		"tests.muxer.mplex_test",
 		"tests.muxer.mplex_conn_test",
+		"tests.transport.webrtc.fingerprint_test",
+		"tests.transport.webrtc.sdp_test",
+		"tests.transport.webrtc.wire_test",
+		"tests.transport.webrtc.state_test",
+		"tests.transport.webrtc.stream_test",
+		"tests.transport.webrtc.noise_test",
+		"tests.transport.webrtc.transport_test",
+		"tests.transport.webrtc.e2e_test",
 	);
 }

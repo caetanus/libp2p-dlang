@@ -1,11 +1,10 @@
-module tests.transport.webrtc.framed_test;
+module tests.transport.webrtc.wire_test;
 
 import std.typecons : Nullable;
-import libp2p.transport.webrtc.stream.framed;
-import libp2p.wire.webrtc : Message;
-import libp2p.core.stream : ByteStream;
+import libp2p.transport.webrtc.wire : Message, FramedDc, encodeFrame, MAX_DATA_LEN, MAX_MSG_LEN;
+import libp2p.core.stream;
 import fluent.asserts;
-import tests.util.fiberpipe : runPair;
+import tests.util.pipe : runPair;
 
 @("max data len: the largest message frames to exactly MAX_MSG_LEN (rust parity)")
 unittest
@@ -32,7 +31,7 @@ unittest
 	bool sawEof;
 	auto hello = cast(ubyte[]) "hello".dup;
 
-	runPair((ByteStream a) {
+	runPair((Stream a) {
 		auto f = new FramedDc(a);
 		Message m1;
 		m1.message = hello;
@@ -42,7 +41,7 @@ unittest
 		f.send(m1);
 		f.send(m2);
 		a.close();
-	}, (ByteStream b) {
+	}, (Stream b) {
 		auto f = new FramedDc(b);
 		for (auto r = f.next(); !r.isNull; r = f.next())
 			got ~= r.get;

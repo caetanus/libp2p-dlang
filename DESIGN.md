@@ -430,4 +430,17 @@ the one thing not carried; mDNS
 (`discovery/mdns.d`: the DNS codec and a responder on 224.0.0.251:5353 that
 fills the peerstore); and mplex (`muxer/mplex.d`) with rust's two ceilings. Both
 muxers now deliver streams the peer opened before the session ended, and only
-then report the ending.
+then report the ending. DNS moved to c-ares driven from a fiber. Last,
+webrtc-direct (`transport/webrtc/`) on d-webrtc's sans-io engine (a dub path
+dependency on `../d-webrtc`): a `CapableTransport` — the swarm's second kind of
+transport, one that secures and multiplexes itself and hands over an
+`UpgradedConn` — with one UDP socket per listener demultiplexed by remote
+address, a session per remote whose ticker fiber drives the engine's timers,
+data channels as streams under the FIN/STOP_SENDING/RESET framing, and Noise on
+the first channel with both certificate fingerprints in the prologue. Two
+limits are d-webrtc's to grow and are stated in the module: the Noise channel is
+opened by DCEP rather than pre-negotiated as id 0, and SCTP streams are not
+reset when a libp2p stream ends; both interoperate between two of us and not
+yet with rust or a browser. `contract/` is empty: every test of the laundered
+code either lives in `tests/` against the new architecture or was judged a
+shape test and retired with a note in its commit.

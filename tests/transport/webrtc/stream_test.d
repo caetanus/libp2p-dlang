@@ -1,10 +1,11 @@
 module tests.transport.webrtc.stream_test;
 
 import libp2p.transport.webrtc.stream;
-import libp2p.transport.webrtc.stream.state : StreamStateException, IoErrorKind;
-import libp2p.core.stream : ByteStream;
+import libp2p.transport.webrtc.state : StreamStateException, IoErrorKind;
+import libp2p.core.ending : EndOfStream;
+import libp2p.core.stream;
 import fluent.asserts;
-import tests.util.fiberpipe : runPair;
+import tests.util.pipe : runPair;
 
 @("stream round-trips a multi-chunk payload and signals EOF after graceful close")
 unittest
@@ -17,21 +18,18 @@ unittest
 	ubyte[] got;
 	bool sawEof;
 
-	runPair((ByteStream a) {
-		auto s = new Stream(a);
-		s.writeBytes(payload);
+	runPair((Stream a) {
+		auto s = new WebRtcStream(a);
+		s.write(payload);
 		s.close(); // graceful FIN
-	}, (ByteStream b) {
-		auto s = new Stream(b);
+	}, (Stream b) {
+		auto s = new WebRtcStream(b);
 		auto buf = new ubyte[4096];
-		for (;;)
-		{
-			immutable n = s.readAvailable(buf);
-			if (n == 0)
-				break; // EOF from the peer's FIN
-			got ~= buf[0 .. n];
-		}
-		sawEof = true;
+		try
+			for (;;)
+				got ~= buf[0 .. s.read(buf)];
+		catch (EndOfStream)
+			sawEof = true; // the peer's FIN, once everything before it was handed over
 	});
 
 	sawEof.should.equal(true);
@@ -42,20 +40,18 @@ unittest
 @("stream reset makes the peer's subsequent read fail with ConnectionReset")
 unittest
 {
-	size_t firstRead = size_t.max;
 	IoErrorKind caught = IoErrorKind.other;
 	bool threw;
 
-	runPair((ByteStream a) {
-		auto s = new Stream(a);
+	runPair((Stream a) {
+		auto s = new WebRtcStream(a);
 		s.reset(); // abrupt RESET, no data
-	}, (ByteStream b) {
-		auto s = new Stream(b);
+	}, (Stream b) {
+		auto s = new WebRtcStream(b);
 		auto buf = new ubyte[64];
-		// The RESET frame carries no data, so the first read reports EOF (0)...
-		firstRead = s.readAvailable(buf);
+		// The RESET frame carries no data, so the read hits the reset barrier.
 		try
-			s.readAvailable(buf); // ...and the next read hits the reset barrier.
+			s.read(buf);
 		catch (StreamStateException e)
 		{
 			threw = true;
@@ -63,7 +59,6 @@ unittest
 		}
 	});
 
-	firstRead.should.equal(0);
 	threw.should.equal(true);
 	caught.should.equal(IoErrorKind.connectionReset);
 }
@@ -74,20 +69,24 @@ unittest
 	IoErrorKind caught = IoErrorKind.other;
 	bool threw;
 
-	runPair((ByteStream a) {
-		auto s = new Stream(a);
+	runPair((Stream a) {
+		auto s = new WebRtcStream(a);
 		s.close();
 		try
-			s.writeBytes(cast(ubyte[])[1, 2, 3]);
+			s.write(cast(ubyte[])[1, 2, 3]);
 		catch (StreamStateException e)
 		{
 			threw = true;
 			caught = e.kind;
 		}
-	}, (ByteStream b) {
-		auto s = new Stream(b);
+	}, (Stream b) {
+		auto s = new WebRtcStream(b);
 		auto buf = new ubyte[16];
-		s.readAvailable(buf); // drain the FIN so the writer side can terminate
+		try
+			s.read(buf); // drain the FIN so the writer side can terminate
+		catch (EndOfStream)
+		{
+		}
 	});
 
 	threw.should.equal(true);

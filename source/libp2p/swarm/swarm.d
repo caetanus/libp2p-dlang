@@ -29,6 +29,7 @@ import libp2p.core.stream : Stream;
 import libp2p.core.upgrade;
 import libp2p.crypto.keys : Keypair, PublicKey;
 import libp2p.multiformats.multiaddr : Multiaddr;
+import libp2p.muxer.muxer : Muxer;
 import libp2p.muxer.yamux : YamuxFactory;
 import libp2p.security.noise : NoiseTransport;
 import libp2p.swarm.connection;
@@ -50,6 +51,29 @@ struct SwarmConfig
 	Duration idleTimeout = Duration.zero;
 	Duration dialTimeout = 10.seconds;
 	Duration handshakeTimeout = 10.seconds;
+}
+
+/// A connection that arrives already authenticated and multiplexed: what a
+/// transport with its own security and muxing (webrtc-direct) hands over.
+struct UpgradedConn
+{
+	Muxer muxer;
+	PeerId remotePeer;
+	PublicKey remoteKey;
+	Multiaddr localAddr;
+	Multiaddr remoteAddr;
+}
+
+/// A transport that does the whole upgrade itself. The swarm still owns
+/// admission: limits, the gater, the pool.
+interface CapableTransport
+{
+	bool canHandle(const Multiaddr addr);
+	UpgradedConn dial(const Multiaddr remote, Nullable!PeerId expected);
+	/// Start listening; `onInbound` is called with each connection, on a fiber
+	/// of the transport's. Returns the address actually listening on.
+	Multiaddr listen(const Multiaddr local, void delegate(UpgradedConn) onInbound);
+	void close() nothrow;
 }
 
 /// Policy on who may connect. Every method answers true by default.
@@ -83,6 +107,8 @@ final class Swarm
 	private Keypair identity;
 	private SwarmConfig cfg;
 	private Transport[] transports;
+	private CapableTransport[] capable;
+	private Multiaddr[] capableAddrs;
 	private UpgradeConfig upgradeCfg;
 	private ConnectionGater gater;
 	private Limiter limiter;
@@ -136,11 +162,23 @@ final class Swarm
 		transports ~= t;
 	}
 
+	/// A transport that secures and multiplexes on its own.
+	void addCapableTransport(CapableTransport t)
+	{
+		capable ~= t;
+	}
+
 	// --- listening ---------------------------------------------------------------------
 
 	void listen(Multiaddr addr)
 	{
 		enforce(!closed, "swarm: closed");
+		foreach (t; capable)
+			if (t.canHandle(addr))
+			{
+				capableAddrs ~= t.listen(addr, (UpgradedConn up) { admitCapable(up, Endpoint.listener); });
+				return;
+			}
 		auto l = transportFor(addr).listen(addr);
 		listeners ~= l;
 		fibers.spawn({ acceptLoop(l); });
@@ -151,7 +189,22 @@ final class Swarm
 		Multiaddr[] out_;
 		foreach (l; listeners)
 			out_ ~= l.address;
-		return out_;
+		return out_ ~ capableAddrs;
+	}
+
+	/// Admission for a connection a capable transport upgraded itself.
+	private Connection admitCapable(UpgradedConn up, Endpoint role)
+	{
+		scope (failure)
+			up.muxer.close();
+		if (gater !is null && !gater.allowPeer(up.remotePeer, role))
+			throw new Exception("swarm: gater refused " ~ up.remotePeer.toString);
+		auto established = limiter.established(role, up.remotePeer);
+		Upgraded u;
+		u.muxer = up.muxer;
+		u.remotePeer = up.remotePeer;
+		u.remoteKey = up.remoteKey;
+		return admit(u, role, up.localAddr, up.remoteAddr, established);
 	}
 
 	// --- dialing -----------------------------------------------------------------------
@@ -229,6 +282,14 @@ final class Swarm
 		auto pending = limiter.pending(Endpoint.dialer);
 		scope (exit)
 			pending.release(); // and by unwinding, whichever comes first
+
+		foreach (t; capable)
+			if (t.canHandle(addr))
+			{
+				auto up = withTimeout(cfg.dialTimeout + cfg.handshakeTimeout, "dial " ~ addr.toString,
+					() => t.dial(addr, expected));
+				return admitCapable(up, Endpoint.dialer);
+			}
 
 		RawConn raw = withTimeout(cfg.dialTimeout, "dial " ~ addr.toString, () => transportFor(addr).dial(addr));
 		scope (failure)
@@ -349,6 +410,8 @@ final class Swarm
 		closed = true;
 		foreach (l; listeners)
 			l.close(); // wakes the accept loops, which then leave
+		foreach (t; capable)
+			t.close();
 		fibers.stopAll();
 		foreach (c; pool.dup)
 			c.close();

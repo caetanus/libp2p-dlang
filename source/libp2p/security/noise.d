@@ -97,6 +97,26 @@ SecureConn noiseResponder(Stream raw, Keypair identity)
 	return hs.finish(raw, remote);
 }
 
+/**
+ * The XX handshake alone, with a prologue, returning who the peer is. For
+ * transports that are already encrypted (webrtc-direct: DTLS) and use Noise
+ * only to prove identity.
+ */
+PublicKey noiseAuthenticate(Stream raw, Keypair identity, bool initiator, const(ubyte)[] prologue)
+{
+	auto hs = Handshake(initiator, identity, prologue);
+	if (initiator)
+	{
+		raw.writeFrame(hs.writeMessage([]));
+		auto remote = hs.verifyPayload(hs.readMessage(raw.readFrame()));
+		raw.writeFrame(hs.writeMessage(hs.ownPayload()));
+		return remote;
+	}
+	cast(void) hs.readMessage(raw.readFrame());
+	raw.writeFrame(hs.writeMessage(hs.ownPayload()));
+	return hs.verifyPayload(hs.readMessage(raw.readFrame()));
+}
+
 // --- framing ------------------------------------------------------------------
 
 private enum maxFrame = 65_535;
@@ -339,7 +359,7 @@ private struct X25519
 	}
 }
 
-private struct Handshake
+package struct Handshake
 {
 	bool initiator;
 	Keypair identity;
@@ -349,12 +369,12 @@ private struct Handshake
 	bool haveRs;
 	int step; // which message is next: 0, 1, 2
 
-	this(bool initiator, Keypair identity)
+	this(bool initiator, Keypair identity, const(ubyte)[] prologue = null)
 	{
 		this.initiator = initiator;
 		this.identity = identity;
 		ss.initialize("Noise_XX_25519_ChaChaPoly_SHA256");
-		ss.mixHash([]); // empty prologue
+		ss.mixHash(prologue); // empty for libp2p noise; webrtc binds both fingerprints here
 		s = X25519.generate();
 	}
 

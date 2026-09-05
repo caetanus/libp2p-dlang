@@ -16,7 +16,10 @@
 	"dependencies": {
 		"vibe-core": "~>2.0",
 		"libsodiumd": "~>0.2",
-		"openssl": "~>3.4"
+		"openssl": "~>3.4",
+		"webrtc": {
+			"path": "../d-webrtc"
+		}
 	},
 	"configurations": [
 		{
@@ -61,6 +64,7 @@
 	],
 	"libs": [
 		"crypto",
-		"cares"
+		"cares",
+		"ssl"
 	]
 }

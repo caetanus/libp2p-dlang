@@ -26,7 +26,8 @@ string negotiateDialer(Stream s, const(string)[] protocols)
 {
 	enforce(protocols.length > 0, "multistream: nothing to propose");
 	s.write(frame(multistreamHeader) ~ frame(protocols[0]));
-	enforce(readMessage(s) == multistreamHeader, "multistream: peer did not send the header");
+	immutable header = readMessage(s);
+	enforce(header == multistreamHeader, "multistream: peer did not send the header, but '" ~ header ~ "'");
 	foreach (i, proto; protocols)
 	{
 		if (i > 0)
@@ -43,7 +44,8 @@ string negotiateDialer(Stream s, const(string)[] protocols)
 string negotiateListener(Stream s, const(string)[] supported)
 {
 	writeMessage(s, multistreamHeader);
-	enforce(readMessage(s) == multistreamHeader, "multistream: peer did not send the header");
+	immutable header = readMessage(s);
+	enforce(header == multistreamHeader, "multistream: peer did not send the header, but '" ~ header ~ "'");
 	while (true)
 	{
 		immutable proposal = readMessage(s);

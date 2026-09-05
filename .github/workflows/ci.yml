@@ -1,6 +1,7 @@
 name: CI
 
-# Two checks, both of which do the real thing or fail. The gate runs the suite
+# Two checks, both of which do the real thing or fail. d-webrtc is a sibling
+# checkout; the repository variable D_WEBRTC_REPO says where to clone it from. The gate runs the suite
 # and also fails on a crash, a leaked eventcore handle, or a task still running
 # at exit. The interop run talks to a real rust-libp2p node in both directions,
 # which is the only check that can catch a shared misreading of the protocol.
@@ -21,12 +22,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: libp2p-dlang
+      - name: fetch d-webrtc beside it
+        run: git clone --depth 1 "${{ vars.D_WEBRTC_REPO }}" d-webrtc
       - uses: dlang-community/setup-dlang@v2
         with:
           compiler: dmd-latest
       - name: install libsodium and openssl
         run: sudo apt-get update && sudo apt-get install -y libsodium-dev libssl-dev libc-ares-dev
       - name: run the gate
+        working-directory: libp2p-dlang
         run: ./tools/run-tests.sh
 
   interop:
@@ -34,14 +40,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: libp2p-dlang
+      - name: fetch d-webrtc beside it
+        run: git clone --depth 1 "${{ vars.D_WEBRTC_REPO }}" d-webrtc
       - uses: dlang-community/setup-dlang@v2
         with:
           compiler: dmd-latest
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: interop/rust-peer
+          workspaces: libp2p-dlang/interop/rust-peer
       - name: install libsodium and openssl
         run: sudo apt-get update && sudo apt-get install -y libsodium-dev libssl-dev libc-ares-dev
       - name: both directions
+        working-directory: libp2p-dlang
         run: ./interop/run-interop.sh
