@@ -16,5 +16,7 @@ int main(string[] args)
 
 	return args.runTests!(
 		"tests.harness_test",
+		"tests.core.ending_test",
+		"tests.util.select_test",
 	);
 }

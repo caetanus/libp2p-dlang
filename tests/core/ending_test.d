@@ -28,7 +28,7 @@ unittest
 	// ...and still answers to the broader questions, the way go-libp2p's
 	// `errors.Is(err, ErrReset)` does, but without a hand-written matcher.
 	(cast(ConnClosed) typed !is null).should.equal(true);
-	(cast(Ended) typed !is null).should.equal(true);
+	(cast(Ending) typed !is null).should.equal(true);
 }
 
 // Translating an error must never be the same act as discarding it. The layer
@@ -53,7 +53,7 @@ unittest
 	auto typed = asEnding(new Exception("Reached end of stream while reading data"), "tcp");
 
 	(cast(EndOfStream) typed !is null).should.equal(true);
-	(cast(Ended) typed !is null).should.equal(true);
+	(cast(Ending) typed !is null).should.equal(true);
 	(cast(ConnResetByPeer) typed !is null).should.equal(false);
 }
 
@@ -68,7 +68,7 @@ unittest
 	auto typed = asEnding(original, "tcp");
 
 	(typed is original).should.equal(true); // untouched, not even rewrapped
-	(cast(Ended) typed !is null).should.equal(false);
+	(cast(Ending) typed !is null).should.equal(false);
 }
 
 // Under a muxer session the transport ending is not one substream finishing, it
@@ -96,7 +96,7 @@ unittest
 	(cast(ConnResetByPeer) typed !is null).should.equal(true);
 }
 
-// A failure under a session is still a failure. `catch (Ended)`, written to
+// A failure under a session is still a failure. `catch (Ending)`, written to
 // absorb ordinary shutdown, must not absorb a peer breaking the protocol.
 @("ending: a genuine failure under a session stays a failure")
 unittest
@@ -105,5 +105,5 @@ unittest
 	auto typed = asConnEnding(original, "yamux");
 
 	(typed is original).should.equal(true);
-	(cast(Ended) typed !is null).should.equal(false);
+	(cast(Ending) typed !is null).should.equal(false);
 }
