@@ -24,6 +24,20 @@
 			"targetType": "library"
 		},
 		{
+			"name": "interop-peer",
+			"targetType": "executable",
+			"targetName": "interop-peer",
+			"mainSourceFile": "interop/dpeer/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/dpeer"
+			],
+			"importPaths": [
+				"source",
+				"interop/dpeer"
+			]
+		},
+		{
 			"name": "ut",
 			"targetType": "executable",
 			"targetName": "libp2p-test",

@@ -136,7 +136,7 @@ unittest
 		auto s = m.accept();
 		served = negotiateListener(s, [identifyProtocol]);
 		sendIdentify(s, self);
-		s.close(); // the FIN is what ends the reader's message
+		s.close();
 	});
 	served.should.equal(identifyProtocol);
 	auto recovered = PeerId.fromPublicKey(PublicKey.fromProtobuf(got.publicKey));

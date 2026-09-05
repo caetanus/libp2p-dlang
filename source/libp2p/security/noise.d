@@ -310,6 +310,8 @@ private struct SymmetricState
 	void split(out CipherState c1, out CipherState c2)
 	{
 		ubyte[hashLength] k1, k2;
+		k1[] = 0;
+		k2[] = 0;
 		hkdf(ck, [], k1, k2);
 		c1.initializeKey(k1[]);
 		c2.initializeKey(k2[]);
@@ -462,9 +464,15 @@ private ubyte[hashLength] hmac(scope const(ubyte)[] key, scope const(ubyte)[] da
 	return out_;
 }
 
-private void hkdf(const(ubyte)[] chainingKey, const(ubyte)[] ikm, out ubyte[hashLength] out1, out ubyte[hashLength] out2) @safe
+// `ref`, not `out`: a caller passes its chaining key as both the input and the
+// first output, and an `out` parameter is zeroed on entry — before the input
+// is read. Everything is computed into temporaries first for the same reason.
+private void hkdf(const(ubyte)[] chainingKey, const(ubyte)[] ikm, ref ubyte[hashLength] out1,
+	ref ubyte[hashLength] out2) @safe
 {
 	immutable temp = hmac(chainingKey, ikm);
-	out1 = hmac(temp[], [cast(ubyte) 1]);
-	out2 = hmac(temp[], out1[] ~ cast(ubyte) 2);
+	immutable a = hmac(temp[], [cast(ubyte) 1]);
+	immutable b = hmac(temp[], a[] ~ cast(ubyte) 2);
+	out1 = a;
+	out2 = b;
 }

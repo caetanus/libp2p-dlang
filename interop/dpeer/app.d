@@ -1,0 +1,162 @@
+/**
+ * Our end of the interop wire: a D node that speaks the same line protocol as
+ * `interop/rust-peer`, so `interop/run-interop.sh` can drive both against each
+ * other in either direction.
+ *
+ *   LISTEN <multiaddr>/p2p/<peer>   ready, this is where to reach me
+ *   CONNECTED <peer>
+ *   PING <peer> <micros>            a ping round trip completed
+ *   IDENTIFY <peer> <agent>         the peer told us who it is
+ *   OK                              both happened
+ *   CLOSED <peer>
+ *   ERROR <what>                    something went wrong; the exit code says so too
+ *
+ * Stack: TCP -> multistream-select -> Noise XX -> yamux -> ping / identify.
+ */
+module interop.dpeer.app;
+
+import core.time : Duration, msecs, seconds, MonoTime;
+import std.stdio : writeln, writefln, stdout;
+
+import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+
+import libp2p.core.peer_id : PeerId;
+import libp2p.host.host;
+import libp2p.multiformats.multiaddr : Multiaddr;
+import libp2p.protocol.identify;
+import libp2p.protocol.ping;
+
+private enum deadline = 30.seconds;
+
+private void say(Args...)(string fmt, Args args)
+{
+	writefln(fmt, args);
+	stdout.flush();
+}
+
+private final class Reporter : Notifiee
+{
+	bool gone;
+
+	void connected(Connection c)
+	{
+		say("CONNECTED %s", c.remotePeer);
+	}
+
+	void disconnected(Connection c)
+	{
+		say("CLOSED %s", c.remotePeer);
+		gone = true;
+	}
+}
+
+int main(string[] args)
+{
+	immutable mode = args.length > 1 ? args[1] : "listen";
+	int rc;
+	runTask(() nothrow {
+		try
+			rc = run(mode, args.length > 2 ? args[2] : null);
+		catch (Exception e)
+		{
+			try
+				say("ERROR %s", e.msg);
+			catch (Exception)
+			{
+			}
+			rc = 1;
+		}
+		try
+			exitEventLoop();
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	return rc;
+}
+
+private int run(string mode, string target)
+{
+	HostConfig cfg;
+	cfg.agentVersion = "libp2p-dlang/interop";
+	cfg.swarm.idleTimeout = 30.seconds;
+	auto host = Host.create(cfg);
+	scope (exit)
+		host.close();
+
+	bool pinged, identified;
+	PingConfig pc;
+	pc.interval = 200.msecs;
+	pc.timeout = 5.seconds;
+	auto ping = new Ping(host, pc);
+	ping.onResult = (PeerId p, Duration rtt) {
+		say("PING %s %d", p, rtt.total!"usecs");
+		pinged = true;
+	};
+	ping.onFailure = (PeerId p, Exception e) { say("ERROR ping to %s failed: %s", p, e.msg); };
+	auto ident = new IdentifyService(host);
+	ident.onIdentified = (IdentifyInfo i) {
+		say("IDENTIFY %s %s", i.peer, i.agentVersion);
+		identified = true;
+	};
+	auto reporter = new Reporter;
+	host.addNotifiee(reporter);
+
+	immutable until = MonoTime.currTime + deadline;
+	bool ok;
+
+	switch (mode)
+	{
+	case "listen":
+		host.listen(Multiaddr.parse("/ip4/127.0.0.1/tcp/0"));
+		say("LISTEN %s/p2p/%s", host.addrs[0], host.id);
+		// The peer that dials drives; we stay until it leaves, and report OK as
+		// soon as our own half is done.
+		while (MonoTime.currTime < until && !reporter.gone)
+		{
+			if (pinged && identified && !ok)
+			{
+				say("OK");
+				ok = true;
+			}
+			sleep(20.msecs);
+		}
+		break;
+
+	case "dial":
+		if (target is null)
+			throw new Exception("dial needs a multiaddr");
+		auto full = Multiaddr.parse(target);
+		PeerId peer;
+		Multiaddr addr;
+		foreach (c; full.components)
+		{
+			if (c.name == "p2p")
+				peer = PeerId.fromBytes(c.value);
+			else
+				addr = addr ~ Multiaddr.parse("/" ~ c.name ~ (c.protocol.size != 0 ? "/" ~ c.text : ""));
+		}
+		if (peer.bytes.length == 0)
+			throw new Exception("dial needs a /p2p/<peer> component");
+		host.connect(peer, [addr]);
+		while (MonoTime.currTime < until && !(pinged && identified))
+			sleep(20.msecs);
+		if (pinged && identified)
+		{
+			say("OK");
+			ok = true;
+		}
+		break;
+
+	default:
+		throw new Exception("unknown mode: " ~ mode);
+	}
+
+	if (!ok)
+	{
+		say("ERROR timed out after %s (pinged=%s, identified=%s)", deadline, pinged, identified);
+		return 1;
+	}
+	return 0;
+}

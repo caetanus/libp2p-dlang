@@ -1,8 +1,10 @@
 /**
  * identify (`/ipfs/id/1.0.0`): who are you, and what did you see me as.
  *
- * The side that wants to know opens the stream and reads one protobuf message
- * to end-of-stream; the other side writes its description and closes. The
+ * The side that wants to know opens the stream and reads one varint
+ * length-prefixed protobuf message; the other side writes its description and
+ * closes. (rust and go both frame it this way; a reader that waited for EOF
+ * would work between two copies of itself and with nobody else.) The
  * service does this for every new connection on a fiber it owns, verifies that
  * the key in the message is the key the handshake proved, and records what it
  * learned in the peerstore. The observed address the peer reports is how a
@@ -15,7 +17,6 @@ import std.algorithm.searching : canFind;
 import std.exception : enforce;
 import std.typecons : Nullable;
 
-import libp2p.core.ending : Ending;
 import libp2p.core.peer_id : PeerId;
 import libp2p.core.stream;
 import libp2p.crypto.keys : PublicKey;
@@ -53,30 +54,15 @@ struct Identify
 	}
 }
 
-/// Read one identify message: everything until the peer closes.
+/// Read one identify message: a varint length, then the protobuf.
 Identify readIdentify(Stream s)
 {
-	ubyte[] got;
-	ubyte[4096] chunk;
-	try
-	{
-		for (;;)
-		{
-			immutable n = s.read(chunk[]);
-			got ~= chunk[0 .. n];
-			enforce(got.length <= maxIdentifyMessage, "identify: message too large");
-		}
-	}
-	catch (Ending)
-	{
-	}
-	enforce(got.length > 0, "identify: the peer sent nothing");
-	return Identify.decode(got);
+	return Identify.decode(s.readLengthPrefixed(maxIdentifyMessage));
 }
 
 void sendIdentify(Stream s, const Identify msg)
 {
-	s.write(msg.encode);
+	s.writeLengthPrefixed(msg.encode);
 }
 
 /// What identify learned about a peer, decoded.

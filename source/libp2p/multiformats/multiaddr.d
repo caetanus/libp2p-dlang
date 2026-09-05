@@ -175,7 +175,7 @@ struct Multiaddr
 
 	Multiaddr opBinary(string op : "~")(const Multiaddr o) const @safe pure nothrow
 	{
-		return Multiaddr(bytes ~ o.bytes);
+		return Multiaddr((bytes ~ o.bytes).dup);
 	}
 
 	bool opEquals(const Multiaddr o) const @safe pure nothrow

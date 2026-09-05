@@ -160,7 +160,7 @@ final class Swarm
 			catch (Exception e)
 				last = e;
 		}
-		throw new DialFailure("dial " ~ peer.toString ~ " failed", last);
+		throw new DialFailure("dial " ~ peer.toString ~ " failed: " ~ (last is null ? "no address worked" : last.msg), last);
 	}
 
 	/// Dial an address whose peer we do not know yet.
@@ -170,7 +170,7 @@ final class Swarm
 		try
 			return dialOne(addr, Nullable!PeerId.init);
 		catch (Exception e)
-			throw new DialFailure("dial " ~ addr.toString ~ " failed", e);
+			throw new DialFailure("dial " ~ addr.toString ~ " failed: " ~ e.msg, e);
 	}
 
 	private Connection dialOne(const Multiaddr target, Nullable!PeerId expected)

@@ -1,8 +1,12 @@
 # libp2p-dlang v2 — design for milestone 1
 
-**Status:** proposal, awaiting the author's approval. No module is written until
-the seams below are agreed. Where a choice is still open it is marked **OPEN**
-with a recommendation.
+**Status:** approved 2026-09-05 and built. Milestone 1 is reached: the
+`ut` gate is green with nothing left running, and `interop/run-interop.sh`
+verifies both dial directions against a real rust-libp2p node. The choices that
+were marked OPEN were taken as recommended (A: `reset()` on the surface; B: a
+Go-shaped host; C: direct writes under a mutex; D: the UDA protobuf codec).
+Where the built code departs from the text below, the departure is noted in
+place with **BUILT:**.
 
 **What this is.** A libp2p node in D, on vibe-core fibers, with an architecture
 that is ours. go-libp2p is consulted when a concurrency or lifecycle question
@@ -127,8 +131,11 @@ the *only* racing primitive in the codebase; nothing uses vibe's
 `asyncAwaitAny`/`Waitable`. Its tests carry (`contract/util/select_test.d`).
 
 **Identity** — `Keypair` (Ed25519 via libsodium), `PublicKey` for all four
-libp2p key types *as data* (we must parse and hash a peer's RSA or secp256k1
-key to get its PeerId even though we sign only with Ed25519), `PeerId`
+libp2p key types (we must parse and hash a peer's RSA or secp256k1 key to get
+its PeerId even though we sign only with Ed25519). **BUILT:** the contract
+requires *verifying* signatures of all four types against rust-generated
+vectors, so RSA, ECDSA and secp256k1 verification go through OpenSSL's EVP —
+the one place OpenSSL is used; Noise stays on libsodium. `PeerId`
 (multihash: identity for keys ≤ 42 bytes, sha2-256 otherwise). Vectors carry
 from `contract/crypto` and `contract/core/peer_id_test.d`.
 
@@ -142,7 +149,10 @@ Small, pure, vector-tested. `varint` (unsigned LEB128, 10-byte cap),
 `multihash`, `base58btc`, `multibase` (base58btc + base32 for peer ids).
 
 **protobuf.** No generator, no `tools/protogen`. A proto2 struct is a D struct
-whose fields carry a UDA, and the codec is derived at compile time:
+whose fields carry a UDA, and the codec is derived at compile time.
+**BUILT:** plain fields are always written; `Nullable!T` is written when set; a
+plain field marked `@optional` is written only when non-empty, which is what
+`identify` uses so its tests can compare plain strings and arrays:
 
 ```d
 struct IdentifyMsg {
@@ -204,8 +214,7 @@ extra round trip matters.
 
 ### 2.5 security (noise)
 
-Noise `XX_25519_ChaChaPoly_SHA256`, entirely on libsodium (no OpenSSL in
-milestone 1). Frames are 2-byte big-endian length + payload, 65535 max. The
+Noise `XX_25519_ChaChaPoly_SHA256`, entirely on libsodium. Frames are 2-byte big-endian length + payload, 65535 max. The
 libp2p payload is the `NoiseHandshakePayload` protobuf carrying our identity
 key and a signature over `"noise-libp2p-static-key:" ++ static_public`.
 
@@ -339,8 +348,11 @@ after `timeout` or a mismatch the stream is reset and the failure is reported.
 rust's defaults: 15 s interval, 20 s timeout.
 
 **identify** (`/ipfs/id/1.0.0`): on `connected` the service opens a stream,
-reads one protobuf message to EOF, verifies the public key matches the peer
-id, records the peer's addresses and protocols in the peerstore, and reports.
+reads one protobuf message, verifies the public key matches the peer id,
+records the peer's addresses and protocols in the peerstore, and reports.
+**BUILT:** the message is varint length-prefixed, as rust and go frame it; a
+reader that waited for EOF worked only against itself, and the interop run is
+what caught it.
 The handler side writes our message and `close()`s. `identify/push` is *not*
 milestone 1. The 375-byte go-libp2p interop vector that rust's
 `protobuf_roundtrip` carries is a required test.
@@ -357,7 +369,8 @@ milestone 1. The 375-byte go-libp2p interop vector that rust's
   tasks still running, zero eventcore handles at teardown. Any entry is a
   regression, not noise.
 - Interop (`interop/rust-peer`, both directions) is the acceptance test for
-  milestone 1 and runs in CI.
+  milestone 1 and runs in CI. `interop/dpeer` is our end of the wire, speaking
+  the same line protocol as the rust peer.
 - A file in `contract/` is deleted when its assertions live in `tests/` against
   the new API, or when it is judged a shape test with a note in the commit.
   `contract/` empty for the milestone-1 modules is part of "done".
@@ -365,7 +378,11 @@ milestone 1. The 375-byte go-libp2p interop vector that rust's
 ## 4. Build order
 
 Each step: the module, its carried tests, gate green, one commit. No step
-begins before the previous one is committed.
+begins before the previous one is committed. **BUILT:** all eleven steps are
+committed on `v2`; two defects reached the interop run and were found there
+and nowhere earlier — an `out` parameter zeroing the Noise chaining key, and
+the identify framing above. Both were self-consistent between two copies of
+this code, which is exactly what the interop run exists to catch.
 
 1. `core.ending`, `util.select` + cancellation — carried tests.
 2. `wire.varint`, `multihash`, `base58`, `multibase`; `core.multiaddr`.
