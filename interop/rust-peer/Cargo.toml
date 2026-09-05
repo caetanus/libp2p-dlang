@@ -1,0 +1,28 @@
+[package]
+name = "interop-rust-peer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The whole point of this crate is that it is NOT ours. It depends on
+# rust-libp2p from crates.io, pinned, so the thing on the other end of the wire
+# is the reference implementation and not a second reading of the same spec by
+# the same author.
+[dependencies]
+# 0.56.0 is the newest published release; 0.57.0 exists only in the upstream
+# development tree, and pinning to a git revision would make this test depend on
+# a moving target rather than on a release someone else can reproduce.
+libp2p = { version = "0.56.0", features = [
+    "tcp",
+    "noise",
+    "yamux",
+    "ping",
+    "identify",
+    "tokio",
+    "macros",
+    "secp256k1",
+    "ecdsa",
+    "rsa",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"

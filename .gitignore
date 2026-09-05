@@ -1,0 +1,15 @@
+# dub build cache / artifacts
+.dub/
+*.o
+*.a
+*.so
+/bin/
+
+# local tooling / session data
+.claude/
+
+# working notes (not shipped)
+/notes/
+
+# rust interop peer build output
+/interop/rust-peer/target/

@@ -1,0 +1,33 @@
+{
+	"name": "libp2p",
+	"description": "libp2p for D — fibers on vibe-core, crypto on libsodium",
+	"authors": ["caetano"],
+	"license": "MIT",
+	"targetType": "library",
+	"targetPath": "bin",
+	"sourcePaths": ["source"],
+	"importPaths": ["source"],
+	"dependencies": {
+		"vibe-core": "~>2.0",
+		"libsodiumd": "~>0.2"
+	},
+	"configurations": [
+		{
+			"name": "library",
+			"targetType": "library"
+		},
+		{
+			"name": "ut",
+			"targetType": "executable",
+			"targetName": "libp2p-test",
+			"mainSourceFile": "tests/runner.d",
+			"sourcePaths": ["source", "tests"],
+			"importPaths": ["source", "tests"],
+			"dependencies": {
+				"unit-threaded": "~>2.2",
+				"fluent-asserts": "~>2.0"
+			},
+			"dflags": ["-unittest"]
+		}
+	]
+}
