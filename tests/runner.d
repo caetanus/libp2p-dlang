@@ -27,5 +27,6 @@ int main(string[] args)
 		"tests.crypto.keytypes_test",
 		"tests.core.peer_id_test",
 		"tests.transport.tcp_test",
+		"tests.multistream.select_test",
 	);
 }
