@@ -110,6 +110,51 @@ fi
 cat "$work/rust2.log" 2>/dev/null | sed 's/^/      rust: /'
 
 echo
+echo "── 3. D dials rust over webrtc-direct ──"
+"$rust" listen-webrtc >"$work/rust3.log" 2>&1 &
+pids+=($!)
+if await_listen "$work/rust3.log"; then
+    addr=$(grep -m1 '^LISTEN ' "$work/rust3.log" | cut -d' ' -f2)
+    if timeout 40 ./bin/interop-peer dial "$addr" >"$work/d3.log" 2>&1; then
+        grep -q '^PING ' "$work/d3.log" \
+            && pass "D pinged rust over webrtc-direct ($(grep -m1 '^PING ' "$work/d3.log"))" \
+            || fail "D connected over webrtc-direct but reported no ping"
+        grep -q '^IDENTIFY ' "$work/d3.log" \
+            && pass "D read rust's identify over webrtc-direct" \
+            || fail "D did not decode rust's identify over webrtc-direct"
+    else
+        fail "the D webrtc dialer exited non-zero"
+    fi
+    sleep 2
+    grep -q '^OK ' "$work/rust3.log" \
+        && pass "rust pinged and identified D back over webrtc-direct" \
+        || fail "rust did not complete its half over webrtc-direct: $(tail -3 "$work/rust3.log" | tr '\n' ' ')"
+else
+    fail "the rust peer never announced a webrtc-direct address"
+fi
+cat "$work/rust3.log" | sed 's/^/      rust: /'
+cat "$work/d3.log" 2>/dev/null | sed 's/^/      D:    /'
+
+echo
+echo "── 4. rust dials D over webrtc-direct ──"
+./bin/interop-peer listen-webrtc >"$work/d4.log" 2>&1 &
+pids+=($!)
+if await_listen "$work/d4.log"; then
+    addr=$(grep -m1 '^LISTEN ' "$work/d4.log" | cut -d' ' -f2)
+    if timeout 40 "$rust" dial "$addr" >"$work/rust4.log" 2>&1; then
+        grep -q '^OK ' "$work/rust4.log" \
+            && pass "rust pinged and identified a D webrtc-direct listener ($(grep -m1 '^PING ' "$work/rust4.log"))" \
+            || fail "rust connected over webrtc-direct but did not complete"
+    else
+        fail "the rust webrtc dialer exited non-zero"
+    fi
+else
+    fail "the D peer never announced a webrtc-direct address"
+fi
+cat "$work/rust4.log" 2>/dev/null | sed 's/^/      rust: /'
+cat "$work/d4.log" 2>/dev/null | sed 's/^/      D:    /'
+
+echo
 echo "──────── interop ────────"
 if [ $status -eq 0 ]; then
     echo "PASS  both directions verified against the rust-libp2p release pinned in"

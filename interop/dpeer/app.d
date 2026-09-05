@@ -11,7 +11,11 @@
  *   CLOSED <peer>
  *   ERROR <what>                    something went wrong; the exit code says so too
  *
- * Stack: TCP -> multistream-select -> Noise XX -> yamux -> ping / identify.
+ * Modes: `listen`, `listen-webrtc` (a webrtc-direct address instead of TCP),
+ * `dial <multiaddr>` (TCP or webrtc-direct, by the address).
+ *
+ * Stack: TCP -> multistream-select -> Noise XX -> yamux -> ping / identify, or
+ * webrtc-direct -> Noise (identity only) -> data channels -> ping / identify.
  */
 module interop.dpeer.app;
 
@@ -21,10 +25,13 @@ import std.stdio : writeln, writefln, stdout;
 import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
 
 import libp2p.core.peer_id : PeerId;
+import libp2p.crypto.keys : Keypair;
 import libp2p.host.host;
 import libp2p.multiformats.multiaddr : Multiaddr;
 import libp2p.protocol.identify;
 import libp2p.protocol.ping;
+import libp2p.transport.tcp : TcpTransport;
+import libp2p.transport.webrtc.transport : WebRtcTransport;
 
 private enum deadline = 30.seconds;
 
@@ -81,9 +88,11 @@ private int run(string mode, string target)
 	HostConfig cfg;
 	cfg.agentVersion = "libp2p-dlang/interop";
 	cfg.swarm.idleTimeout = 30.seconds;
-	auto host = Host.create(cfg);
+	auto key = Keypair.generateEd25519;
+	auto host = new Host(key, [new TcpTransport], cfg);
 	scope (exit)
 		host.close();
+	host.swarm.addCapableTransport(new WebRtcTransport(key)); // webrtc-direct beside TCP
 
 	bool pinged, identified;
 	PingConfig pc;
@@ -109,7 +118,8 @@ private int run(string mode, string target)
 	switch (mode)
 	{
 	case "listen":
-		host.listen(Multiaddr.parse("/ip4/127.0.0.1/tcp/0"));
+	case "listen-webrtc":
+		host.listen(Multiaddr.parse(mode == "listen" ? "/ip4/127.0.0.1/tcp/0" : "/ip4/127.0.0.1/udp/0/webrtc-direct"));
 		say("LISTEN %s/p2p/%s", host.addrs[0], host.id);
 		// The peer that dials drives; we stay until it leaves, and report OK as
 		// soon as our own half is done.

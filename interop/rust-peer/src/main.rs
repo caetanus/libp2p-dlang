@@ -23,7 +23,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{identify, identity, noise, ping, tcp, yamux, Multiaddr, SwarmBuilder};
+use libp2p::{identify, identity, noise, ping, tcp, yamux, Multiaddr, SwarmBuilder, Transport};
+use libp2p_webrtc as webrtc;
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct Behaviour {
@@ -46,6 +47,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             noise::Config::new,
             yamux::Config::default,
         )?
+        // webrtc-direct beside TCP: it secures and multiplexes itself.
+        .with_other_transport(|id| {
+            let cert = webrtc::tokio::Certificate::generate(&mut rand::thread_rng())?;
+            Ok(webrtc::tokio::Transport::new(id.clone(), cert)
+                .map(|(peer, conn), _| (peer, libp2p::core::muxing::StreamMuxerBox::new(conn))))
+        })?
         .with_behaviour(|key| Behaviour {
             // Ping often enough that a short test does not have to wait for it.
             ping: ping::Behaviour::new(
@@ -63,12 +70,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "listen" => {
             swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
         }
+        "listen-webrtc" => {
+            swarm.listen_on("/ip4/127.0.0.1/udp/0/webrtc-direct".parse()?)?;
+        }
         "dial" => {
             let addr: Multiaddr = args
                 .get(2)
                 .ok_or("dial needs a multiaddr")?
                 .parse()
                 .map_err(|e| format!("bad multiaddr: {e}"))?;
+            // webrtc-direct dials from a listening socket: the transport wants
+            // one before it will dial.
+            if addr.to_string().contains("/webrtc-direct/") {
+                swarm.listen_on("/ip4/127.0.0.1/udp/0/webrtc-direct".parse()?)?;
+            }
             swarm.dial(addr)?;
         }
         other => return Err(format!("unknown mode: {other}").into()),
