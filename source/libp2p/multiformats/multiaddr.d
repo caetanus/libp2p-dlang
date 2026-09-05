@@ -57,17 +57,17 @@ immutable Protocol[] protocols = [
 
 const(Protocol)* protocolByName(const(char)[] name) @safe pure nothrow
 {
-	foreach (ref p; protocols)
-		if (p.name == name)
-			return &p;
+	foreach (i; 0 .. protocols.length)
+		if (protocols[i].name == name)
+			return &protocols[i];
 	return null;
 }
 
 const(Protocol)* protocolByCode(ulong code) @safe pure nothrow
 {
-	foreach (ref p; protocols)
-		if (p.code == code)
-			return &p;
+	foreach (i; 0 .. protocols.length)
+		if (protocols[i].code == code)
+			return &protocols[i];
 	return null;
 }
 

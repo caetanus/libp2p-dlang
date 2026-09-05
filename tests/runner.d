@@ -30,5 +30,6 @@ int main(string[] args)
 		"tests.multistream.select_test",
 		"tests.security.noise_test",
 		"tests.muxer.yamux_test",
+		"tests.swarm.swarm_test",
 	);
 }

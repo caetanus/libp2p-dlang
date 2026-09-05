@@ -30,6 +30,7 @@ import vibe.core.task : Task, InterruptException;
 import libp2p.core.ending;
 import libp2p.core.stream;
 import libp2p.muxer.muxer;
+import libp2p.core.upgrade : MuxerFactory;
 
 enum yamuxProtocolId = "/yamux/1.0.0";
 
@@ -119,14 +120,17 @@ final class YamuxConn : Muxer
 		if (closed)
 			return;
 		end(new ConnClosed("yamux: session closed"), goAwayNormal);
-		// The reader is ours: it leaves before close() returns. Uninterruptible
-		// because we are already finishing, and a second interruption here would
-		// leave it running, which is the one thing close() promises not to do.
+		// The reader is ours: it leaves before close() returns, and it leaves by
+		// being interrupted — never by having the socket closed under it, which
+		// races the wakeup with the cancellation. Uninterruptible because we are
+		// already finishing, and a second interruption here would leave it
+		// running, which is the one thing close() promises not to do.
 		if (reader != Task.getThis() && reader.running)
 		{
 			reader.interrupt();
 			reader.joinUninterruptible();
 		}
+		transport.close();
 	}
 
 	bool isClosed() nothrow
@@ -159,7 +163,8 @@ final class YamuxConn : Muxer
 		streams = null;
 		backlog = null;
 		arrived.emit();
-		transport.close();
+		// The transport is closed by whoever owns the reader's stack at this
+		// point: close() after joining it, or the reader itself on its way out.
 	}
 
 	// --- the reader ---------------------------------------------------------------
@@ -177,7 +182,9 @@ final class YamuxConn : Muxer
 		}
 		catch (InterruptException)
 		{
-			// close() told us to leave; it has already ended the session.
+			// close() told us to leave; it has already ended the session and
+			// closes the transport once we are gone.
+			return;
 		}
 		catch (YamuxProtocolError e)
 			end(e, goAwayProtocolError);
@@ -186,6 +193,7 @@ final class YamuxConn : Muxer
 			// The transport ending under a session is the connection ending.
 			end(asConnEnding(e, "yamux"), goAwayInternalError);
 		}
+		transport.close();
 	}
 
 	private void dispatch(ref const ubyte[headerLength] h)
@@ -504,5 +512,26 @@ private final class YamuxStream : Stream
 		catch (Exception)
 		{
 		} // if the session is gone the reader will learn it its own way
+	}
+}
+
+/// yamux as the upgrade sees it.
+final class YamuxFactory : MuxerFactory
+{
+	private YamuxConfig cfg;
+
+	this(YamuxConfig cfg = YamuxConfig.init)
+	{
+		this.cfg = cfg;
+	}
+
+	string protocolId()
+	{
+		return yamuxProtocolId;
+	}
+
+	Muxer create(Stream secured, bool client)
+	{
+		return new YamuxConn(secured, client, cfg);
 	}
 }
