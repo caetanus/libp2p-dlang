@@ -28,9 +28,10 @@ import std.exception : collectExceptionMsg;
 import vibe.core.core : sleep;
 
 import libp2p.core.ending : ConnClosed, EndOfStream, StreamReset;
-import libp2p.core.stream : ByteStream;
+import libp2p.core.stream;
 import libp2p.muxer.yamux : YamuxConn;
-import tests.util.looppipe : MemStream, memPair, onLoop, spawn, Side;
+import tests.util.pipe : MemStream, memPair;
+import tests.util.loop : onLoop, spawn, Side;
 import fluent.asserts;
 
 private enum ubyte typeData = 0, typeWindowUpdate = 1, typePing = 2, typeGoAway = 3;
@@ -62,7 +63,7 @@ private uint lengthOf(const(ubyte)[] h)
  * is the one place that catches: `MemStream` reports the end of a channel by
  * throwing, so "read what is there" has to stop on it.
  */
-private ubyte[][] drainFrames(ByteStream c, bool stopAtPong = false)
+private ubyte[][] drainFrames(Stream c, bool stopAtPong = false)
 {
 	ubyte[][] frames;
 	for (;;)
@@ -109,7 +110,7 @@ private struct Outcome
  * Drive a hand-written peer against a real session. The session is the server,
  * so the peer's stream ids must be odd.
  */
-private Outcome againstSession(void delegate(ByteStream) peer)
+private Outcome againstSession(void delegate(Stream) peer)
 {
 	Outcome o;
 	onLoop({
@@ -123,7 +124,7 @@ private Outcome againstSession(void delegate(ByteStream) peer)
 		auto session = spawn({
 			auto m = new YamuxConn(sa, false);
 			for (;;)
-				m.acceptStream();
+				m.accept();
 		});
 		peer(sb);
 		o.frames = drainFrames(sb);
@@ -141,9 +142,9 @@ private Outcome againstSession(void delegate(ByteStream) peer)
 @("yamux: a data frame larger than the receive window is refused, not allocated")
 unittest
 {
-	auto o = againstSession((ByteStream c) {
-		c.writeBytes(frame(typeWindowUpdate, flagSyn, 1, 0));
-		c.writeBytes(frame(typeData, 0, 1, uint.max));
+	auto o = againstSession((Stream c) {
+		c.write(frame(typeWindowUpdate, flagSyn, 1, 0));
+		c.write(frame(typeData, 0, 1, uint.max));
 	});
 	o.failure.should.equal("yamux: data frame exceeds the receive window");
 	sentGoAway(o.frames).should.equal(true);
@@ -154,8 +155,8 @@ unittest
 @("yamux: a data frame for an unknown stream cannot claim an unbounded payload")
 unittest
 {
-	auto o = againstSession((ByteStream c) {
-		c.writeBytes(frame(typeData, 0, 777, uint.max));
+	auto o = againstSession((Stream c) {
+		c.write(frame(typeData, 0, 777, uint.max));
 	});
 	o.failure.should.equal("yamux: data frame for an unknown stream exceeds the window");
 	sentGoAway(o.frames).should.equal(true);
@@ -167,16 +168,16 @@ unittest
 @("yamux: a peer may not send past the window it was advertised")
 unittest
 {
-	auto o = againstSession((ByteStream c) {
-		c.writeBytes(frame(typeWindowUpdate, flagSyn, 1, 0));
+	auto o = againstSession((Stream c) {
+		c.write(frame(typeWindowUpdate, flagSyn, 1, 0));
 		enum chunk = 16 * 1024;
 		foreach (_; 0 .. window / chunk)
 		{
-			c.writeBytes(frame(typeData, 0, 1, chunk));
-			c.writeBytes(new ubyte[chunk]);
+			c.write(frame(typeData, 0, 1, chunk));
+			c.write(new ubyte[chunk]);
 		}
-		c.writeBytes(frame(typeData, 0, 1, 1)); // one past the window
-		c.writeBytes([cast(ubyte) 0]);
+		c.write(frame(typeData, 0, 1, 1)); // one past the window
+		c.write([cast(ubyte) 0]);
 	});
 	o.failure.should.equal("yamux: data frame exceeds the receive window");
 	sentGoAway(o.frames).should.equal(true);
@@ -189,8 +190,8 @@ unittest
 @("yamux: an inbound stream id with our own parity is refused")
 unittest
 {
-	auto o = againstSession((ByteStream c) {
-		c.writeBytes(frame(typeWindowUpdate, flagSyn, 2, 0));
+	auto o = againstSession((Stream c) {
+		c.write(frame(typeWindowUpdate, flagSyn, 2, 0));
 	});
 	o.failure.should.equal("yamux: inbound stream id has the wrong parity");
 	sentGoAway(o.frames).should.equal(true);
@@ -200,8 +201,8 @@ unittest
 @("yamux: stream id 0 cannot be opened as a stream")
 unittest
 {
-	auto o = againstSession((ByteStream c) {
-		c.writeBytes(frame(typeWindowUpdate, flagSyn, 0, 0));
+	auto o = againstSession((Stream c) {
+		c.write(frame(typeWindowUpdate, flagSyn, 0, 0));
 	});
 	o.failure.should.equal("yamux: stream id 0 is the session, not a stream");
 	sentGoAway(o.frames).should.equal(true);
@@ -212,9 +213,9 @@ unittest
 @("yamux: a reused stream id is refused")
 unittest
 {
-	auto o = againstSession((ByteStream c) {
-		c.writeBytes(frame(typeWindowUpdate, flagSyn, 3, 0));
-		c.writeBytes(frame(typeWindowUpdate, flagSyn, 3, 0));
+	auto o = againstSession((Stream c) {
+		c.write(frame(typeWindowUpdate, flagSyn, 3, 0));
+		c.write(frame(typeWindowUpdate, flagSyn, 3, 0));
 	});
 	o.failure.should.equal("yamux: inbound stream id is not increasing");
 	sentGoAway(o.frames).should.equal(true);
@@ -223,9 +224,9 @@ unittest
 @("yamux: a stream id that goes backwards is refused")
 unittest
 {
-	auto o = againstSession((ByteStream c) {
-		c.writeBytes(frame(typeWindowUpdate, flagSyn, 5, 0));
-		c.writeBytes(frame(typeWindowUpdate, flagSyn, 1, 0));
+	auto o = againstSession((Stream c) {
+		c.write(frame(typeWindowUpdate, flagSyn, 5, 0));
+		c.write(frame(typeWindowUpdate, flagSyn, 1, 0));
 	});
 	o.failure.should.equal("yamux: inbound stream id is not increasing");
 	sentGoAway(o.frames).should.equal(true);
@@ -236,7 +237,7 @@ unittest
 @("yamux: an unknown frame type is refused")
 unittest
 {
-	auto o = againstSession((ByteStream c) { c.writeBytes(frame(9, 0, 1, 0)); });
+	auto o = againstSession((Stream c) { c.write(frame(9, 0, 1, 0)); });
 	o.failure.should.equal("yamux: unknown frame type");
 	sentGoAway(o.frames).should.equal(true);
 }
@@ -244,8 +245,8 @@ unittest
 @("yamux: an unknown protocol version is refused")
 unittest
 {
-	auto o = againstSession((ByteStream c) {
-		c.writeBytes(frame(typeWindowUpdate, flagSyn, 1, 0, 1));
+	auto o = againstSession((Stream c) {
+		c.write(frame(typeWindowUpdate, flagSyn, 1, 0, 1));
 	});
 	o.failure.should.equal("yamux: unknown protocol version");
 	sentGoAway(o.frames).should.equal(true);
@@ -256,9 +257,9 @@ unittest
 @("yamux: a window update that would overflow the send window is refused")
 unittest
 {
-	auto o = againstSession((ByteStream c) {
-		c.writeBytes(frame(typeWindowUpdate, flagSyn, 1, 0));
-		c.writeBytes(frame(typeWindowUpdate, 0, 1, uint.max));
+	auto o = againstSession((Stream c) {
+		c.write(frame(typeWindowUpdate, flagSyn, 1, 0));
+		c.write(frame(typeWindowUpdate, 0, 1, uint.max));
 	});
 	o.failure.should.equal("yamux: window update overflows the send window");
 	sentGoAway(o.frames).should.equal(true);
@@ -284,8 +285,8 @@ unittest
 		auto session = spawn({ cast(void) new YamuxConn(sa, false); });
 
 		foreach (i; 0 .. backlog + 8)
-			sb.writeBytes(frame(typeWindowUpdate, flagSyn, cast(uint)(2 * i + 1), 0));
-		sb.writeBytes(frame(typePing, flagSyn, 0, 1));
+			sb.write(frame(typeWindowUpdate, flagSyn, cast(uint)(2 * i + 1), 0));
+		sb.write(frame(typePing, flagSyn, 0, 1));
 		frames = drainFrames(sb, true);
 		sb.close();
 		session.join();
@@ -313,15 +314,15 @@ unittest
 		memPair(sa, sb);
 		auto reader = spawn({
 			auto m = new YamuxConn(sa, false);
-			auto s = m.acceptStream();
+			auto s = m.accept();
 			auto buf = new ubyte[total];
 			s.readExact(buf);
 			got = buf;
 		});
 
 		auto m = new YamuxConn(sb, true);
-		auto s = m.openStream();
-		s.writeBytes(sent);
+		auto s = m.open();
+		s.write(sent);
 		s.close();
 		reader.join();
 		m.close();
@@ -355,15 +356,15 @@ unittest
 		memPair(sa, sb);
 		auto other = spawn({
 			auto m = new YamuxConn(sa, false);
-			m.acceptStream(); // accepted, deliberately never read
+			m.accept(); // accepted, deliberately never read
 		});
 
 		auto m = new YamuxConn(sb, true);
-		auto s = m.openStream();
+		auto s = m.open();
 		auto writer = spawn({
 			foreach (_; 0 .. 2)
 			{
-				s.writeBytes(new ubyte[window]);
+				s.write(new ubyte[window]);
 				written += window;
 			}
 		});
@@ -401,15 +402,15 @@ unittest
 		memPair(sa, sb);
 		auto peer = spawn({
 			auto m = new YamuxConn(sa, false);
-			auto s = m.acceptStream();
+			auto s = m.accept();
 			auto buf = new ubyte[2];
 			s.readExact(buf);
 			s.close();
 		});
 
 		auto m = new YamuxConn(sb, true);
-		auto s = m.openStream();
-		s.writeBytes(cast(ubyte[]) "hi".dup);
+		auto s = m.open();
+		s.write(cast(ubyte[]) "hi".dup);
 		afterOpen = m.openStreams;
 		s.close(); // our FIN; the peer's arrives while we wait below
 		immutable deadline = MonoTime.currTime + 5.seconds;
@@ -438,13 +439,13 @@ unittest
 		YamuxConn m;
 		auto session = spawn({
 			m = new YamuxConn(sa, false);
-			auto s = m.acceptStream();
+			auto s = m.accept();
 			auto buf = new ubyte[1];
 			s.readExact(buf); // wakes on the RST
 		});
 
-		sb.writeBytes(frame(typeWindowUpdate, flagSyn, 1, 0));
-		sb.writeBytes(frame(typeData, flagRst, 1, 0));
+		sb.write(frame(typeWindowUpdate, flagSyn, 1, 0));
+		sb.write(frame(typeData, flagRst, 1, 0));
 		ended = collectExceptionMsg(session.join());
 		remaining = m.openStreams;
 		sb.close();
@@ -465,7 +466,7 @@ unittest
 		MemStream sa, sb;
 		memPair(sa, sb);
 		auto m = new YamuxConn(sb, true);
-		auto s = m.openStream();
+		auto s = m.open();
 		m.close();
 		first = collectExceptionMsg(s.close());
 		second = collectExceptionMsg(s.close());
@@ -497,7 +498,7 @@ unittest
 		// Park a fiber in acceptStream. Nothing will ever arrive.
 		auto parked = spawn({
 			try
-				m.acceptStream();
+				m.accept();
 			catch (InterruptException)
 			{
 				woke = true;
@@ -508,7 +509,7 @@ unittest
 		});
 
 		sleep(50.msecs); // let it get there
-		parked.task.interrupt(); // the only thing done: no close, no socket
+		parked.interrupt(); // the only thing done: no close, no socket
 		parked.join();
 
 		m.close();
@@ -541,14 +542,14 @@ unittest
 		auto peer = spawn({
 			auto m = new YamuxConn(sa, false);
 			try
-				m.acceptStream(); // accepted, and deliberately never written to
+				m.accept(); // accepted, and deliberately never written to
 			catch (Exception)
 			{
 			}
 		});
 
 		auto m = new YamuxConn(sb, true);
-		auto s = m.openStream();
+		auto s = m.open();
 		auto reader = spawn({
 			ubyte[4] b;
 			try
@@ -592,7 +593,7 @@ unittest
 		memPair(sa, sb);
 		auto app = spawn({
 			auto m = new YamuxConn(sa, false);
-			auto s = m.acceptStream();
+			auto s = m.accept();
 			ubyte[4] b;
 			try
 				s.readExact(b[]);
@@ -606,9 +607,9 @@ unittest
 			m.close();
 		});
 
-		sb.writeBytes(frame(typeWindowUpdate, flagSyn, 1, 0)); // open stream 1
+		sb.write(frame(typeWindowUpdate, flagSyn, 1, 0)); // open stream 1
 		sleep(50.msecs); // let the read park
-		sb.writeBytes(frame(typeData, flagRst, 1, 0)); // and abandon it
+		sb.write(frame(typeData, flagRst, 1, 0)); // and abandon it
 		app.join();
 		sb.close();
 		sleep(20.msecs);
@@ -631,7 +632,7 @@ unittest
 		memPair(sa, sb);
 		auto app = spawn({
 			auto m = new YamuxConn(sa, false);
-			auto s = m.acceptStream();
+			auto s = m.accept();
 			ubyte[5] b;
 			s.readExact(b[]); // the bytes that landed before the FIN did
 			got = cast(string) b.idup;
@@ -650,9 +651,9 @@ unittest
 
 		// All three land before the application reads any of them, so the FIN is
 		// already recorded by the time the first `readExact` runs.
-		sb.writeBytes(frame(typeWindowUpdate, flagSyn, 1, 0));
-		sb.writeBytes(frame(typeData, 0, 1, 5) ~ cast(const(ubyte)[]) "hello");
-		sb.writeBytes(frame(typeData, flagFin, 1, 0));
+		sb.write(frame(typeWindowUpdate, flagSyn, 1, 0));
+		sb.write(frame(typeData, 0, 1, 5) ~ cast(const(ubyte)[]) "hello");
+		sb.write(frame(typeData, flagFin, 1, 0));
 		app.join();
 		sb.close();
 		sleep(20.msecs);

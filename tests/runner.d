@@ -29,5 +29,6 @@ int main(string[] args)
 		"tests.transport.tcp_test",
 		"tests.multistream.select_test",
 		"tests.security.noise_test",
+		"tests.muxer.yamux_test",
 	);
 }
