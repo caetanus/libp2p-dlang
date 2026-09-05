@@ -46,5 +46,10 @@ int main(string[] args)
 		"tests.protocol.gossipsub_score_test",
 		"tests.protocol.gossipsub_promises_test",
 		"tests.protocol.gossipsub_service_test",
+		"tests.protocol.relay_test",
+		"tests.protocol.dcutr_test",
+		"tests.protocol.autonat_test",
+		"tests.protocol.relay_service_test",
+		"tests.protocol.autonat_service_test",
 	);
 }

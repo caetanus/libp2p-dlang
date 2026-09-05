@@ -18,7 +18,7 @@ tools/run-tests.sh        # the gate: tests, no fibers left, no descriptors left
 interop/run-interop.sh    # both dial directions against a real rust-libp2p node
 ```
 
-Milestone 1 is reached and both checks are green; identify/push, Kademlia and
-gossipsub followed. What remains under `contract/` belongs to later milestones
-(mplex, plaintext, DNS, relay, dcutr, autonat, mdns, WebRTC) and is untouched
-until its turn.
+Milestone 1 is reached and both checks are green; identify/push, Kademlia,
+gossipsub, circuit relay v2 with DCUtR, and AutoNAT followed. What remains under
+`contract/` belongs to later milestones (mplex, plaintext, DNS, mdns, WebRTC) and
+is untouched until its turn.

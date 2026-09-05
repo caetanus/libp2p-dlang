@@ -4,7 +4,7 @@ import libp2p.protocol.autonat;
 import libp2p.core.peer_id : PeerId;
 import libp2p.crypto.keys : Keypair;
 import libp2p.multiformats.multiaddr : Multiaddr;
-import wire = libp2p.wire.autonat_v1;
+import wire = libp2p.protocol.autonat.wire;
 import fluent.asserts;
 
 private PeerId randomPeer()
@@ -65,15 +65,16 @@ unittest
 	// Build the generated Message wire form, injecting one bad address bytes blob
 	// alongside the valid one (PeerInfo.addrs is raw `bytes`).
 	wire.Message msg;
-	msg.type = wire.Message.MessageType.DIAL;
-	msg.hasType = true;
-	msg.dial.peer.id = peer.bytes.dup;
-	msg.dial.peer.addrs = [
+	msg.type = cast(uint) wire.MessageType.DIAL;
+	wire.PeerInfo pi;
+	pi.id = peer.bytes.dup;
+	pi.addrs = [
 		valid.encode,
 		cast(ubyte[])[255, 255, 255, 255, 255, 255, 255, 255],
 	];
-	msg.dial.hasPeer = true;
-	msg.hasDial = true;
+	wire.Dial d;
+	d.peer = pi;
+	msg.dial = d;
 
 	auto req = DialRequest.decode(msg.encode);
 	req.addresses.should.equal([valid]);

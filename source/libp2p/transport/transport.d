@@ -43,3 +43,48 @@ interface Transport
 
 	Listener listen(const Multiaddr local);
 }
+
+/// A `Stream` dressed as a raw connection: what a relay hands over, so the
+/// upgrade can treat it like a socket.
+final class StreamRawConn : RawConn
+{
+	private Stream inner;
+	private Multiaddr local, remote;
+
+	this(Stream inner, Multiaddr local, Multiaddr remote)
+	{
+		this.inner = inner;
+		this.local = local;
+		this.remote = remote;
+	}
+
+	size_t read(ubyte[] buf)
+	{
+		return inner.read(buf);
+	}
+
+	void write(const(ubyte)[] data)
+	{
+		inner.write(data);
+	}
+
+	void close() nothrow
+	{
+		inner.close();
+	}
+
+	void reset() nothrow
+	{
+		inner.reset();
+	}
+
+	Multiaddr localAddr()
+	{
+		return local;
+	}
+
+	Multiaddr remoteAddr()
+	{
+		return remote;
+	}
+}

@@ -125,6 +125,12 @@ final class Swarm
 		return cfg;
 	}
 
+	/// Another way to dial and listen (a relay client, say).
+	void addTransport(Transport t)
+	{
+		transports ~= t;
+	}
+
 	// --- listening ---------------------------------------------------------------------
 
 	void listen(Multiaddr addr)
@@ -185,10 +191,15 @@ final class Swarm
 			enforce(expected.isNull || expected.get == named,
 				"swarm: address names " ~ named.toString ~ " but " ~ expected.get.toString ~ " was expected");
 			expected = named;
-			Multiaddr bare;
-			foreach (c; comps[0 .. $ - 1])
-				bare = bare ~ Multiaddr.parse("/" ~ c.name ~ (c.protocol.size != 0 ? "/" ~ c.text : ""));
-			addr = bare;
+			// A relayed address (`.../p2p-circuit/p2p/<dst>`) keeps its destination:
+			// the relay transport needs it. A plain one is dialed without.
+			if (!comps.canFind!(c => c.name == "p2p-circuit"))
+			{
+				Multiaddr bare;
+				foreach (c; comps[0 .. $ - 1])
+					bare = bare ~ Multiaddr.parse("/" ~ c.name ~ (c.protocol.size != 0 ? "/" ~ c.text : ""));
+				addr = bare;
+			}
 		}
 		auto pending = limiter.pending(Endpoint.dialer);
 		scope (exit)
@@ -337,7 +348,7 @@ final class Swarm
 		}
 	}
 
-	private void admitInbound(RawConn raw)
+	private Connection admitInbound(RawConn raw)
 	{
 		scope (failure)
 			raw.close();
@@ -357,7 +368,33 @@ final class Swarm
 			throw new Exception("swarm: gater refused " ~ up.remotePeer.toString);
 
 		auto established = limiter.established(Endpoint.listener, up.remotePeer);
-		admit(up, Endpoint.listener, raw.localAddr, raw.remoteAddr, established);
+		return admit(up, Endpoint.listener, raw.localAddr, raw.remoteAddr, established);
+	}
+
+	/// A raw connection established some other way (a relayed stream, say),
+	/// taken through the upgrade as the dialer and into the pool.
+	Connection admitOutbound(RawConn raw, Nullable!PeerId expected)
+	{
+		auto pending = limiter.pending(Endpoint.dialer);
+		scope (exit)
+			pending.release();
+		scope (failure)
+			raw.close();
+		Upgraded up = withTimeout(cfg.handshakeTimeout, "handshake with " ~ raw.remoteAddr.toString,
+			() => upgrade(raw, Endpoint.dialer, upgradeCfg, expected));
+		scope (failure)
+			up.muxer.close();
+		if (gater !is null && !gater.allowPeer(up.remotePeer, Endpoint.dialer))
+			throw new Exception("swarm: gater refused " ~ up.remotePeer.toString);
+		auto established = limiter.established(Endpoint.dialer, up.remotePeer);
+		return admit(up, Endpoint.dialer, raw.localAddr, raw.remoteAddr, established);
+	}
+
+	/// The same for one that arrived: the listener's side of the upgrade.
+	Connection admitInboundRaw(RawConn raw)
+	{
+		enforce(!closed, "swarm: closed");
+		return admitInbound(raw);
 	}
 
 	private Connection admit(ref Upgraded up, Endpoint role, Multiaddr local, Multiaddr remote, ref Lease established)

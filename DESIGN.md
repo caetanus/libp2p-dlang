@@ -411,4 +411,12 @@ calls and heartbeats with the RPCs to send — mesh, backoff, flood publish,
 message cache with IHAVE/IWANT, IDONTWANT, duplicate cache, peer scoring with
 rust's formulas and the gates it drives — and a service around it that owns
 one reader per inbound stream, one writer per peer and the heartbeat, holding
-a connection only while its peer is in the router.
+a connection only while its peer is in the router; circuit relay v2 as relay and
+as client (`protocol/relay/`), with reservations that are bounded, rate-limited,
+expire on their own and die with their connection, circuits that pipe within a
+byte and time budget, a `/p2p-circuit` transport registered with the swarm, and
+a relayed stream admitted to the swarm as a raw connection and upgraded like any
+other; DCUtR on top of it; AutoNAT v1 (`protocol/autonat/`) with the server
+dialing back only at the observed IP, throttled, and the client's
+confidence-weighted status. The swarm grew `addTransport`, `admitOutbound` and
+`admitInboundRaw` for those.

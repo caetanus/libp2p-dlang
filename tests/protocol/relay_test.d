@@ -1,9 +1,8 @@
 module tests.protocol.relay_test;
 
 import libp2p.protocol.relay;
-import libp2p.core.stream : ByteStream;
-import libp2p.util.protobuf : writeDelimited, readDelimited;
-import tests.util.fiberpipe : runPair;
+import libp2p.core.stream;
+import tests.util.pipe : runPair;
 import fluent.asserts;
 
 @("Peer protobuf roundtrips")
@@ -52,25 +51,25 @@ unittest
 	Status seenByRelay;
 	Status seenByClient;
 	runPair(
-		(ByteStream s) {
+		(Stream s) {
 		// client: send RESERVE, read the status reply
 		HopMessage m;
 		m.type = HopMessage.Type.RESERVE;
 		m.peer.id = cast(ubyte[])[1, 2, 3];
 		m.hasPeer = true;
-		writeDelimited(s, m.encode);
-		auto reply = HopMessage.decode(readDelimited(s));
+		s.writeLengthPrefixed(m.encode);
+		auto reply = HopMessage.decode(s.readLengthPrefixed(4096));
 		seenByClient = reply.status;
 	},
-		(ByteStream s) {
+		(Stream s) {
 		// relay: read RESERVE, reply STATUS ok
-		auto req = HopMessage.decode(readDelimited(s));
+		auto req = HopMessage.decode(s.readLengthPrefixed(4096));
 		seenByRelay = req.type == HopMessage.Type.RESERVE ? Status.OK : Status.MALFORMED_MESSAGE;
 		HopMessage reply;
 		reply.type = HopMessage.Type.STATUS;
 		reply.status = Status.OK;
 		reply.hasStatus = true;
-		writeDelimited(s, reply.encode);
+		s.writeLengthPrefixed(reply.encode);
 	});
 	seenByRelay.should.equal(Status.OK);
 	seenByClient.should.equal(Status.OK);

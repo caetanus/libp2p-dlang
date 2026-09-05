@@ -2,8 +2,8 @@ module tests.protocol.dcutr_test;
 
 import core.time : Duration;
 import libp2p.protocol.dcutr;
-import libp2p.core.stream : ByteStream;
-import tests.util.fiberpipe : runPair;
+import libp2p.core.stream;
+import tests.util.pipe : runPair;
 import fluent.asserts;
 
 @("HolePunch protobuf roundtrips type and addresses")
@@ -26,8 +26,8 @@ unittest
 	DcutrResult res;
 	ubyte[][] gotA;
 	runPair(
-		(ByteStream s) { res = initiateHolePunch(s, aAddrs); },
-		(ByteStream s) { gotA = respondHolePunch(s, bAddrs); });
+		(Stream s) { res = initiateHolePunch(s, aAddrs); },
+		(Stream s) { gotA = respondHolePunch(s, bAddrs); });
 	res.peerAddrs.should.equal(bAddrs); // A learned B's addresses
 	gotA.should.equal(aAddrs); // B learned A's addresses
 	(res.rtt >= Duration.zero).should.equal(true);
