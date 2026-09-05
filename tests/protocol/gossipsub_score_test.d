@@ -5,7 +5,7 @@ import std.conv : to;
 import std.math : isClose;
 
 import libp2p.core.peer_id : PeerId;
-import libp2p.protocol.gossipsub_score;
+import libp2p.protocol.gossipsub.score;
 import fluent.asserts;
 
 private PeerId peer(ubyte b)

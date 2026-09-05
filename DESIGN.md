@@ -405,4 +405,10 @@ stay in `contract/` untouched until their turn.
 **BUILT since:** identify/push; Kademlia (`protocol/kad/`), with the routing
 table, the store, the jobs and the iterative lookup carried from the contract
 as pure algorithms, and the lookup driven by α fibers (`runQuery`) instead of a
-poll loop — the α that the laundered code never actually had.
+poll loop — the α that the laundered code never actually had; gossipsub
+(`protocol/gossipsub/`): a router with no I/O that answers RPCs, application
+calls and heartbeats with the RPCs to send — mesh, backoff, flood publish,
+message cache with IHAVE/IWANT, IDONTWANT, duplicate cache, peer scoring with
+rust's formulas and the gates it drives — and a service around it that owns
+one reader per inbound stream, one writer per peer and the heartbeat, holding
+a connection only while its peer is in the router.

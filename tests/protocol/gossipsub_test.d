@@ -4,7 +4,7 @@ import core.time : MonoTime, Duration, seconds;
 import libp2p.core.peer_id : PeerId;
 import libp2p.crypto.keys : Keypair;
 import gs = libp2p.protocol.gossipsub; // qualified: gs.Message clashes with fluent's Message
-import libp2p.protocol.gossipsub_score : PeerScoreParams, PeerScoreThresholds;
+import libp2p.protocol.gossipsub.score : PeerScoreParams, PeerScoreThresholds;
 import fluent.asserts;
 
 private gs.Rpc subRpc(bool subscribe, string topic)

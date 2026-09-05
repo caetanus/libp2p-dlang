@@ -4,7 +4,7 @@ import core.time : Duration, MonoTime, seconds;
 
 import libp2p.core.peer_id : PeerId;
 import libp2p.protocol.gossipsub : GossipPromises;
-import libp2p.protocol.gossipsub_score : PeerScore, PeerScoreParams,
+import libp2p.protocol.gossipsub.score : PeerScore, PeerScoreParams,
 	PeerScoreThresholds, TopicScoreParams, RejectReason;
 import fluent.asserts;
 

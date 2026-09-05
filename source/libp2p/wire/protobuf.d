@@ -114,7 +114,7 @@ private void encodeField(uint number, bool skipEmpty = false, T)(auto ref const 
 			if (value.length == 0)
 				return;
 		}
-		else static if (!isNullable!T && !isMessage!T)
+		else static if (!isNullable!T)
 		{
 			if (value == T.init)
 				return;

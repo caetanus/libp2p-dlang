@@ -42,5 +42,9 @@ int main(string[] args)
 		"tests.protocol.kad_store_test",
 		"tests.protocol.kad_jobs_test",
 		"tests.protocol.kad_node_test",
+		"tests.protocol.gossipsub_test",
+		"tests.protocol.gossipsub_score_test",
+		"tests.protocol.gossipsub_promises_test",
+		"tests.protocol.gossipsub_service_test",
 	);
 }
