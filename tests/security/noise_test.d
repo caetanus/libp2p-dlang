@@ -1,10 +1,10 @@
 module tests.security.noise_test;
 
 import libp2p.security.noise;
-import libp2p.core.stream : ByteStream;
+import libp2p.core.stream;
 import libp2p.core.peer_id : PeerId;
 import libp2p.crypto.keys : Keypair;
-import tests.util.fiberpipe : runPair;
+import tests.util.pipe : runPair;
 import std.digest.sha : sha256Of;
 import fluent.asserts;
 
@@ -16,20 +16,20 @@ unittest
 	PeerId aSawB, bSawA;
 	ubyte[] echoed;
 	runPair(
-		(ByteStream s) {
+		(Stream s) {
 		auto sec = noiseInitiator(s, aKp);
 		aSawB = sec.remotePeer;
-		sec.writeBytes(cast(ubyte[]) "secret hello".dup);
+		sec.write(cast(ubyte[]) "secret hello".dup);
 		auto buf = new ubyte[12];
 		sec.readExact(buf);
 		echoed = buf;
 	},
-		(ByteStream s) {
+		(Stream s) {
 		auto sec = noiseResponder(s, bKp);
 		bSawA = sec.remotePeer;
 		auto buf = new ubyte[12];
 		sec.readExact(buf);
-		sec.writeBytes(buf); // echo it back, encrypted
+		sec.write(buf); // echo it back, encrypted
 	});
 	// Each side learned the OTHER's real libp2p identity from the handshake.
 	aSawB.should.equal(PeerId.fromPublicKey(bKp.publicKey));
@@ -42,32 +42,30 @@ unittest
 {
 	auto aKp = Keypair.generateEd25519;
 	auto bKp = Keypair.generateEd25519;
-	auto payload = new ubyte[200_000]; // > 3 Noise frames (64511 plaintext each)
+	auto payload = new ubyte[200_000]; // > 3 Noise frames (65519 plaintext each)
 	foreach (i, ref b; payload)
 		b = cast(ubyte)(i * 17 + 5);
 
 	ubyte[] got;
 	runPair(
-		(ByteStream s) {
+		(Stream s) {
 		auto sec = noiseInitiator(s, aKp);
-		sec.writeBytes(payload);
-		s.close();
+		sec.write(payload);
 	},
-		(ByteStream s) {
+		(Stream s) {
 		auto sec = noiseResponder(s, bKp);
 		auto buf = new ubyte[payload.length];
 		sec.readExact(buf);
 		got = buf;
 	});
 	got.length.should.equal(payload.length);
-	sha256Of(got).should.equal(sha256Of(payload));
+	// Never deep-compare a large array with fluent-asserts (it is quadratic).
+	(sha256Of(got) == sha256Of(payload)).should.equal(true);
 }
 
 @("the plaintext never appears on the wire")
 unittest
 {
-	import libp2p.multistream.select : negotiateDialer, negotiateListener;
-
 	// A distinctive marker we can search the raw bytes for.
 	auto marker = cast(ubyte[]) "TOPSECRETMARKER".dup;
 	auto aKp = Keypair.generateEd25519;
@@ -76,12 +74,11 @@ unittest
 
 	// Wrap the responder's raw stream so we can inspect everything it receives.
 	runPair(
-		(ByteStream s) {
+		(Stream s) {
 		auto sec = noiseInitiator(s, aKp);
-		sec.writeBytes(marker);
-		s.close();
+		sec.write(marker);
 	},
-		(ByteStream s) {
+		(Stream s) {
 		auto tap = new TapStream(s);
 		auto sec = noiseResponder(tap, bKp);
 		auto buf = new ubyte[marker.length];
@@ -102,22 +99,11 @@ unittest
 	auto bKp = Keypair.generateEd25519;
 	({
 		runPair(
-			(ByteStream s) {
-			void safeClose()
-			{
-				try
-					s.close();
-				catch (Exception)
-				{
-				}
-			}
-
-			scope (exit)
-				safeClose();
+			(Stream s) {
 			auto sec = noiseInitiator(s, aKp);
-			sec.writeBytes(cast(ubyte[]) "hello".dup);
+			sec.write(cast(ubyte[]) "hello".dup);
 		},
-			(ByteStream s) {
+			(Stream s) {
 			// Corrupt one byte well inside the first message (the ephemeral key).
 			auto flip = new FlipStream(s, 10);
 			noiseResponder(flip, bKp);
@@ -125,38 +111,47 @@ unittest
 	}).should.throwAnyException;
 }
 
-/// A ByteStream wrapper that flips a single byte at a fixed read offset,
-/// simulating an on-the-wire corruption/MITM.
-private final class FlipStream : ByteStream
+@("Noise refuses a peer that is not the one we expected")
+unittest
 {
-	private ByteStream inner;
+	import std.typecons : Nullable, nullable;
+
+	auto aKp = Keypair.generateEd25519;
+	auto bKp = Keypair.generateEd25519;
+	auto someoneElse = PeerId.fromPublicKey(Keypair.generateEd25519.publicKey);
+	bool refused;
+	runPair(
+		(Stream s) {
+		try
+			noiseInitiator(s, aKp, nullable(someoneElse));
+		catch (Exception)
+			refused = true;
+	},
+		(Stream s) { noiseResponder(s, bKp); });
+	refused.should.equal(true);
+}
+
+/// A Stream wrapper that flips a single byte at a fixed read offset,
+/// simulating an on-the-wire corruption/MITM.
+private final class FlipStream : Stream
+{
+	private Stream inner;
 	private size_t offset;
 	private size_t flipAt;
-	this(ByteStream inner, size_t flipAt)
+	this(Stream inner, size_t flipAt)
 	{
 		this.inner = inner;
 		this.flipAt = flipAt;
 	}
 
-	void writeBytes(scope const(ubyte)[] d)
+	void write(const(ubyte)[] d)
 	{
-		inner.writeBytes(d);
+		inner.write(d);
 	}
 
-	void readExact(scope ubyte[] buf)
+	size_t read(ubyte[] buf)
 	{
-		inner.readExact(buf);
-		foreach (ref b; buf)
-		{
-			if (offset == flipAt)
-				b ^= 0xff;
-			offset++;
-		}
-	}
-
-	size_t readAvailable(scope ubyte[] buf)
-	{
-		immutable n = inner.readAvailable(buf);
+		immutable n = inner.read(buf);
 		foreach (i; 0 .. n)
 		{
 			if (offset == flipAt)
@@ -166,43 +161,47 @@ private final class FlipStream : ByteStream
 		return n;
 	}
 
-	void close()
+	void close() nothrow
 	{
 		inner.close();
 	}
+
+	void reset() nothrow
+	{
+		inner.reset();
+	}
 }
 
-/// A ByteStream wrapper that records every byte read from the underlying stream.
-private final class TapStream : ByteStream
+/// A Stream wrapper that records every byte read from the underlying stream.
+private final class TapStream : Stream
 {
-	private ByteStream inner;
+	private Stream inner;
 	ubyte[] seen;
-	this(ByteStream inner)
+	this(Stream inner)
 	{
 		this.inner = inner;
 	}
 
-	void writeBytes(scope const(ubyte)[] d)
+	void write(const(ubyte)[] d)
 	{
-		inner.writeBytes(d);
+		inner.write(d);
 	}
 
-	void readExact(scope ubyte[] buf)
+	size_t read(ubyte[] buf)
 	{
-		inner.readExact(buf);
-		seen ~= buf;
-	}
-
-	size_t readAvailable(scope ubyte[] buf)
-	{
-		immutable n = inner.readAvailable(buf);
+		immutable n = inner.read(buf);
 		seen ~= buf[0 .. n];
 		return n;
 	}
 
-	void close()
+	void close() nothrow
 	{
 		inner.close();
+	}
+
+	void reset() nothrow
+	{
+		inner.reset();
 	}
 }
 

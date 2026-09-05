@@ -28,5 +28,6 @@ int main(string[] args)
 		"tests.core.peer_id_test",
 		"tests.transport.tcp_test",
 		"tests.multistream.select_test",
+		"tests.security.noise_test",
 	);
 }
