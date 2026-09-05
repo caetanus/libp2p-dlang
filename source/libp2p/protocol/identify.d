@@ -27,6 +27,8 @@ import libp2p.util.timeout : withTimeout;
 import libp2p.wire.protobuf;
 
 enum identifyProtocol = "/ipfs/id/1.0.0";
+/// The same message, in the other direction: a peer telling us it changed.
+enum identifyPushProtocol = "/ipfs/id/push/1.0.0";
 
 /// The largest identify message we accept. rust allows 4 KiB by default and go
 /// 8 KiB; 64 KiB leaves room for a peer with many addresses and protocols.
@@ -100,7 +102,33 @@ final class IdentifyService : Notifiee
 		this.cfg = cfg;
 		fibers = new FiberGroup; // a peer that will not identify is not our problem
 		host.setStreamHandler(identifyProtocol, &serve);
+		host.setStreamHandler(identifyPushProtocol, &servePush);
 		host.addNotifiee(this);
+	}
+
+	/// Tell `peer` that our description changed (new listen address, new
+	/// protocol). Blocks until the message is sent; throws if it cannot be.
+	void push(PeerId peer)
+	{
+		auto c = host.swarm.connection(peer);
+		auto s = c.newStream(identifyPushProtocol);
+		scope (exit)
+			s.close();
+		sendIdentify(s, describe(c));
+	}
+
+	/// Push to every connected peer, on fibers of ours; a peer that cannot be
+	/// reached is skipped.
+	void pushAll()
+	{
+		foreach (c; host.swarm.connections)
+			fibers.spawn({
+				try
+					push(c.remotePeer);
+				catch (Exception)
+				{
+				} // it is gone, or will not listen; nothing to decide here
+			});
 	}
 
 	/// Addresses peers have reported seeing us at: candidates for our own
@@ -125,6 +153,7 @@ final class IdentifyService : Notifiee
 		{
 			host.removeNotifiee(this);
 			host.removeStreamHandler(identifyProtocol);
+			host.removeStreamHandler(identifyPushProtocol);
 		}
 		catch (Exception)
 		{
@@ -155,6 +184,15 @@ final class IdentifyService : Notifiee
 			onSent(c.remotePeer);
 	}
 
+	/// The peer changed and says so: the same bookkeeping as a fresh identify.
+	private void servePush(Stream s, Connection c, string)
+	{
+		scope (exit)
+			s.close();
+		auto msg = withTimeout(cfg.timeout, "identify push", () => readIdentify(s));
+		record(c, msg);
+	}
+
 	private void identify(Connection c)
 	{
 		auto hold = c.hold(); // asking who they are is use
@@ -162,7 +200,13 @@ final class IdentifyService : Notifiee
 		scope (exit)
 			s.close();
 		auto msg = withTimeout(cfg.timeout, "identify", () => readIdentify(s));
+		record(c, msg);
+	}
 
+	/// Verify a peer's message against the connection it came over, store it,
+	/// and report it.
+	private void record(Connection c, Identify msg)
+	{
 		IdentifyInfo info;
 		info.peer = c.remotePeer;
 		if (msg.publicKey.length > 0)

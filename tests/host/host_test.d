@@ -14,6 +14,7 @@ import vibe.core.core : sleep;
 import fluent.asserts;
 
 import libp2p.core.peer_id : PeerId;
+import libp2p.core.stream : Stream;
 import libp2p.host.host;
 import libp2p.multiformats.multiaddr : Multiaddr;
 import libp2p.protocol.identify;
@@ -207,4 +208,40 @@ unittest
 		echoed = rtt >= Duration.zero ? "ok" : "bad";
 	});
 	echoed.should.equal("ok");
+}
+
+@("host: a pushed identify updates what the peer knows about us")
+unittest
+{
+	string[] before, after;
+	int identifiedTimes;
+	onLoop({
+		auto listener = listeningHost();
+		scope (exit)
+			listener.close();
+		auto lid = new IdentifyService(listener);
+
+		auto dialer = Host.create();
+		scope (exit)
+			dialer.close();
+		auto did = new IdentifyService(dialer);
+		did.onIdentified = (IdentifyInfo) { identifiedTimes++; };
+
+		dialer.connect(listener.id, listener.addrs);
+		immutable deadline = MonoTime.currTime + 3.seconds;
+		while (identifiedTimes < 1 && MonoTime.currTime < deadline)
+			sleep(10.msecs);
+		before = dialer.peerstore.protocols(listener.id);
+
+		// The listener grows a protocol and says so.
+		listener.setStreamHandler("/test/new/1.0.0", (Stream s, Connection, string) { s.close(); });
+		lid.pushAll();
+		while (identifiedTimes < 2 && MonoTime.currTime < deadline)
+			sleep(10.msecs);
+		after = dialer.peerstore.protocols(listener.id);
+	});
+	identifiedTimes.should.equal(2);
+	before.should.not.contain("/test/new/1.0.0");
+	after.should.contain("/test/new/1.0.0");
+	after.should.contain(identifyPushProtocol);
 }
