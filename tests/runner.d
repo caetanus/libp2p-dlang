@@ -23,5 +23,8 @@ int main(string[] args)
 		"tests.multiformats.multihash_test",
 		"tests.multiformats.multibase_test",
 		"tests.multiformats.multiaddr_test",
+		"tests.crypto.keys_test",
+		"tests.crypto.keytypes_test",
+		"tests.core.peer_id_test",
 	);
 }
