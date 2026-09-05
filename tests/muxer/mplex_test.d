@@ -1,11 +1,10 @@
 module tests.muxer.mplex_test;
 
-import libp2p.muxer.mplex : Mplex;
-import libp2p.muxer.frame : readMplexFrame, writeMplexFrame, MplexFrame, Flag, maxFrameSize;
-import libp2p.core.stream : ByteStream;
+import libp2p.muxer.mplex;
+import libp2p.core.stream;
 import libp2p.multiformats.varint : encodeVarint;
 import libp2p.multistream.select : negotiateDialer, negotiateListener;
-import tests.util.fiberpipe : runPair;
+import tests.util.pipe : runPair;
 import fluent.asserts;
 
 @("open, accept, and deliver a message")
@@ -13,15 +12,19 @@ unittest
 {
 	ubyte[] received;
 	runPair(
-		(ByteStream c) {
+		(Stream c) {
 		auto m = new Mplex(c, true);
-		auto s = m.openStream("x");
-		s.writeBytes(cast(ubyte[]) "hello".dup);
+		scope (exit)
+			m.close();
+		auto s = m.open("x");
+		s.write(cast(ubyte[]) "hello".dup);
 		s.close();
 	},
-		(ByteStream c) {
+		(Stream c) {
 		auto m = new Mplex(c, false);
-		auto s = m.acceptStream();
+		scope (exit)
+			m.close();
+		auto s = m.accept();
 		auto buf = new ubyte[5];
 		s.readExact(buf);
 		received = buf;
@@ -34,20 +37,24 @@ unittest
 {
 	ubyte[] reply;
 	runPair(
-		(ByteStream c) {
+		(Stream c) {
 		auto m = new Mplex(c, true);
-		auto s = m.openStream();
-		s.writeBytes(cast(ubyte[]) "ping".dup);
+		scope (exit)
+			m.close();
+		auto s = m.open();
+		s.write(cast(ubyte[]) "ping".dup);
 		auto buf = new ubyte[4];
 		s.readExact(buf);
 		reply = buf;
 	},
-		(ByteStream c) {
+		(Stream c) {
 		auto m = new Mplex(c, false);
-		auto s = m.acceptStream();
+		scope (exit)
+			m.close();
+		auto s = m.accept();
 		auto buf = new ubyte[4];
 		s.readExact(buf);
-		s.writeBytes(cast(ubyte[]) "pong".dup);
+		s.write(cast(ubyte[]) "pong".dup);
 	});
 	reply.should.equal(cast(ubyte[]) "pong");
 }
@@ -57,22 +64,26 @@ unittest
 {
 	ubyte[] a, b;
 	runPair(
-		(ByteStream c) {
+		(Stream c) {
 		auto m = new Mplex(c, true);
-		auto sa = m.openStream("a");
-		sa.writeBytes(cast(ubyte[]) "AAA".dup);
-		auto sb = m.openStream("b");
-		sb.writeBytes(cast(ubyte[]) "BBBB".dup);
+		scope (exit)
+			m.close();
+		auto sa = m.open("a");
+		sa.write(cast(ubyte[]) "AAA".dup);
+		auto sb = m.open("b");
+		sb.write(cast(ubyte[]) "BBBB".dup);
 		sa.close();
 		sb.close();
 	},
-		(ByteStream c) {
+		(Stream c) {
 		auto m = new Mplex(c, false);
-		auto s1 = m.acceptStream();
+		scope (exit)
+			m.close();
+		auto s1 = m.accept();
 		auto b1 = new ubyte[3];
 		s1.readExact(b1);
 		a = b1;
-		auto s2 = m.acceptStream();
+		auto s2 = m.accept();
 		auto b2 = new ubyte[4];
 		s2.readExact(b2);
 		b = b2;
@@ -86,14 +97,18 @@ unittest
 {
 	string dialed, served;
 	runPair(
-		(ByteStream c) {
+		(Stream c) {
 		auto m = new Mplex(c, true);
-		auto s = m.openStream();
+		scope (exit)
+			m.close();
+		auto s = m.open();
 		dialed = negotiateDialer(s, ["/ipfs/ping/1.0.0"]);
 	},
-		(ByteStream c) {
+		(Stream c) {
 		auto m = new Mplex(c, false);
-		auto s = m.acceptStream();
+		scope (exit)
+			m.close();
+		auto s = m.accept();
 		served = negotiateListener(s, ["/ipfs/ping/1.0.0"]);
 	});
 	dialed.should.equal("/ipfs/ping/1.0.0");
@@ -105,15 +120,19 @@ unittest
 {
 	({
 		runPair(
-			(ByteStream c) {
+			(Stream c) {
 			auto m = new Mplex(c, true);
-			auto s = m.openStream();
-			s.writeBytes(cast(ubyte[]) "hi".dup);
+		scope (exit)
+			m.close();
+			auto s = m.open();
+			s.write(cast(ubyte[]) "hi".dup);
 			s.close();
 		},
-			(ByteStream c) {
+			(Stream c) {
 			auto m = new Mplex(c, false);
-			auto s = m.acceptStream();
+		scope (exit)
+			m.close();
+			auto s = m.accept();
 			auto buf = new ubyte[10]; // more than was sent
 			s.readExact(buf);
 		});
@@ -128,13 +147,13 @@ unittest
 {
 	({
 		runPair(
-			(ByteStream s) {
+			(Stream s) {
 			// header = (stream 1 << 3) | messageInitiator(2); then an oversized len.
-			s.writeBytes(encodeVarint((1UL << 3) | cast(ulong) Flag.messageInitiator));
-			s.writeBytes(encodeVarint(maxFrameSize + 1));
+			s.write(encodeVarint((1UL << 3) | cast(ulong) Flag.messageInitiator));
+			s.write(encodeVarint(maxFrameSize + 1));
 			s.close();
 		},
-			(ByteStream s) { readMplexFrame(s); });
+			(Stream s) { readMplexFrame(s); });
 	}).should.throwAnyException;
 }
 
@@ -147,18 +166,18 @@ unittest
 	// Over the cap: writeMplexFrame throws before writing anything.
 	({
 		runPair(
-			(ByteStream s) { writeMplexFrame(s, 1, Flag.messageInitiator, new ubyte[maxFrameSize + 1]); },
-			(ByteStream s) {});
+			(Stream s) { writeMplexFrame(s, 1, Flag.messageInitiator, new ubyte[maxFrameSize + 1]); },
+			(Stream s) {});
 	}).should.throwAnyException;
 
 	// Exactly the cap: accepted and read back intact.
 	MplexFrame got;
 	runPair(
-		(ByteStream s) {
+		(Stream s) {
 		writeMplexFrame(s, 1, Flag.messageInitiator, new ubyte[maxFrameSize]);
 		s.close();
 	},
-		(ByteStream s) { got = readMplexFrame(s); });
+		(Stream s) { got = readMplexFrame(s); });
 	got.payload.length.should.equal(maxFrameSize);
 }
 
@@ -171,11 +190,11 @@ unittest
 	enum ulong bigId = (1UL << 59) | 0x1234_5678; // well beyond 32 bits
 	MplexFrame got;
 	runPair(
-		(ByteStream s) {
+		(Stream s) {
 		writeMplexFrame(s, bigId, Flag.closeReceiver, [0xAB, 0xCD]);
 		s.close();
 	},
-		(ByteStream s) { got = readMplexFrame(s); });
+		(Stream s) { got = readMplexFrame(s); });
 	got.id.should.equal(bigId);
 	got.flag.should.equal(Flag.closeReceiver);
 	got.payload.should.equal([cast(ubyte) 0xAB, 0xCD]);

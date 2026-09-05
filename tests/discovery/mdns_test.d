@@ -2,7 +2,7 @@ module tests.discovery.mdns_test;
 
 import libp2p.crypto.keys : Keypair;
 import libp2p.core.peer_id : PeerId;
-import libp2p.multiformats.multiaddr : Multiaddr, Component;
+import libp2p.multiformats.multiaddr : Multiaddr;
 import libp2p.discovery.mdns;
 import fluent.asserts;
 
@@ -48,7 +48,7 @@ unittest
 	peers[0].id.should.equal(other);
 	peers[0].addrs.length.should.equal(1);
 	peers[0].addrs[0].toString().should.equal(
-		addr.append(Component(421, other.bytes)).toString());
+		(addr ~ Multiaddr.parse("/p2p/" ~ other.toBase58)).toString());
 }
 
 @("mDNS peersFromMessage skips our own advertisement")

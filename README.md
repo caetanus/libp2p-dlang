@@ -19,6 +19,6 @@ interop/run-interop.sh    # both dial directions against a real rust-libp2p node
 ```
 
 Milestone 1 is reached and both checks are green; identify/push, Kademlia,
-gossipsub, circuit relay v2 with DCUtR, and AutoNAT followed. What remains under
-`contract/` belongs to later milestones (mplex, plaintext, DNS, mdns, WebRTC) and
-is untouched until its turn.
+gossipsub, circuit relay v2 with DCUtR, AutoNAT, plaintext, DNS resolution, mDNS
+and mplex followed. What remains under `contract/` is WebRTC, untouched until
+its turn.

@@ -196,24 +196,18 @@ unittest
 @("transports: tcp refuses addresses that belong to another transport")
 unittest
 {
-	import libp2p.crypto.keys : Keypair;
-	import libp2p.host : Host;
-	import libp2p.transport.tcp_transport : TcpTransport;
+	import libp2p.transport.tcp : TcpTransport;
 
-	auto host = new Host(Keypair.generateEd25519);
-	scope (exit)
-		host.close();
-	auto tcp = new TcpTransport(host.upgrader);
-
-	tcp.canDial(Multiaddr.parse("/ip4/127.0.0.1/tcp/4001")).should.equal(true);
+	auto tcp = new TcpTransport;
+	tcp.canHandle(Multiaddr.parse("/ip4/127.0.0.1/tcp/4001")).should.equal(true);
 	// The canonical full form names who is there; it is still a TCP address.
-	tcp.canDial(Multiaddr.parse(
+	tcp.canHandle(Multiaddr.parse(
 			"/ip4/127.0.0.1/tcp/4001/p2p/QmaGdzz8AKTxf3291Cm391TDhaukS3p9AoBVxF3VuifTZN"))
 		.should.equal(true);
 
 	// These are somebody else's.
-	tcp.canDial(Multiaddr.parse("/ip4/127.0.0.1/tcp/4001/ws")).should.equal(false);
-	tcp.canDial(Multiaddr.parse("/ip4/127.0.0.1/udp/4001/quic-v1")).should.equal(false);
-	tcp.canDial(Multiaddr.parse("/dns4/example.org/tcp/4001")).should.equal(false);
-	tcp.canDial(Multiaddr.parse("/ip4/127.0.0.1")).should.equal(false);
+	tcp.canHandle(Multiaddr.parse("/ip4/127.0.0.1/tcp/4001/ws")).should.equal(false);
+	tcp.canHandle(Multiaddr.parse("/ip4/127.0.0.1/udp/4001/quic-v1")).should.equal(false);
+	tcp.canHandle(Multiaddr.parse("/dns4/example.org/tcp/4001")).should.equal(false);
+	tcp.canHandle(Multiaddr.parse("/ip4/127.0.0.1")).should.equal(false);
 }

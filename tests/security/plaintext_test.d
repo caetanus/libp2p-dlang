@@ -2,13 +2,11 @@ module tests.security.plaintext_test;
 
 import std.exception : collectExceptionMsg;
 
-import libp2p.core.stream : ByteStream;
+import libp2p.core.stream;
 import libp2p.crypto.keys : Keypair;
 import libp2p.core.peer_id : PeerId;
-import libp2p.security.plaintext : plaintextUpgrade, plaintextProtocol, PlaintextStream;
-import libp2p.util.protobuf : writeDelimited;
-import libp2p.wire.plaintext : Exchange;
-import tests.util.fiberpipe : runPair;
+import libp2p.security.plaintext : plaintextUpgrade, plaintextProtocol, PlaintextStream, Exchange;
+import tests.util.pipe : runPair;
 import fluent.asserts;
 
 // The whole protocol: each side learns who the other is, and nothing is hidden
@@ -22,12 +20,12 @@ unittest
 	ubyte[] carried;
 
 	runPair(
-		(ByteStream c) {
+		(Stream c) {
 		auto s = plaintextUpgrade(c, a);
 		aSaw = s.remotePeer;
-		s.writeBytes(cast(ubyte[]) "hello".dup);
+		s.write(cast(ubyte[]) "hello".dup);
 	},
-		(ByteStream c) {
+		(Stream c) {
 		auto s = plaintextUpgrade(c, b);
 		bSaw = s.remotePeer;
 		auto buf = new ubyte[5];
@@ -51,19 +49,19 @@ unittest
 
 	string err;
 	runPair(
-		(ByteStream c) {
+		(Stream c) {
 		// Claims the victim's identity while holding its own key.
 		Exchange forged;
 		forged.id = PeerId.fromPublicKey(victim.publicKey).bytes.dup;
 		forged.pubkey = liar.publicKey.toProtobuf;
-		writeDelimited(c, forged.encode);
+		c.writeLengthPrefixed(forged.encode);
 		try
 			c.readExact(new ubyte[1]);
 		catch (Exception)
 		{
 		}
 	},
-		(ByteStream c) { err = collectExceptionMsg(plaintextUpgrade(c, honest)); });
+		(Stream c) { err = collectExceptionMsg(plaintextUpgrade(c, honest)); });
 
 	err.should.equal("plaintext: the peer id does not match the public key");
 }
@@ -74,16 +72,16 @@ unittest
 	auto honest = Keypair.generateEd25519;
 	string err;
 	runPair(
-		(ByteStream c) {
+		(Stream c) {
 		Exchange empty;
-		writeDelimited(c, empty.encode);
+		c.writeLengthPrefixed(empty.encode);
 		try
 			c.readExact(new ubyte[1]);
 		catch (Exception)
 		{
 		}
 	},
-		(ByteStream c) { err = collectExceptionMsg(plaintextUpgrade(c, honest)); });
+		(Stream c) { err = collectExceptionMsg(plaintextUpgrade(c, honest)); });
 
 	err.should.equal("plaintext: peer sent no public key");
 }

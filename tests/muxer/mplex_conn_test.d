@@ -1,5 +1,5 @@
 /**
- * `MuxedConn` — the concurrent mplex, and what stops a peer from using it as an
+ * `Mplex` — the concurrent mplex, and what stops a peer from using it as an
  * allocator.
  *
  * mplex has no flow control; the protocol has none to have. What it has are the
@@ -21,10 +21,10 @@ import std.exception : collectExceptionMsg;
 
 import vibe.core.core : sleep;
 
-import libp2p.core.stream : ByteStream;
-import libp2p.muxer.muxed_conn : MuxedConn;
-import libp2p.muxer.frame : writeMplexFrame, readMplexFrame, MplexFrame, Flag;
-import tests.util.looppipe : MemStream, memPair, onLoop, spawn;
+import libp2p.core.stream;
+import libp2p.muxer.mplex;
+import tests.util.pipe : MemStream, memPair;
+import tests.util.loop : onLoop, spawn;
 import fluent.asserts;
 
 private enum size_t maxSubstreams = 128; // rust Config::max_substreams
@@ -75,8 +75,8 @@ unittest
 		memPair(sa, sb);
 		// Deliberately does not accept: the ceiling counts substreams the
 		// connection is routing, and accepting does not free a slot.
-		MuxedConn m;
-		auto session = spawn({ m = new MuxedConn(sa, false); });
+		Mplex m;
+		auto session = spawn({ m = new Mplex(sa, false); });
 
 		foreach (i; 0 .. maxSubstreams + 1)
 			writeMplexFrame(sb, i, Flag.newStream, null);
@@ -104,9 +104,9 @@ unittest
 		MemStream sa, sb;
 		memPair(sa, sb);
 		auto session = spawn({
-			auto m = new MuxedConn(sa, false);
+			auto m = new Mplex(sa, false);
 			for (;;)
-				m.acceptStream(); // parks, and reports why it stopped
+				m.accept(); // parks, and reports why it stopped
 		});
 
 		writeMplexFrame(sb, 7, Flag.newStream, null);
@@ -134,8 +134,8 @@ unittest
 		MemStream sa, sb;
 		memPair(sa, sb);
 		auto reader = spawn({
-			auto m = new MuxedConn(sa, false);
-			auto s = m.acceptStream();
+			auto m = new Mplex(sa, false);
+			auto s = m.accept();
 			// Nothing is read until the peer has stopped making progress, which
 			// is what makes the stall below meaningful.
 			waitUntil(() => sb.unread == 0, 1.seconds);
@@ -177,16 +177,16 @@ unittest
 		MemStream sa, sb;
 		memPair(sa, sb);
 		auto peer = spawn({
-			auto m = new MuxedConn(sa, false);
-			auto s = m.acceptStream();
+			auto m = new Mplex(sa, false);
+			auto s = m.accept();
 			auto buf = new ubyte[2];
 			s.readExact(buf);
 			s.close();
 		});
 
-		auto m = new MuxedConn(sb, true);
-		auto s = m.openStream();
-		s.writeBytes(cast(ubyte[]) "hi".dup);
+		auto m = new Mplex(sb, true);
+		auto s = m.open();
+		s.write(cast(ubyte[]) "hi".dup);
 		afterOpen = m.openStreams;
 		s.close(); // ours; the peer's close arrives while we wait
 		waitUntil(() => m.openStreams == 0);
@@ -210,10 +210,10 @@ unittest
 	onLoop({
 		MemStream sa, sb;
 		memPair(sa, sb);
-		MuxedConn m;
+		Mplex m;
 		auto session = spawn({
-			m = new MuxedConn(sa, false);
-			auto s = m.acceptStream();
+			m = new Mplex(sa, false);
+			auto s = m.accept();
 			auto buf = new ubyte[1];
 			s.readExact(buf); // wakes on the reset
 		});
@@ -238,8 +238,8 @@ unittest
 	onLoop({
 		MemStream sa, sb;
 		memPair(sa, sb);
-		auto m = new MuxedConn(sb, true);
-		auto s = m.openStream();
+		auto m = new Mplex(sb, true);
+		auto s = m.open();
 		m.close();
 		first = collectExceptionMsg(s.close());
 		second = collectExceptionMsg(s.close());

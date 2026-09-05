@@ -31,6 +31,8 @@ final class TcpTransport : Transport
 		try
 		{
 			auto c = addr.components;
+			if (c.length == 3 && c[2].name == "p2p")
+				c = c[0 .. 2]; // the canonical form names who is there; still TCP
 			return c.length == 2 && (c[0].name == "ip4" || c[0].name == "ip6") && c[1].name == "tcp";
 		}
 		catch (Exception)

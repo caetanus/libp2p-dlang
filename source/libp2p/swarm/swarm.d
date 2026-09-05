@@ -34,6 +34,7 @@ import libp2p.security.noise : NoiseTransport;
 import libp2p.swarm.connection;
 import libp2p.swarm.limiter;
 import libp2p.transport.transport;
+import libp2p.transport.dns : DnsResolver, SystemDns, resolve, needsResolution;
 import libp2p.util.fibers : FiberGroup;
 import libp2p.util.timeout : withTimeout;
 
@@ -84,6 +85,8 @@ final class Swarm
 	private UpgradeConfig upgradeCfg;
 	private ConnectionGater gater;
 	private Limiter limiter;
+	/// How names in addresses are resolved; replaceable for tests.
+	DnsResolver resolver;
 
 	private Connection[] pool;
 	private Listener[] listeners;
@@ -102,6 +105,7 @@ final class Swarm
 		this.cfg = cfg;
 		this.gater = gater;
 		this.limiter = new Limiter(cfg.limits);
+		resolver = new SystemDns;
 		upgradeCfg.security = [new NoiseTransport(identity)];
 		upgradeCfg.muxers = [new YamuxFactory];
 		// An admission that fails is one connection not made; the swarm goes on.
@@ -159,7 +163,7 @@ final class Swarm
 		enforce(!closed, "swarm: closed");
 		enforce(addrs.length > 0, "swarm: no addresses for " ~ peer.toString);
 		Exception last;
-		foreach (addr; addrs)
+		foreach (addr; expand(addrs))
 		{
 			try
 				return dialOne(addr, nullable(peer));
@@ -173,10 +177,30 @@ final class Swarm
 	Connection dial(Multiaddr addr)
 	{
 		enforce(!closed, "swarm: closed");
-		try
-			return dialOne(addr, Nullable!PeerId.init);
-		catch (Exception e)
-			throw new DialFailure("dial " ~ addr.toString ~ " failed: " ~ e.msg, e);
+		Exception last;
+		foreach (a; expand([addr]))
+		{
+			try
+				return dialOne(a, Nullable!PeerId.init);
+			catch (Exception e)
+				last = e;
+		}
+		throw new DialFailure("dial " ~ addr.toString ~ " failed: " ~ (last is null ? "no address to dial" : last.msg), last);
+	}
+
+	/// Names become addresses before a transport sees them.
+	private Multiaddr[] expand(const(Multiaddr)[] addrs)
+	{
+		Multiaddr[] out_;
+		foreach (a; addrs)
+		{
+			auto m = Multiaddr(a.bytes.dup);
+			if (needsResolution(m))
+				out_ ~= resolve(m, resolver);
+			else
+				out_ ~= m;
+		}
+		return out_;
 	}
 
 	private Connection dialOne(const Multiaddr target, Nullable!PeerId expected)

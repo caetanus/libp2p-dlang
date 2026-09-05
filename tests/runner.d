@@ -51,5 +51,11 @@ int main(string[] args)
 		"tests.protocol.autonat_test",
 		"tests.protocol.relay_service_test",
 		"tests.protocol.autonat_service_test",
+		"tests.security.plaintext_test",
+		"tests.transport.dns_test",
+		"tests.discovery.mdns_test",
+		"tests.discovery.mdns_service_test",
+		"tests.muxer.mplex_test",
+		"tests.muxer.mplex_conn_test",
 	);
 }

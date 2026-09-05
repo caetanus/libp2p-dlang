@@ -86,6 +86,12 @@ final class MemStream : Stream
 	{
 		return tx.data.length;
 	}
+
+	/// Bytes waiting for this end to read.
+	size_t available() const @safe pure nothrow @nogc
+	{
+		return rx.data.length;
+	}
 }
 
 void memPair(out MemStream a, out MemStream b)

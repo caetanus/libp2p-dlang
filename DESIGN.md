@@ -419,4 +419,11 @@ a relayed stream admitted to the swarm as a raw connection and upgraded like any
 other; DCUtR on top of it; AutoNAT v1 (`protocol/autonat/`) with the server
 dialing back only at the observed IP, throttled, and the client's
 confidence-weighted status. The swarm grew `addTransport`, `admitOutbound` and
-`admitInboundRaw` for those.
+`admitInboundRaw` for those. Then the small ones: plaintext/2.0.0
+(`security/plaintext.d`); name resolution (`transport/dns.d`: `/dns*` by
+A/AAAA, `/dnsaddr` by TXT followed on a budget, resolved by the swarm before a
+transport sees the address, with the system resolver over UDP for TXT); mDNS
+(`discovery/mdns.d`: the DNS codec and a responder on 224.0.0.251:5353 that
+fills the peerstore); and mplex (`muxer/mplex.d`) with rust's two ceilings. Both
+muxers now deliver streams the peer opened before the session ended, and only
+then report the ending.

@@ -102,6 +102,8 @@ final class YamuxConn : Muxer
 
 	Stream accept()
 	{
+		// Streams the peer opened before the session ended are still delivered;
+		// the ending is reported once there is nothing left to hand over.
 		auto seen = arrived.emitCount;
 		while (backlog.length == 0)
 		{
@@ -111,7 +113,8 @@ final class YamuxConn : Muxer
 		}
 		auto s = backlog[0];
 		backlog = backlog[1 .. $];
-		sendFrame(typeWindowUpdate, flagAck, s.id, 0);
+		if (!closed)
+			sendFrame(typeWindowUpdate, flagAck, s.id, 0); // a dead session has nobody to ack to
 		return s;
 	}
 
@@ -168,7 +171,6 @@ final class YamuxConn : Muxer
 		foreach (s; streams)
 			s.sessionEnded(why);
 		streams = null;
-		backlog = null;
 		arrived.emit();
 		// The transport is closed by whoever owns the reader's stack at this
 		// point: close() after joining it, or the reader itself on its way out.
