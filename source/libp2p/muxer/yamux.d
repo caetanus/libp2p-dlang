@@ -121,10 +121,17 @@ final class YamuxConn : Muxer
 			return;
 		end(new ConnClosed("yamux: session closed"), goAwayNormal);
 		// The reader is ours: it leaves before close() returns, and it leaves by
-		// being interrupted — never by having the socket closed under it, which
-		// races the wakeup with the cancellation. Uninterruptible because we are
-		// already finishing, and a second interruption here would leave it
-		// running, which is the one thing close() promises not to do.
+		// being interrupted — never by having the socket closed under it. vibe's
+		// close() shuts the socket down and drops a reference, but a parked read
+		// holds its own, so the descriptor stays registered; cancelling the read
+		// afterwards misses it (the connection's handle is already invalid) and a
+		// later readable event fires an orphaned callback, which is an assertion
+		// inside vibe's event loop. The swarm tests over real sockets fail when
+		// this order is reversed; a minimal yamux-only reproduction does not
+		// exist, because there the reader's own reference is the last one.
+		// Uninterruptible because we are already finishing, and a second
+		// interruption here would leave it running, which is the one thing
+		// close() promises not to do.
 		if (reader != Task.getThis() && reader.running)
 		{
 			reader.interrupt();

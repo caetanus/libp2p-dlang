@@ -663,3 +663,4 @@ unittest
 	wasEof.should.equal(true); // and only then did the read end
 	msg.should.equal("yamux: stream closed by peer");
 }
+
