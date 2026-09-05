@@ -25,7 +25,7 @@ jobs:
         with:
           path: libp2p-dlang
       - name: fetch d-webrtc beside it
-        run: git clone --depth 1 "${{ vars.D_WEBRTC_REPO }}" d-webrtc
+        run: git clone --depth 1 "${{ vars.D_WEBRTC_REPO || 'https://github.com/caetanus/d-webrtc.git' }}" d-webrtc
       - uses: dlang-community/setup-dlang@v2
         with:
           compiler: dmd-latest
@@ -43,7 +43,7 @@ jobs:
         with:
           path: libp2p-dlang
       - name: fetch d-webrtc beside it
-        run: git clone --depth 1 "${{ vars.D_WEBRTC_REPO }}" d-webrtc
+        run: git clone --depth 1 "${{ vars.D_WEBRTC_REPO || 'https://github.com/caetanus/d-webrtc.git' }}" d-webrtc
       - uses: dlang-community/setup-dlang@v2
         with:
           compiler: dmd-latest
