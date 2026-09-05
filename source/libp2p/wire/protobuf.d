@@ -31,6 +31,12 @@ struct field
 	uint number;
 }
 
+/// A plain field that is written only when it holds something: a non-empty
+/// string or array, a non-default scalar. proto2 `optional` without the
+/// `Nullable` on the D side, for messages where "absent" and "empty" mean the
+/// same thing to every reader.
+enum optional;
+
 enum WireType : ubyte
 {
 	varint = 0,
@@ -96,11 +102,24 @@ ubyte[] encode(T)(auto ref const T msg) if (isMessage!T)
 private void encodeInto(T)(auto ref const T msg, ref ubyte[] out_) if (isMessage!T)
 {
 	static foreach (m; byNumber!T)
-		encodeField!(fieldNumber!(T, m))(__traits(getMember, msg, m), out_);
+		encodeField!(fieldNumber!(T, m), hasUDA!(__traits(getMember, T, m), optional))(__traits(getMember, msg, m), out_);
 }
 
-private void encodeField(uint number, T)(auto ref const T value, ref ubyte[] out_)
+private void encodeField(uint number, bool skipEmpty = false, T)(auto ref const T value, ref ubyte[] out_)
 {
+	static if (skipEmpty)
+	{
+		static if (isArray!T || isSomeString!T)
+		{
+			if (value.length == 0)
+				return;
+		}
+		else static if (!isNullable!T && !isMessage!T)
+		{
+			if (value == T.init)
+				return;
+		}
+	}
 	static if (isNullable!T)
 	{
 		if (!value.isNull)

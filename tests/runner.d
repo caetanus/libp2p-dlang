@@ -31,5 +31,8 @@ int main(string[] args)
 		"tests.security.noise_test",
 		"tests.muxer.yamux_test",
 		"tests.swarm.swarm_test",
+		"tests.protocol.ping_test",
+		"tests.protocol.identify_test",
+		"tests.host.host_test",
 	);
 }

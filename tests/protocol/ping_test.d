@@ -1,12 +1,11 @@
 module tests.protocol.ping_test;
 
 import core.time : Duration;
-import libp2p.protocol.ping : ping, handlePing;
-import libp2p.muxer.mplex : Mplex;
-import libp2p.core.stream : ByteStream;
+import libp2p.protocol.ping : ping, handlePing, pingProtocol, pingSize;
+import libp2p.muxer.yamux : YamuxConn;
+import libp2p.core.stream;
 import libp2p.multistream.select : negotiateDialer, negotiateListener;
-import libp2p.protocol.ping : pingProtocol;
-import tests.util.fiberpipe : runPair;
+import tests.util.pipe : runPair;
 import fluent.asserts;
 
 @("ping round-trips a payload directly over a stream")
@@ -15,27 +14,35 @@ unittest
 	Duration rtt;
 	bool handled;
 	runPair(
-		(ByteStream s) { rtt = ping(s); },
-		(ByteStream s) { handlePing(s); handled = true; });
+		(Stream s) { rtt = ping(s); },
+		(Stream s) { handlePing(s); handled = true; });
 	handled.should.equal(true);
 	(rtt >= Duration.zero).should.equal(true);
 }
 
-@("full stack: mplex + multistream + ping")
+@("full stack: yamux + multistream + ping")
 unittest
 {
 	Duration rtt;
 	string served;
 	runPair(
-		(ByteStream c) {
-		auto m = new Mplex(c, true);
-		auto s = m.openStream();
+		(Stream c) {
+		auto m = new YamuxConn(c, true);
+		scope (exit)
+			m.close();
+		auto s = m.open();
+		scope (exit)
+			s.close();
 		negotiateDialer(s, [pingProtocol]);
 		rtt = ping(s);
 	},
-		(ByteStream c) {
-		auto m = new Mplex(c, false);
-		auto s = m.acceptStream();
+		(Stream c) {
+		auto m = new YamuxConn(c, false);
+		scope (exit)
+			m.close();
+		auto s = m.accept();
+		scope (exit)
+			s.close();
 		served = negotiateListener(s, [pingProtocol]);
 		handlePing(s);
 	});
@@ -43,27 +50,24 @@ unittest
 	(rtt >= Duration.zero).should.equal(true);
 }
 
-// The dialer rejects a mismatched echo: rust ping treats a payload that comes
-// back altered as a protocol failure (InvalidData). Here a handler echoes a
-// flipped payload and `ping` must throw.
+// The dialer rejects a mismatched echo: a payload that comes back altered is a
+// protocol failure. Here a handler echoes a flipped payload and `ping` must throw.
 @("ping rejects a mismatched echo")
 unittest
 {
-	import libp2p.protocol.ping : pingSize;
-
 	bool threw;
 	runPair(
-		(ByteStream s) {
+		(Stream s) {
 		try
 			ping(s);
 		catch (Exception)
 			threw = true;
 	},
-		(ByteStream s) {
+		(Stream s) {
 		ubyte[pingSize] buf;
 		s.readExact(buf[]);
 		buf[0] ^= 0xFF; // corrupt one byte of the echo
-		s.writeBytes(buf[]);
+		s.write(buf[]);
 	});
 	threw.should.equal(true);
 }
