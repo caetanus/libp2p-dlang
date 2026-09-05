@@ -175,7 +175,21 @@ final class Swarm
 
 	private Connection dialOne(const Multiaddr target, Nullable!PeerId expected)
 	{
+		// An address may name its peer (`.../p2p/<id>`); transports dial the
+		// part before it, and the name becomes the peer we expect.
 		auto addr = Multiaddr(target.bytes.dup);
+		auto comps = addr.components;
+		if (comps.length > 0 && comps[$ - 1].name == "p2p")
+		{
+			auto named = PeerId.fromBytes(comps[$ - 1].value);
+			enforce(expected.isNull || expected.get == named,
+				"swarm: address names " ~ named.toString ~ " but " ~ expected.get.toString ~ " was expected");
+			expected = named;
+			Multiaddr bare;
+			foreach (c; comps[0 .. $ - 1])
+				bare = bare ~ Multiaddr.parse("/" ~ c.name ~ (c.protocol.size != 0 ? "/" ~ c.text : ""));
+			addr = bare;
+		}
 		auto pending = limiter.pending(Endpoint.dialer);
 		scope (exit)
 			pending.release(); // and by unwinding, whichever comes first

@@ -34,5 +34,13 @@ int main(string[] args)
 		"tests.protocol.ping_test",
 		"tests.protocol.identify_test",
 		"tests.host.host_test",
+		"tests.protocol.kad_key_test",
+		"tests.protocol.kad_bucket_test",
+		"tests.protocol.kad_table_test",
+		"tests.protocol.kad_message_test",
+		"tests.protocol.kad_query_test",
+		"tests.protocol.kad_store_test",
+		"tests.protocol.kad_jobs_test",
+		"tests.protocol.kad_node_test",
 	);
 }

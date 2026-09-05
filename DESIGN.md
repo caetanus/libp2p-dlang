@@ -399,5 +399,10 @@ this code, which is exactly what the interop run exists to catch.
 ## 5. Not in milestone 1
 
 QUIC (ngtcp2), WebRTC, WebSocket, mplex, plaintext, relay, dcutr, autonat,
-kad, gossipsub, mdns, identify/push, DNS via c-ares, the browser/WASM target.
-Their contract tests stay in `contract/` untouched until their turn.
+gossipsub, mdns, DNS via c-ares, the browser/WASM target. Their contract tests
+stay in `contract/` untouched until their turn.
+
+**BUILT since:** identify/push; Kademlia (`protocol/kad/`), with the routing
+table, the store, the jobs and the iterative lookup carried from the contract
+as pure algorithms, and the lookup driven by α fibers (`runQuery`) instead of a
+poll loop — the α that the laundered code never actually had.

@@ -6,6 +6,7 @@ import libp2p.crypto.keys : Keypair;
 import libp2p.core.peer_id : PeerId;
 import libp2p.protocol.kad.key : Key;
 import libp2p.protocol.kad.query;
+import tests.util.loop : onLoop;
 import fluent.asserts;
 
 private PeerId rp()
@@ -347,4 +348,145 @@ unittest
 		else
 			closest.length.should.equal(numResults);
 	}
+}
+
+// --- the fixed set --------------------------------------------------------------
+
+// A failure frees a parallelism slot.
+@("kad fixed-iter: a failure frees a parallelism slot")
+unittest
+{
+	auto it = new FixedPeersIter([rp(), rp()], 1);
+
+	auto s = it.next();
+	s.kind.should.equal(IterStateKind.waiting);
+	s.hasPeer.should.equal(true);
+	it.onFailure(s.peer).should.equal(true);
+
+	// The freed slot must let the next peer through (not WaitingAtCapacity).
+	auto s2 = it.next();
+	s2.kind.should.equal(IterStateKind.waiting);
+	s2.hasPeer.should.equal(true);
+}
+
+// A fixed iterator finishes once every contacted peer has answered, and reports
+// exactly the succeeded peers.
+@("kad fixed-iter: finishes after all peers answer, yields succeeded")
+unittest
+{
+	auto a = rp(), b = rp();
+	auto it = new FixedPeersIter([a, b], 3);
+
+	auto s1 = it.next();
+	s1.hasPeer.should.equal(true);
+	auto s2 = it.next();
+	s2.hasPeer.should.equal(true);
+	// both in flight; nothing new to hand out yet
+	it.next().hasPeer.should.equal(false);
+
+	it.onSuccess(s1.peer).should.equal(true);
+	it.onFailure(s2.peer).should.equal(true);
+
+	it.next().kind.should.equal(IterStateKind.finished);
+	it.isFinished.should.equal(true);
+	auto res = it.intoResult();
+	res.length.should.equal(1UL);
+	(res[0] == s1.peer).should.equal(true);
+}
+
+@("kad fixed-iter: empty set finishes immediately")
+unittest
+{
+	auto it = new FixedPeersIter([], 3);
+	it.next().kind.should.equal(IterStateKind.finished);
+}
+
+// --- the driver: α that is really α ---------------------------------------------
+//
+// Kademlia's whole latency argument rests on α requests being in flight at
+// once. The iterator only decides; the driver has to actually overlap the
+// contacts, and never more than α of them.
+@("kad query: runQuery contacts alpha peers at once, and never more than alpha")
+unittest
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+
+	enum alpha = 3;
+	PeerId[] known;
+	foreach (_; 0 .. 8)
+		known ~= rp();
+
+	size_t live, peak, contacted;
+	onLoop({
+		auto it = new ClosestPeersIter(Key.fromPeer(rp()), known, alpha, 20);
+		runQuery(it, alpha, (PeerId p) {
+			live++;
+			if (live > peak)
+				peak = live;
+			contacted++;
+			sleep(20.msecs); // the network turnaround, in miniature
+			live--;
+			return PeerId[].init; // knows nobody new: the search converges
+		});
+	});
+
+	peak.should.be.greaterThan(1); // they genuinely overlapped...
+	peak.should.be.lessThan(alpha + 1); // ...and the limit still held
+	contacted.should.be.greaterThan(alpha); // the search really ran
+	live.should.equal(0); // nothing outlived the call
+}
+
+// The deadline stops the search from handing out new peers. It does not abandon
+// the contacts in flight — no fiber outlives the call — so the assertion is that
+// the search was cut short, not that it returned instantly.
+@("kad query: runQuery stops handing out peers once its deadline passes")
+unittest
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+
+	PeerId[] known;
+	foreach (_; 0 .. 12)
+		known ~= rp();
+
+	size_t contacted;
+	bool finished;
+	onLoop({
+		// numResults above the peers we know keeps the search iterating, where
+		// the parallelism limit is α; a stalled search fans out on purpose.
+		auto it = new ClosestPeersIter(Key.fromPeer(rp()), known, 2, 30);
+		runQuery(it, 2, (PeerId p) {
+			contacted++;
+			sleep(40.msecs); // slower than the deadline allows for twelve
+			return PeerId[].init;
+		}, 60.msecs);
+		finished = it.isFinished;
+	});
+
+	contacted.should.be.greaterThan(0); // it did start
+	contacted.should.be.lessThan(known.length); // and it did not finish the set
+	finished.should.equal(true); // the deadline ended the query, not exhaustion
+}
+
+// A contact that throws is a failure for that peer and nothing more.
+@("kad query: a contact that throws fails that peer and the search goes on")
+unittest
+{
+	PeerId[] known;
+	foreach (_; 0 .. 4)
+		known ~= rp();
+	size_t asked;
+	PeerId[] result;
+	onLoop({
+		auto it = new ClosestPeersIter(Key.fromPeer(rp()), known, 2, 20);
+		result = runQuery(it, 2, (PeerId p) {
+			asked++;
+			if (asked % 2 == 0)
+				throw new Exception("unreachable");
+			return PeerId[].init;
+		});
+	});
+	asked.should.equal(4);
+	result.length.should.equal(2); // the ones that answered
 }
