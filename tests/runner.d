@@ -53,6 +53,7 @@ int main(string[] args)
 		"tests.protocol.autonat_service_test",
 		"tests.security.plaintext_test",
 		"tests.transport.dns_test",
+		"tests.transport.dns_cares_test",
 		"tests.discovery.mdns_test",
 		"tests.discovery.mdns_service_test",
 		"tests.muxer.mplex_test",

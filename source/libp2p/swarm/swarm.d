@@ -34,7 +34,8 @@ import libp2p.security.noise : NoiseTransport;
 import libp2p.swarm.connection;
 import libp2p.swarm.limiter;
 import libp2p.transport.transport;
-import libp2p.transport.dns : DnsResolver, SystemDns, resolve, needsResolution;
+import libp2p.transport.dns : DnsResolver, resolve, needsResolution;
+import libp2p.transport.dns_cares : CaresDns;
 import libp2p.util.fibers : FiberGroup;
 import libp2p.util.timeout : withTimeout;
 
@@ -105,7 +106,7 @@ final class Swarm
 		this.cfg = cfg;
 		this.gater = gater;
 		this.limiter = new Limiter(cfg.limits);
-		resolver = new SystemDns;
+		resolver = new CaresDns;
 		upgradeCfg.security = [new NoiseTransport(identity)];
 		upgradeCfg.muxers = [new YamuxFactory];
 		// An admission that fails is one connection not made; the swarm goes on.

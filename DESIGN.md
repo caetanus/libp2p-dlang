@@ -422,7 +422,11 @@ confidence-weighted status. The swarm grew `addTransport`, `admitOutbound` and
 `admitInboundRaw` for those. Then the small ones: plaintext/2.0.0
 (`security/plaintext.d`); name resolution (`transport/dns.d`: `/dns*` by
 A/AAAA, `/dnsaddr` by TXT followed on a budget, resolved by the swarm before a
-transport sees the address, with the system resolver over UDP for TXT); mDNS
+transport sees the address); the resolver is c-ares (`transport/dns_cares.d`),
+driven from a fiber: a `dup()` of each c-ares socket is adopted by vibe's
+`FileDescriptorEvent` and the fiber parks on it with the timeout c-ares asks
+for, so the loop stays free — the old code's `select()` on the loop thread is
+the one thing not carried; mDNS
 (`discovery/mdns.d`: the DNS codec and a responder on 224.0.0.251:5353 that
 fills the peerstore); and mplex (`muxer/mplex.d`) with rust's two ceilings. Both
 muxers now deliver streams the peer opened before the session ended, and only
