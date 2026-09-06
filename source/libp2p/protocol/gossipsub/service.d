@@ -17,7 +17,7 @@ import std.algorithm.searching : canFind;
 import vibe.core.core : sleep;
 import vibe.core.log : logDebug;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
-import vibe.core.task : Task;
+import vibe.core.task : InterruptException;
 
 import libp2p.core.ending : Ending;
 import libp2p.core.peer_id : PeerId;
@@ -61,6 +61,7 @@ final class Gossipsub : Notifiee
 	GossipSub router;
 	private PeerLink[PeerId] links;
 	private FiberGroup fibers;
+	private bool closed;
 
 	/// A message on a topic we subscribe to.
 	void delegate(PeerId from, string topic, const(ubyte)[] data) onMessage;
@@ -92,6 +93,12 @@ final class Gossipsub : Notifiee
 
 	void close() nothrow
 	{
+		if (closed)
+			return;
+		// Fence first: a connection-owned serve() (not in our fiber group, so
+		// stopAll cannot interrupt it) must not attach a new peer — with a fresh
+		// hold and writer — after we have dropped everything.
+		closed = true;
 		try
 		{
 			host.removeNotifiee(this);
@@ -134,6 +141,8 @@ final class Gossipsub : Notifiee
 
 	void connected(Connection c)
 	{
+		if (closed)
+			return;
 		fibers.spawn({ attach(c); });
 	}
 
@@ -147,6 +156,8 @@ final class Gossipsub : Notifiee
 	/// Open our stream to the peer and introduce it to the router.
 	private void attach(Connection c)
 	{
+		if (closed)
+			return;
 		auto peer = c.remotePeer;
 		if (peer in links)
 			return;
@@ -155,10 +166,22 @@ final class Gossipsub : Notifiee
 		string chosen;
 		try
 			link.out_ = c.newStream(meshsubProtocolIds, chosen);
+		catch (InterruptException e)
+		{
+			link.hold.release(); // release the hold, then let the stop unwind
+			throw e;
+		}
 		catch (Exception)
 		{
 			link.hold.release();
 			return; // not a gossipsub peer; nothing to do
+		}
+		// close() may have run while newStream blocked; drop the stream and hold we
+		// just opened rather than keep an unowned stream and a spawned writer.
+		if (closed)
+		{
+			drop(link);
+			return;
 		}
 		links[peer] = link;
 		router.addPeer(peer, c.role == Endpoint.dialer);
