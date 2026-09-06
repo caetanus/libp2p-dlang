@@ -543,6 +543,17 @@ private final class Session : Muxer
 	{
 		if (closed_)
 			return;
+		// Tell the peer we are leaving (SCTP shutdown, then DTLS close_notify) and
+		// push it out, so the far end tears the connection down promptly instead of
+		// waiting for a timeout. Best-effort — the socket may already be gone.
+		try
+		{
+			conn.closeNow();
+			pump(); // flush the close_notify
+		}
+		catch (Exception)
+		{
+		}
 		closed_ = true;
 		cause = new ConnClosed("webrtc: connection closed");
 		foreach (s; streams)
