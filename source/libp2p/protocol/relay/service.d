@@ -29,6 +29,7 @@ import std.typecons : Nullable, nullable;
 
 import vibe.core.core : sleep;
 import vibe.core.log : logDebug;
+import vibe.core.sync : LocalManualEvent, createManualEvent;
 import vibe.core.task : InterruptException;
 
 import libp2p.core.ending : Ending;
@@ -75,7 +76,6 @@ private struct Held
 	PeerId peer;
 	Connection conn;
 	MonoTime expires;
-	size_t stamp;
 }
 
 final class Relay : Notifiee, Transport
@@ -83,7 +83,7 @@ final class Relay : Notifiee, Transport
 	private Host host;
 	RelayLimits limits;
 	private Held[] reservations;
-	private size_t stamps;
+	private LocalManualEvent reservationChanged; // wakes the expiry sweeper
 	private RateLimiter!PeerId reservationRate;
 	private size_t circuits;
 	private size_t[PeerId] circuitsBy;
@@ -95,7 +95,9 @@ final class Relay : Notifiee, Transport
 	{
 		this.host = host;
 		this.limits = limits;
+		reservationChanged = createManualEvent();
 		fibers = new FiberGroup((Exception e) nothrow { logDebug("libp2p: relay work failed: %s", e.msg); });
+		fibers.spawn(&expireReservations);
 		host.setStreamHandler(hopProtocol, &serveHop);
 		host.setStreamHandler(stopProtocol, &serveStop);
 		host.setStreamHandler(dcutrProtocol, &serveDcutr);
@@ -213,13 +215,8 @@ final class Relay : Notifiee, Transport
 		if (mine >= limits.maxReservationsPerPeer)
 			return HopMessage.statusReply(Status.RESERVATION_REFUSED);
 
-		auto held = Held(peer, c, now + limits.reservationDuration, ++stamps);
-		reservations ~= held;
-		immutable stamp = held.stamp;
-		fibers.spawn({
-			sleep(limits.reservationDuration);
-			reservations = reservations.filter!(r => r.stamp != stamp).array;
-		});
+		reservations ~= Held(peer, c, now + limits.reservationDuration);
+		reservationChanged.emit(); // one sweeper expires them all; wake it for the new deadline
 
 		auto reply = HopMessage.statusReply(Status.OK);
 		reply.hasReservation = true;
@@ -228,6 +225,33 @@ final class Relay : Notifiee, Transport
 		reply.hasLimit = true;
 		reply.limit = Limit(cast(uint) limits.maxCircuitDuration.total!"seconds", limits.maxCircuitBytes);
 		return reply;
+	}
+
+	// One fiber expires reservations by their deadline. A timer per reservation
+	// would outlive an early forget/disconnect — sleeping out its full duration
+	// while a churning peer piled up more — so the ceiling bounded the table but
+	// not the fibers. This sweeps the earliest deadline and re-arms when a
+	// reservation is added.
+	private void expireReservations()
+	{
+		auto seen = reservationChanged.emitCount;
+		for (;;)
+		{
+			immutable now = MonoTime.currTime;
+			reservations = reservations.filter!(r => r.expires > now).array;
+			MonoTime next;
+			bool have;
+			foreach (r; reservations)
+				if (!have || r.expires < next)
+				{
+					next = r.expires;
+					have = true;
+				}
+			if (have)
+				seen = reservationChanged.wait(next - now, seen); // the soonest expiry, or a new reservation
+			else
+				seen = reservationChanged.wait(seen); // nothing to expire; wait for one
+		}
 	}
 
 	// --- as a relay: circuits ---------------------------------------------------------------------
