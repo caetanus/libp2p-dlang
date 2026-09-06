@@ -485,6 +485,14 @@ private final class Session : Muxer
 		pump();
 	}
 
+	// A failed engine (bad certhash, ICE or DTLS failure) is surfaced as a thrown
+	// error, not left to look like a slow connection until the dial's timeout.
+	private void throwIfFailed()
+	{
+		if (conn.state == ConnState.failed)
+			throw new ConnClosed("webrtc: " ~ conn.failureReason());
+	}
+
 	void waitReady()
 	{
 		auto seen = changed.emitCount;
@@ -492,6 +500,7 @@ private final class Session : Muxer
 		{
 			if (closed_)
 				throw cause;
+			throwIfFailed();
 			seen = changed.wait(transport.cfg.tick, seen);
 		}
 	}
@@ -518,8 +527,10 @@ private final class Session : Muxer
 		{
 			if (closed_)
 				throw cause;
+			throwIfFailed();
 			seen = changed.wait(transport.cfg.tick, seen);
 		}
+		throwIfFailed(); // the channel opened, but the connection may have failed since
 		ensureStream(sid);
 		return new WebRtcStream(streams[sid]);
 	}
@@ -531,8 +542,10 @@ private final class Session : Muxer
 		{
 			if (closed_)
 				throw cause;
+			throwIfFailed();
 			seen = changed.wait(seen);
 		}
+		throwIfFailed(); // a channel was accepted, but the connection may have failed since
 		immutable sid = accepted[0];
 		accepted = accepted[1 .. $];
 		ensureStream(sid);
@@ -603,6 +616,9 @@ private final class DcStream : Stream
 				throw cause;
 			if (closed)
 				throw new ConnClosed("webrtc: channel closed locally");
+			// A read during the Noise phase (before the swarm owns the session)
+			// must notice the engine failing, or it waits out the whole timeout.
+			session.throwIfFailed();
 			seen = session.changed.wait(seen);
 		}
 		immutable n = min(buf.length, inbound.length);
