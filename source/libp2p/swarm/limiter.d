@@ -28,12 +28,16 @@ enum LimitKind
 
 struct Limits
 {
-	uint pendingInbound;
-	uint pendingOutbound;
-	uint establishedInbound;
-	uint establishedOutbound;
-	uint establishedTotal;
-	uint establishedPerPeer;
+	// Sane defaults so a node is bounded out of the box (go-libp2p ships limits;
+	// rust leaves them to the app). An application raises or zeroes any of these;
+	// 0 is unlimited. The inbound/pending ceilings are what an attacker drives, so
+	// they matter most.
+	uint pendingInbound = 64;
+	uint pendingOutbound = 64;
+	uint establishedInbound = 256;
+	uint establishedOutbound = 256;
+	uint establishedTotal = 512;
+	uint establishedPerPeer = 8;
 
 	/// True if one more of `kind` fits given `current` already counted.
 	bool admits(LimitKind kind, uint current) const @safe pure nothrow
