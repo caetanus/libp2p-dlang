@@ -17,6 +17,8 @@ import std.algorithm.searching : canFind;
 import std.exception : enforce;
 import std.typecons : Nullable;
 
+import vibe.core.task : InterruptException;
+
 import libp2p.core.peer_id : PeerId;
 import libp2p.core.stream;
 import libp2p.crypto.keys : PublicKey;
@@ -125,6 +127,8 @@ final class IdentifyService : Notifiee
 			fibers.spawn({
 				try
 					push(c.remotePeer);
+				catch (InterruptException e)
+					throw e; // the group is stopping us, not a peer that will not listen
 				catch (Exception)
 				{
 				} // it is gone, or will not listen; nothing to decide here

@@ -22,6 +22,7 @@ import std.exception : enforce;
 import std.typecons : Nullable, nullable;
 
 import vibe.core.log : logDebug, logDiagnostic;
+import vibe.core.task : InterruptException;
 
 import libp2p.core.ending;
 import libp2p.core.peer_id : PeerId;
@@ -221,6 +222,8 @@ final class Swarm
 		{
 			try
 				return dialOne(addr, nullable(peer));
+			catch (InterruptException e)
+				throw e; // the dialer is being cancelled, not this address failing
 			catch (Exception e)
 				last = e;
 		}
@@ -236,6 +239,8 @@ final class Swarm
 		{
 			try
 				return dialOne(a, Nullable!PeerId.init);
+			catch (InterruptException e)
+				throw e; // the dialer is being cancelled, not this address failing
 			catch (Exception e)
 				last = e;
 		}

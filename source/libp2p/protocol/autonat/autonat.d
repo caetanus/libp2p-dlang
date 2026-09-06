@@ -20,6 +20,7 @@ import std.exception : enforce;
 import std.typecons : Nullable;
 
 import vibe.core.log : logDebug;
+import vibe.core.task : InterruptException;
 
 import libp2p.core.ending : Ending;
 import libp2p.core.peer_id : PeerId;
@@ -456,6 +457,8 @@ final class AutoNat
 		DialRequest req;
 		try
 			req = DialRequest.decode(s.readLengthPrefixed(maxAutonatMessage));
+		catch (InterruptException e)
+			throw e; // we are being stopped, not reading a malformed request
 		catch (Exception e)
 		{
 			s.writeLengthPrefixed(DialResponse(false, Multiaddr.init, ResponseError.badRequest, e.msg).encode);
@@ -495,6 +498,8 @@ final class AutoNat
 				resp = DialResponse(true, addr);
 				break;
 			}
+			catch (InterruptException e)
+				throw e; // the dial-back is being cancelled, not this address failing
 			catch (Exception e)
 			{
 				resp.statusText = e.msg;

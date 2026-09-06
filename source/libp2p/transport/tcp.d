@@ -45,6 +45,8 @@ final class TcpTransport : Transport
 		TCPConnection conn;
 		try
 			conn = connectTCP(toNetworkAddress(remote));
+		catch (InterruptException e)
+			throw e; // the dial was cancelled; do not disguise it as a dial failure
 		catch (Exception e)
 			throw new Exception("tcp: dial " ~ remote.toString ~ " failed", e);
 		conn.tcpNoDelay = true;

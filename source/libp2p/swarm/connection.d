@@ -23,7 +23,7 @@ import core.time : Duration;
 
 import vibe.core.core : sleep;
 import vibe.core.log : logDebug;
-import vibe.core.task : Task;
+import vibe.core.task : Task, InterruptException;
 
 import libp2p.core.ending : Ending;
 import libp2p.core.peer_id : PeerId;
@@ -194,6 +194,10 @@ final class Connection
 
 	private void inboundLoop()
 	{
+		// However this loop ends — peer gone, our owner stopping us, or an error
+		// — the connection is over, so close on the way out.
+		scope (exit)
+			close();
 		try
 		{
 			for (;;)
@@ -207,11 +211,15 @@ final class Connection
 			// The session ended — peer closed, reset, or a protocol error the
 			// muxer already reported. Either way this connection is over.
 		}
+		catch (InterruptException)
+		{
+			// Our owner is closing this connection; leave without logging it as
+			// a peer error. The scope guard still closes.
+		}
 		catch (Exception e)
 		{
 			logDebug("libp2p: connection to %s ended: %s", remotePeer_.toString, e.msg);
 		}
-		close();
 	}
 
 	private void serve(Stream s)

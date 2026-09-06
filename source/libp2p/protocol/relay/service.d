@@ -29,6 +29,7 @@ import std.typecons : Nullable, nullable;
 
 import vibe.core.core : sleep;
 import vibe.core.log : logDebug;
+import vibe.core.task : InterruptException;
 
 import libp2p.core.ending : Ending;
 import libp2p.core.peer_id : PeerId;
@@ -279,6 +280,12 @@ final class Relay : Notifiee, Transport
 					"destination refused");
 			});
 		}
+		catch (InterruptException e)
+		{
+			if (dstStream !is null)
+				dstStream.reset(); // still clean up, but do not disguise the stop as a failure
+			throw e;
+		}
 		catch (Exception e)
 		{
 			if (dstStream !is null)
@@ -308,6 +315,8 @@ final class Relay : Notifiee, Transport
 					pipe(dstStream, src, limits.maxCircuitBytes);
 				});
 			});
+		catch (InterruptException e)
+			throw e; // the relay is shutting down; the scope guards close both ends
 		catch (Exception)
 		{
 		} // the circuit is over, whichever way; both ends are closed below
@@ -474,6 +483,8 @@ final class Relay : Notifiee, Transport
 				auto direct = host.swarm.dial(addr);
 				return direct.remotePeer;
 			}
+			catch (InterruptException e)
+				throw e; // the hole punch was cancelled, not this address failing
 			catch (Exception e)
 				last = e;
 		}
@@ -501,6 +512,8 @@ final class Relay : Notifiee, Transport
 					host.swarm.dial(addr);
 					return;
 				}
+				catch (InterruptException e)
+					throw e; // the punch fiber is being stopped, not this address failing
 				catch (Exception)
 				{
 				} // the next address may work; if none does, the relayed connection stays

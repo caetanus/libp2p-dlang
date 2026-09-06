@@ -18,6 +18,7 @@ import core.time : Duration, MonoTime, seconds, msecs;
 import std.algorithm.sorting : sort;
 
 import vibe.core.sync : LocalManualEvent, createManualEvent;
+import vibe.core.task : InterruptException;
 
 import libp2p.core.peer_id : PeerId;
 import libp2p.protocol.kad.bucket : kValue;
@@ -380,6 +381,8 @@ PeerId[] runQuery(ClosestPeersIter it, size_t parallelism, PeerId[] delegate(Pee
 					closer = contact(s.peer);
 					ok = true;
 				}
+				catch (InterruptException e)
+					throw e; // the owner is stopping the query, not a peer timeout
 				catch (Exception)
 				{
 				} // the peer did not answer; the iterator records it and moves on
@@ -425,6 +428,8 @@ PeerId[] runFixed(FixedPeersIter it, size_t parallelism, void delegate(PeerId) c
 					contact(s.peer);
 					ok = true;
 				}
+				catch (InterruptException e)
+					throw e; // the owner is stopping the query, not a peer timeout
 				catch (Exception)
 				{
 				}

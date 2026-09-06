@@ -13,7 +13,7 @@ import core.time : Duration, seconds, MonoTime;
 import std.exception : enforce;
 
 import vibe.core.core : sleep;
-import vibe.core.task : Task;
+import vibe.core.task : Task, InterruptException;
 
 import libsodium.randombytes : randombytes_buf;
 
@@ -136,6 +136,8 @@ final class Ping : Notifiee
 			{
 				return; // the connection is gone; so is the reason to ping it
 			}
+			catch (InterruptException e)
+				throw e; // close() is stopping this loop, not a ping failure
 			catch (Exception e)
 			{
 				if (onFailure !is null)

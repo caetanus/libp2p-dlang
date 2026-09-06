@@ -20,6 +20,7 @@ import std.exception : enforce;
 
 import vibe.core.core : sleep;
 import vibe.core.log : logDebug;
+import vibe.core.task : InterruptException;
 
 import libp2p.core.ending : Ending;
 import libp2p.core.peer_id : PeerId;
@@ -261,6 +262,8 @@ final class Kademlia
 						auto closest = lookup(Key.fromBytes(rec.key.bytes), (PeerId q) => findNode(q, rec.key.bytes));
 						writeTo(closest, (PeerId q) { sendPutValue(q, rec); });
 					}
+					catch (InterruptException e)
+						throw e; // the owner is stopping us; not a failed record
 					catch (Exception e)
 						logDebug("libp2p: kad replication of a record failed: %s", e.msg);
 				}
@@ -275,6 +278,8 @@ final class Kademlia
 						auto closest = lookup(Key.fromBytes(rec.key.bytes), (PeerId q) => findNode(q, rec.key.bytes));
 						writeTo(closest, (PeerId q) { sendAddProvider(q, rec.key.bytes); });
 					}
+					catch (InterruptException e)
+						throw e; // the owner is stopping us; not a failed record
 					catch (Exception e)
 						logDebug("libp2p: kad provider re-announcement failed: %s", e.msg);
 				}
