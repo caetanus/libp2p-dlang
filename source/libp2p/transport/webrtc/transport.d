@@ -32,6 +32,7 @@ import vibe.core.core : sleep;
 import vibe.core.log : logDebug;
 import vibe.core.net;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
+import vibe.core.task : InterruptException;
 
 import webrtc.connection.connection : Connection, Perspective, OutboundDatagram, ConnState, noiseChannel;
 import webrtc.datachannel.channels : ChannelEvent, ChannelEventKind;
@@ -108,6 +109,12 @@ struct WebRtcConfig
 {
 	Duration connectTimeout = 15.seconds;
 	Duration tick = 50.msecs; /// how often the engine's timers are driven
+	/// The most inbound handshakes a listening socket will have in flight at
+	/// once. A STUN packet from a stranger starts a whole connection (an engine,
+	/// a ticker fiber, DTLS/SCTP state); without a ceiling a sender rotating its
+	/// source port could make unbounded numbers of them. Beyond this the packet
+	/// is dropped and the peer's own STUN retransmit retries once a slot frees.
+	uint maxPendingInbound = 32;
 }
 
 final class WebRtcTransport : CapableTransport
@@ -220,6 +227,17 @@ final class WebRtcTransport : CapableTransport
 	/// over Noise, with our certificate and theirs in the prologue.
 	private void admit(UdpMux mux, Session session)
 	{
+		// The inbound slot charged in readLoop is released here — after the peer
+		// authenticates or on any failure — via this flag, so it is given back
+		// once and no later than authentication (the hand-off below runs arbitrary
+		// notifiees and may block; the slot must not be held across it).
+		bool slotReleased;
+		scope (exit)
+			if (!slotReleased)
+			{
+				slotReleased = true;
+				mux.releaseInbound();
+			}
 		scope (failure)
 			session.close();
 		withTimeout(cfg.connectTimeout, "webrtc connect", { session.waitReady(); });
@@ -229,6 +247,10 @@ final class WebRtcTransport : CapableTransport
 			noiseStream.close();
 		auto peer = withTimeout(cfg.connectTimeout, "webrtc noise",
 			() => inbound(identity, noiseStream, clientFp, fingerprint()));
+		// Authenticated: give the inbound slot back before handing the connection
+		// to the swarm, so a slow notifiee cannot hold an admission slot.
+		slotReleased = true;
+		mux.releaseInbound();
 
 		UpgradedConn up;
 		up.muxer = session;
@@ -257,6 +279,42 @@ private long nowMs()
 	return (MonoTime.currTime - MonoTime.zero).total!"msecs";
 }
 
+/// Bounds inbound handshakes in flight on a listening socket. A STUN packet
+/// from a stranger starts a whole connection (an engine, a ticker fiber,
+/// DTLS/SCTP state); the cap keeps a sender rotating its source port from
+/// making unbounded numbers of them. A slot is charged when a handshake starts
+/// and released the moment it authenticates or fails. A cap of 0 is unlimited.
+struct InboundLimiter
+{
+	private uint cap;
+	private uint inFlight_;
+
+	this(uint cap) @safe pure nothrow @nogc
+	{
+		this.cap = cap;
+	}
+
+	/// Charge a slot if one is free; false means we are at the ceiling.
+	bool tryAcquire() @safe pure nothrow @nogc
+	{
+		if (cap != 0 && inFlight_ >= cap)
+			return false;
+		inFlight_++;
+		return true;
+	}
+
+	void release() @safe pure nothrow @nogc
+	{
+		if (inFlight_ > 0)
+			inFlight_--;
+	}
+
+	uint inFlight() const @safe pure nothrow @nogc
+	{
+		return inFlight_;
+	}
+}
+
 /// One UDP socket, many remotes.
 private final class UdpMux
 {
@@ -264,6 +322,7 @@ private final class UdpMux
 	private UDPConnection sock;
 	private bool listening;
 	private Session[TransportAddr] sessions;
+	private InboundLimiter admission; // caps unauthenticated inbound handshakes
 	private FiberGroup fibers;
 	private bool closed;
 	void delegate(UpgradedConn) onInbound;
@@ -273,8 +332,16 @@ private final class UdpMux
 		this.transport = transport;
 		this.sock = sock;
 		this.listening = listening;
+		admission = InboundLimiter(transport.cfg.maxPendingInbound);
 		fibers = new FiberGroup((Exception e) nothrow { logDebug("libp2p: webrtc inbound not admitted: %s", e.msg); });
 		fibers.spawn(&readLoop);
+	}
+
+	// Release an inbound handshake's slot. Called by admit() the moment the peer
+	// authenticates or the handshake fails.
+	private void releaseInbound() nothrow
+	{
+		admission.release();
 	}
 
 	ushort localPort()
@@ -346,11 +413,38 @@ private final class UdpMux
 			{
 				if (!listening || !isStunMessage(pkt))
 					continue; // not for anyone we know
-				auto session = openInbound(pkt, remote);
-				if (session is null)
+				if (!admission.tryAcquire())
+					continue; // at the ceiling: shed; the peer's STUN retransmit retries later
+				Session session;
+				try
+				{
+					session = openInbound(pkt, remote);
+					if (session is null)
+					{
+						admission.release();
+						continue;
+					}
+					sessions[remote] = session;
+					fibers.spawn({ transport.admit(this, session); });
+				}
+				catch (InterruptException e)
+				{
+					admission.release(); // the mux is stopping; give the slot back and unwind
+					throw e;
+				}
+				catch (Exception)
+				{
+					// Building the connection or starting its fiber threw after the
+					// slot was charged: release it and drop this one inbound rather
+					// than let a single bad packet kill the reader.
+					admission.release();
+					if (session !is null)
+					{
+						sessions.remove(remote);
+						session.close();
+					}
 					continue;
-				sessions[remote] = session;
-				fibers.spawn({ transport.admit(this, session); });
+				}
 				s = remote in sessions;
 			}
 			(*s).onDatagram(pkt.dup, remote);

@@ -59,3 +59,40 @@ unittest
 		"/ip4/127.0.0.1/udp/39901/webrtc-direct/certhash/uEiDikp5KVUgkLta1EjUN-IKbHk-dUBg8VzKgf5nXxLK46w/tcp/1")).isNull.should.equal(
 		true);
 }
+
+// The inbound limiter caps unauthenticated handshakes in flight: at the ceiling
+// a new one is refused, and a release frees exactly one slot.
+@("webrtc inbound limiter caps in-flight handshakes and frees on release")
+unittest
+{
+	auto lim = InboundLimiter(2);
+	lim.tryAcquire().should.equal(true);
+	lim.tryAcquire().should.equal(true);
+	lim.inFlight.should.equal(2);
+	lim.tryAcquire().should.equal(false); // at the ceiling
+	lim.release();
+	lim.inFlight.should.equal(1);
+	lim.tryAcquire().should.equal(true); // the freed slot is reusable
+	lim.inFlight.should.equal(2);
+}
+
+// Releasing more than was charged must not underflow the count.
+@("webrtc inbound limiter does not underflow on an extra release")
+unittest
+{
+	auto lim = InboundLimiter(1);
+	lim.release(); // nothing charged
+	lim.inFlight.should.equal(0);
+	lim.tryAcquire().should.equal(true);
+	lim.inFlight.should.equal(1);
+}
+
+// A cap of zero means unlimited, matching the swarm limiter's convention.
+@("webrtc inbound limiter of zero is unbounded")
+unittest
+{
+	auto lim = InboundLimiter(0);
+	foreach (_; 0 .. 500)
+		lim.tryAcquire().should.equal(true);
+	lim.inFlight.should.equal(500);
+}
