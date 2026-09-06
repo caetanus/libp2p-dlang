@@ -18,7 +18,7 @@
 		"libsodiumd": "~>0.2",
 		"openssl": "~>3.4",
 		"webrtc": {
-			"path": "../d-webrtc-v2"
+			"path": "../d-webrtc-v3"
 		}
 	},
 	"configurations": [

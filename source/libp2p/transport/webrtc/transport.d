@@ -5,8 +5,8 @@
  *
  *   /ip4/<ip>/udp/<port>/webrtc-direct/certhash/<multibase multihash>[/p2p/<id>]
  *
- * The engine is d-webrtc's sans-io `PeerConnection`: it is fed datagrams and
- * a clock and drained of datagrams. Everything with a lifetime is here: one
+ * The engine is d-webrtc's sans-io `Connection`: it is fed datagrams and a
+ * clock and drained of datagrams. Everything with a lifetime is here: one
  * UDP socket per listener shared by every remote (demultiplexed by their
  * address), a reader fiber per socket, a session per remote with a ticker
  * fiber for retransmission timers, and data channels presented as streams.
@@ -14,9 +14,8 @@
  * identities with both fingerprints in its prologue. The result is handed to
  * the swarm already upgraded.
  *
- * Known limits, stated: the Noise channel is opened by DCEP (the spec wants a
- * pre-negotiated id 0), and SCTP streams are not reset when a libp2p stream
- * ends — both are d-webrtc's to grow, and both interoperate between two of us.
+ * Noise runs on the negotiated data channel (id 0); further libp2p streams are
+ * DCEP-opened channels, and closing a stream resets its SCTP stream.
  */
 module libp2p.transport.webrtc.transport;
 
@@ -34,12 +33,12 @@ import vibe.core.log : logDebug;
 import vibe.core.net;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
 
-import webrtc.connection : PeerConnection, Perspective, Datagram;
-import webrtc.datachannel.channel : DataChannelConfig, ChannelState;
+import webrtc.connection.connection : Connection, Perspective, OutboundDatagram, ConnState, noiseChannel;
+import webrtc.datachannel.channels : ChannelEvent, ChannelEventKind;
 import webrtc.dtls.certificate : Certificate;
 import webrtc.ice.agent : Credentials, TransportAddr;
 import webrtc.ice.candidate : Candidate, CandidateType;
-import webrtc.stun.message : isStunMessage, StunMessage = Message, ATTR_USERNAME;
+import webrtc.stun.message : isStunMessage, StunMessage = Message, attrUsername;
 
 import libp2p.core.ending;
 import libp2p.core.peer_id : PeerId;
@@ -122,12 +121,12 @@ final class WebRtcTransport : CapableTransport
 	{
 		this.identity = identity;
 		this.cfg = cfg;
-		cert = Certificate.generate();
+		cert = new Certificate;
 	}
 
 	Fingerprint fingerprint()
 	{
-		return Fingerprint.raw(cert.fingerprint);
+		return Fingerprint.raw(cert.sha256Fingerprint());
 	}
 
 	bool canHandle(const Multiaddr addr)
@@ -158,24 +157,27 @@ final class WebRtcTransport : CapableTransport
 
 		immutable ufrag = randomUfrag();
 		auto creds = Credentials(ufrag, ufrag);
-		auto pc = new PeerConnection(Perspective.dialer, creds, uniform!ulong(), cert);
+		auto localAddr = TransportAddr(mux.localIp(target.ipv6), mux.localPort);
+		auto conn = new Connection(Perspective.dialer, cert, localAddr, creds, uniform!ulong());
 		auto remoteAddr = TransportAddr(target.host, target.port);
-		pc.addLocalCandidate(host(mux.localIp(target.ipv6), mux.localPort, target.ipv6));
-		pc.setRemoteIce(creds, host(target.host, target.port, target.ipv6));
+		conn.addLocalCandidate(host(mux.localIp(target.ipv6), mux.localPort, target.ipv6));
+		conn.setRemoteCredentials(creds);
+		conn.addRemoteCandidate(host(target.host, target.port, target.ipv6));
+		// Pin the server's certificate to the certhash in the address (fail-closed).
+		conn.setExpectedFingerprint(target.fingerprint.digest);
 
-		auto session = new Session(this, mux, pc, remoteAddr);
+		auto session = new Session(this, mux, conn, remoteAddr);
 		mux.add(remoteAddr, session);
 		scope (failure)
 			session.close();
 		session.kick();
 		withTimeout(cfg.connectTimeout, "webrtc connect", { session.waitReady(); });
 
-		// The server's certificate must be the one the address promised.
-		auto serverFp = Fingerprint.raw(pc.peerFingerprint);
-		enforce(serverFp == target.fingerprint, "webrtc: the server's certificate is not the one in the address");
+		// The pinned server certificate (verified during the DTLS handshake).
+		auto serverFp = Fingerprint.raw(conn.peerFingerprint());
 
-		// Noise, on the first channel: we are the WebRTC client, so the responder.
-		auto noiseStream = session.open();
+		// Noise, on the negotiated channel: we are the WebRTC client, so the responder.
+		auto noiseStream = session.noiseStream();
 		scope (exit)
 			noiseStream.close();
 		auto peer = withTimeout(cfg.connectTimeout, "webrtc noise",
@@ -221,8 +223,8 @@ final class WebRtcTransport : CapableTransport
 		scope (failure)
 			session.close();
 		withTimeout(cfg.connectTimeout, "webrtc connect", { session.waitReady(); });
-		auto clientFp = Fingerprint.raw(session.pc.peerFingerprint);
-		auto noiseStream = withTimeout(cfg.connectTimeout, "webrtc noise channel", () => session.accept());
+		auto clientFp = Fingerprint.raw(session.conn.peerFingerprint());
+		auto noiseStream = withTimeout(cfg.connectTimeout, "webrtc noise channel", () => session.noiseStream());
 		scope (exit)
 			noiseStream.close();
 		auto peer = withTimeout(cfg.connectTimeout, "webrtc noise",
@@ -306,7 +308,7 @@ private final class UdpMux
 			close();
 	}
 
-	void send(Datagram d)
+	void send(OutboundDatagram d)
 	{
 		if (closed)
 			return;
@@ -363,7 +365,7 @@ private final class UdpMux
 		try
 		{
 			auto msg = StunMessage.decode(pkt);
-			auto user = cast(const(char)[]) msg.get(ATTR_USERNAME);
+			auto user = cast(const(char)[]) msg.get(attrUsername);
 			immutable colon = user.countUntil(':');
 			if (colon <= 0)
 				return null;
@@ -373,10 +375,13 @@ private final class UdpMux
 			return null;
 		auto creds = Credentials(ufrag, ufrag);
 		immutable ipv6 = remote.ip.canFind(':');
-		auto pc = new PeerConnection(Perspective.listener, creds, uniform!ulong(), transport.cert);
-		pc.addLocalCandidate(host(localIp(ipv6), localPort, ipv6));
-		pc.setRemoteIce(creds, host(remote.ip, remote.port, ipv6));
-		auto session = new Session(transport, this, pc, remote);
+		auto localAddr = TransportAddr(localIp(ipv6), localPort);
+		auto conn = new Connection(Perspective.listener, transport.cert, localAddr, creds, uniform!ulong());
+		conn.addLocalCandidate(host(localIp(ipv6), localPort, ipv6));
+		conn.setRemoteCredentials(creds);
+		conn.addRemoteCandidate(host(remote.ip, remote.port, ipv6));
+		// The listener does not pin: the client's identity is proven over Noise.
+		auto session = new Session(transport, this, conn, remote);
 		session.kick();
 		return session;
 	}
@@ -387,7 +392,7 @@ private final class Session : Muxer
 {
 	private WebRtcTransport transport;
 	private UdpMux mux;
-	PeerConnection pc;
+	Connection conn;
 	TransportAddr remote;
 	private FiberGroup fibers;
 	private LocalManualEvent changed;
@@ -396,11 +401,11 @@ private final class Session : Muxer
 	private bool closed_;
 	private Exception cause;
 
-	this(WebRtcTransport transport, UdpMux mux, PeerConnection pc, TransportAddr remote)
+	this(WebRtcTransport transport, UdpMux mux, Connection conn, TransportAddr remote)
 	{
 		this.transport = transport;
 		this.mux = mux;
-		this.pc = pc;
+		this.conn = conn;
 		this.remote = remote;
 		changed = createManualEvent();
 		fibers = new FiberGroup;
@@ -415,7 +420,7 @@ private final class Session : Muxer
 			sleep(transport.cfg.tick);
 			if (closed_)
 				return;
-			pc.handleTimeout(nowMs());
+			conn.handleTimeout(nowMs());
 			pump();
 		}
 	}
@@ -428,52 +433,75 @@ private final class Session : Muxer
 
 	private void pump()
 	{
-		foreach (d; pc.gatherOutbound(nowMs()))
+		foreach (d; conn.gatherOutbound(nowMs()))
 			mux.send(d);
 		deliver();
 	}
 
 	private void deliver()
 	{
-		if (!pc.isReady)
+		// Not yet connected (or failed): waitReady's timeout wrapper handles it.
+		if (conn.state != ConnState.connected)
 		{
 			changed.emit();
 			return;
 		}
-		auto ch = pc.channels;
-		foreach (sid; ch.takeAccepted)
-			accepted ~= sid;
-		for (auto m = ch.receive(); !m.isNull; m = ch.receive())
+		foreach (e; conn.poll())
 		{
-			auto s = m.get.streamId in streams;
-			if (s is null)
+			final switch (e.kind)
 			{
-				// Data on a channel we have not accepted yet: keep it for when we do.
-				streams[m.get.streamId] = new DcStream(this, m.get.streamId);
-				s = m.get.streamId in streams;
+			case ChannelEventKind.opened:
+				ensureStream(e.channel);
+				// A channel the PEER opened (remote) — not our own confirmed open, and
+				// not the negotiated Noise channel 0 — is an inbound libp2p stream
+				// awaiting accept().
+				if (e.remote && e.channel != noiseChannel && !accepted.canFind(e.channel))
+					accepted ~= e.channel;
+				break;
+			case ChannelEventKind.message:
+				ensureStream(e.channel);
+				streams[e.channel].inbound ~= e.data;
+				break;
+			case ChannelEventKind.closed:
+				if (auto s = e.channel in streams)
+					(*s).ended(new ConnClosed("webrtc: channel reset by peer"));
+				break;
 			}
-			(*s).inbound ~= m.get.data;
 		}
 		changed.emit();
+	}
+
+	private void ensureStream(ushort sid)
+	{
+		if (sid !in streams)
+			streams[sid] = new DcStream(this, sid);
 	}
 
 	void onDatagram(ubyte[] data, TransportAddr from)
 	{
 		if (closed_)
 			return;
-		pc.handleDatagram(data, from, TransportAddr(mux.localIp(from.ip.canFind(':')), mux.localPort), nowMs());
+		conn.handleInbound(data, from, nowMs());
 		pump();
 	}
 
 	void waitReady()
 	{
 		auto seen = changed.emitCount;
-		while (!pc.isReady)
+		while (conn.state != ConnState.connected)
 		{
 			if (closed_)
 				throw cause;
 			seen = changed.wait(transport.cfg.tick, seen);
 		}
+	}
+
+	/// The negotiated channel (id 0) libp2p runs Noise over; open on connect.
+	Stream noiseStream()
+	{
+		waitReady();
+		ensureStream(noiseChannel);
+		return new WebRtcStream(streams[noiseChannel]);
 	}
 
 	// --- Muxer -------------------------------------------------------------------------------
@@ -482,24 +510,18 @@ private final class Session : Muxer
 	{
 		if (closed_)
 			throw cause;
-		immutable sid = pc.channels.open(DataChannelConfig("", ""));
+		waitReady();
+		immutable sid = conn.channels().open("", "");
 		pump();
 		auto seen = changed.emitCount;
-		while (pc.channels.channelState(sid) != ChannelState.open)
+		while (!conn.channels().isOpen(sid))
 		{
 			if (closed_)
 				throw cause;
 			seen = changed.wait(transport.cfg.tick, seen);
 		}
-		// Data may already have arrived on this channel while we waited for the
-		// ACK; deliver() will have made the stream for it. Never replace it.
-		auto s = sid in streams;
-		if (s is null)
-		{
-			streams[sid] = new DcStream(this, sid);
-			s = sid in streams;
-		}
-		return new WebRtcStream(*s);
+		ensureStream(sid);
+		return new WebRtcStream(streams[sid]);
 	}
 
 	Stream accept()
@@ -513,13 +535,8 @@ private final class Session : Muxer
 		}
 		immutable sid = accepted[0];
 		accepted = accepted[1 .. $];
-		auto s = sid in streams;
-		if (s is null)
-		{
-			streams[sid] = new DcStream(this, sid);
-			s = sid in streams;
-		}
-		return new WebRtcStream(*s);
+		ensureStream(sid);
+		return new WebRtcStream(streams[sid]);
 	}
 
 	void close() nothrow
@@ -544,7 +561,7 @@ private final class Session : Muxer
 	{
 		if (closed_)
 			throw cause;
-		pc.channels.send(sid, data, false);
+		conn.channels().send(sid, data, false);
 		pump();
 	}
 }
