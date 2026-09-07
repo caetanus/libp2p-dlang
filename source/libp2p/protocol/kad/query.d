@@ -441,7 +441,9 @@ PeerId[] runFixed(FixedPeersIter it, size_t parallelism, void delegate(PeerId) c
 				seen = changed.emitCount;
 				continue;
 			}
-			seen = changed.wait(100.msecs, seen);
+			// A fixed set has no per-peer timeout, so there is nothing to poll for:
+			// wait for another worker's result rather than spinning every 100ms.
+			seen = changed.wait(seen);
 		}
 	}
 
