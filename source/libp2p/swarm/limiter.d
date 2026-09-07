@@ -101,10 +101,12 @@ struct Lease
 
 	void release() nothrow
 	{
-		if (limiter is null)
-			return;
-		limiter.give(role, established, peer);
+		// Clear the reference before the (re-entrant) give-back, so a double release
+		// — or one reached while unwinding — is a no-op rather than a second decrement.
+		auto l = limiter;
 		limiter = null;
+		if (l !is null)
+			l.give(role, established, peer);
 	}
 }
 
