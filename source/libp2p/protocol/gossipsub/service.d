@@ -59,7 +59,8 @@ final class Gossipsub : Notifiee
 	private Host host;
 	private GossipsubConfig cfg;
 	GossipSub router;
-	private PeerLink[PeerId] links;
+	private PeerLink[PeerId] links; // ready peers only: a live meshsub stream + a writer
+	private bool[PeerId] attaching; // an attach is opening a stream; not yet a ready peer
 	private FiberGroup fibers;
 	private bool closed;
 
@@ -159,8 +160,19 @@ final class Gossipsub : Notifiee
 		if (closed)
 			return;
 		auto peer = c.remotePeer;
-		if (peer in links)
+		if (peer in links || peer in attaching)
 			return;
+		// Claim in `attaching` (NOT `links`) before the yielding newStream, so a
+		// second attach for the same peer — connected() and serve() both attach —
+		// bails at the check above instead of opening a second meshsub stream.
+		// Opening two and dropping one either orphaned a held PeerLink (which the GC
+		// then released from its finalizer — an illegal allocation:
+		// InvalidMemoryOperationError) or made the peer drop us from its mesh. The
+		// link only enters `links` — the ready set the rest of the service reads —
+		// once its stream is open, so nothing ever sees a half-built peer.
+		attaching[peer] = true;
+		scope (exit)
+			attaching.remove(peer);
 		auto link = new PeerLink(c);
 		link.hold = c.hold();
 		string chosen;
@@ -176,18 +188,26 @@ final class Gossipsub : Notifiee
 			link.hold.release();
 			return; // not a gossipsub peer; nothing to do
 		}
-		// close() may have run while newStream blocked; drop the stream and hold we
-		// just opened rather than keep an unowned stream and a spawned writer.
+		// close() may have run while newStream yielded (a concurrent attach cannot
+		// have registered this peer — `attaching` blocked it).
 		if (closed)
 		{
 			drop(link);
 			return;
 		}
 		links[peer] = link;
+		// Anything below throwing (OOM, a failed spawn) must not strand the ready
+		// link and its hold: undo the registration and release.
+		scope (failure)
+		{
+			links.remove(peer);
+			router.removePeer(peer);
+			link.hold.release();
+		}
 		router.addPeer(peer, c.role == Endpoint.dialer);
 		link.queue ~= router.helloRpc;
-		link.wake.emit();
 		fibers.spawn({ writer(peer, link); });
+		link.wake.emit();
 	}
 
 	/// Their stream to us: read RPCs for as long as it lasts.

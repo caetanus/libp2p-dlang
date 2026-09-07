@@ -61,10 +61,12 @@ struct Hold
 
 	void release() nothrow
 	{
-		if (conn is null)
-			return;
-		conn.releaseHold();
+		// Clear the reference before the (re-entrant) release, so a double release
+		// or a release reached during unwinding is a no-op.
+		auto c = conn;
 		conn = null;
+		if (c !is null)
+			c.releaseHold();
 	}
 }
 
