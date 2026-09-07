@@ -428,13 +428,12 @@ private final class YamuxStream : Stream
 		catch (Exception)
 		{
 		} // the session is gone; nothing left to tell
-		// Whatever the peer still sends is discarded (read() will not hand it
-		// over), so give the credit back as if it had been read.
-		if (recvBuf.length > 0)
-		{
-			credit(cast(uint) recvBuf.length);
-			recvBuf = null;
-		}
+		// Discard whatever the peer sent that we never read, WITHOUT handing its
+		// receive window back here: that would be a second blocking send right after
+		// the FIN, and if the FIN swallowed an interruption it could hang a teardown.
+		// A FIN only half-closes, so data the peer keeps sending is still credited in
+		// onData; only this already-buffered slice's window is not returned.
+		recvBuf = null;
 		if (remoteClosed)
 			conn.forget(id);
 		changed.emit();
@@ -508,19 +507,27 @@ private final class YamuxStream : Stream
 	}
 
 	/// Return credit to the peer once enough has been consumed to be worth a frame.
-	private void credit(uint n) nothrow
+	/// Not nothrow: this runs on the reader fiber (a half-closed stream still
+	/// receives, so onData credits) and on a read(); if the send blocks and the
+	/// owner interrupts us, the interruption must unwind — swallowing it here would
+	/// consume the only cancellation and hang the connection teardown that follows.
+	private void credit(uint n)
 	{
 		consumed += n;
 		if (consumed < conn.cfg.receiveWindow / 2)
 			return;
 		immutable delta = consumed;
-		consumed = 0;
-		recvWindow += delta;
 		try
 			conn.sendFrame(typeWindowUpdate, 0, id, delta);
+		catch (InterruptException e)
+			throw e; // the update was NOT sent; keep `consumed` so it is retried, and
+		// let the owner's stop unwind the reader or the read().
 		catch (Exception)
 		{
 		} // if the session is gone the reader will learn it its own way
+		// The credit is now sent (or deemed lost with the session): clear the debt.
+		consumed = 0;
+		recvWindow += delta;
 	}
 }
 
