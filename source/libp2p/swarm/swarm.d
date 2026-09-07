@@ -52,6 +52,11 @@ struct SwarmConfig
 	Duration idleTimeout = Duration.zero;
 	Duration dialTimeout = 10.seconds;
 	Duration handshakeTimeout = 10.seconds;
+	/// The most inbound substreams one connection will serve at once. A peer that
+	/// keeps opening streams would otherwise pile up an unbounded number of handler
+	/// fibers; at the ceiling the connection stops accepting, and the muxer resets
+	/// the peer's streams past its own backlog. 0 is unlimited.
+	uint maxInboundStreams = 256;
 }
 
 /// A connection that arrives already authenticated and multiplexed: what a

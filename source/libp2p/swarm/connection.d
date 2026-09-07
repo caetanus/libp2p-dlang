@@ -23,6 +23,7 @@ import core.time : Duration;
 
 import vibe.core.core : sleep;
 import vibe.core.log : logDebug;
+import vibe.core.sync : LocalManualEvent, createManualEvent;
 import vibe.core.task : Task, InterruptException;
 
 import libp2p.core.ending : Ending;
@@ -83,6 +84,8 @@ final class Connection
 
 	private FiberGroup own; // the inbound loop and the idle timer
 	private FiberGroup work; // handler fibers
+	private LocalManualEvent handlerLeft; // wakes the accept loop when a handler frees a slot
+	private uint activeHandlers; // inbound substream handlers currently running
 	private Task idleTimer;
 	private uint holds;
 	private bool closing;
@@ -106,6 +109,7 @@ final class Connection
 		work = new FiberGroup((Exception e) nothrow {
 			logDebug("libp2p: handler on %s failed: %s", remotePeer_.toString, e.msg);
 		}, &maybeArmIdle);
+		handlerLeft = createManualEvent();
 	}
 
 	/// Start serving. Called once by the swarm after the connection is in the pool.
@@ -202,10 +206,26 @@ final class Connection
 			close();
 		try
 		{
+			immutable cap = swarm.config.maxInboundStreams;
 			for (;;)
 			{
+				// At the handler ceiling, stop accepting: the muxer's backlog then fills
+				// and it resets the peer's further streams, so our handler fibers stay
+				// bounded instead of piling up without limit. The count is decremented
+				// before the wake, so the accept loop always sees the freed slot.
+				auto seen = handlerLeft.emitCount;
+				while (cap != 0 && activeHandlers >= cap)
+					seen = handlerLeft.wait(seen);
 				auto s = muxer.accept();
-				work.spawn({ serve(s); });
+				activeHandlers++;
+				work.spawn({
+					scope (exit)
+					{
+						activeHandlers--;
+						handlerLeft.emit();
+					}
+					serve(s);
+				});
 			}
 		}
 		catch (Ending)
