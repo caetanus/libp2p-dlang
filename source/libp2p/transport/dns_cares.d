@@ -87,6 +87,8 @@ private extern (C) nothrow alias ares_addrinfo_callback = void function(void* ar
 	ares_addrinfo* res);
 
 private enum ARES_SUCCESS = 0;
+private enum ARES_ENODATA = 1; // the name exists but has no record of this type
+private enum ARES_ENOTFOUND = 4; // the name does not exist
 private enum ARES_SOCKET_BAD = -1;
 private enum ARES_GETSOCK_MAXNUM = 16;
 private enum ARES_LIB_INIT_ALL = 0;
@@ -127,6 +129,7 @@ final class CaresDns : DnsResolver
 		TxtAnswer answer;
 		ares_query(ch, host.toStringz, C_IN, T_TXT, &onTxt, &answer);
 		drive(ch, &answer.done);
+		enforceResolved(answer.status, host);
 		return answer.txts;
 	}
 
@@ -215,13 +218,27 @@ final class CaresDns : DnsResolver
 	private struct AddrAnswer
 	{
 		bool done;
+		int status = ARES_SUCCESS;
 		string[] addrs;
 	}
 
 	private struct TxtAnswer
 	{
 		bool done;
+		int status = ARES_SUCCESS;
 		string[] txts;
+	}
+
+	// A resolution that failed (SERVFAIL, timeout, refused, cancelled, ...) must be
+	// distinguishable from a name that simply has no such record: the empty-but-OK
+	// cases (ENODATA/ENOTFOUND) return no addresses, everything else throws.
+	private static void enforceResolved(int status, string host)
+	{
+		if (status == ARES_SUCCESS || status == ARES_ENODATA || status == ARES_ENOTFOUND)
+			return;
+		import std.string : fromStringz;
+
+		throw new Exception("dns: resolving " ~ host ~ " failed: " ~ ares_strerror(status).fromStringz.idup);
 	}
 
 	private string[] lookupAddrs(string host, int family)
@@ -235,6 +252,7 @@ final class CaresDns : DnsResolver
 		hints.ai_socktype = SOCK_STREAM; // one entry per address, not one per socket type
 		ares_getaddrinfo(ch, host.toStringz, null, &hints, &onAddrs, &answer);
 		drive(ch, &answer.done);
+		enforceResolved(answer.status, host);
 		return answer.addrs;
 	}
 
@@ -242,6 +260,7 @@ final class CaresDns : DnsResolver
 	{
 		auto answer = cast(AddrAnswer*) arg;
 		answer.done = true;
+		answer.status = status;
 		if (status != ARES_SUCCESS || res is null)
 			return;
 		scope (exit)
@@ -269,6 +288,7 @@ final class CaresDns : DnsResolver
 	{
 		auto answer = cast(TxtAnswer*) arg;
 		answer.done = true;
+		answer.status = status;
 		if (status != ARES_SUCCESS)
 			return;
 		ares_txt_reply* txt;
