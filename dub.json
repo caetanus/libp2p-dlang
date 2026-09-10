@@ -16,15 +16,24 @@
 	"dependencies": {
 		"vibe-core": "~>2.0",
 		"libsodiumd": "~>0.2",
-		"openssl": "~>3.4",
-		"webrtc": {
-			"path": "../d-webrtc-v3"
-		}
+		"openssl": "~>3.4"
 	},
 	"configurations": [
 		{
 			"name": "library",
-			"targetType": "library"
+			"targetType": "library",
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
+		},
+		{
+			"name": "library-no-webrtc",
+			"targetType": "library",
+			"excludedSourceFiles": [
+				"source/libp2p/transport/webrtc/*.d"
+			]
 		},
 		{
 			"name": "interop-peer",
@@ -38,7 +47,12 @@
 			"importPaths": [
 				"source",
 				"interop/dpeer"
-			]
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		},
 		{
 			"name": "ut",
@@ -55,7 +69,10 @@
 			],
 			"dependencies": {
 				"unit-threaded": "~>2.2",
-				"fluent-asserts": "~>2.0"
+				"fluent-asserts": "~>2.0",
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
 			},
 			"dflags": [
 				"-unittest"
