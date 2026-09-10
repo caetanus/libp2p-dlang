@@ -37,7 +37,7 @@ import libp2p.swarm.connection;
 import libp2p.swarm.limiter;
 import libp2p.transport.transport;
 import libp2p.transport.dns : DnsResolver, resolve, needsResolution;
-import libp2p.transport.dns_cares : CaresDns;
+version (LibP2P_Lite) {} else import libp2p.transport.dns_cares : CaresDns;
 import libp2p.util.fibers : FiberGroup;
 import libp2p.util.timeout : withTimeout;
 
@@ -138,7 +138,7 @@ final class Swarm
 		this.cfg = cfg;
 		this.gater = gater;
 		this.limiter = new Limiter(cfg.limits);
-		resolver = new CaresDns;
+		version (LibP2P_Lite) {} else resolver = new CaresDns;   // lite (the phone): no c-ares, IP addresses only
 		upgradeCfg.security = [new NoiseTransport(identity)];
 		upgradeCfg.muxers = [new YamuxFactory];
 		// An admission that fails is one connection not made; the swarm goes on.
@@ -260,7 +260,11 @@ final class Swarm
 		{
 			auto m = Multiaddr(a.bytes.dup);
 			if (needsResolution(m))
+			{
+				if (resolver is null)
+					throw new Exception("no DNS resolver in this build: " ~ m.toString);
 				out_ ~= resolve(m, resolver);
+			}
 			else
 				out_ ~= m;
 		}

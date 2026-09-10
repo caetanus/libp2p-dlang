@@ -58,12 +58,23 @@ struct PublicKey
 			{
 			case KeyType.ed25519:
 				return verifyEd25519(data, msg, sig);
+			// LibP2P_Lite (the phone): no OpenSSL, so only Ed25519 peers verify
+			version (LibP2P_Lite)
+			{
+			case KeyType.rsa:
+			case KeyType.ecdsa:
+			case KeyType.secp256k1:
+				return false;
+			}
+			else
+			{
 			case KeyType.rsa:
 				return openssl.verifyDer(data, msg, sig, openssl.EVP_PKEY_RSA);
 			case KeyType.ecdsa:
 				return openssl.verifyDer(data, msg, sig, openssl.EVP_PKEY_EC);
 			case KeyType.secp256k1:
 				return openssl.verifySecp256k1(data, msg, sig);
+			}
 			}
 		}
 		catch (Exception)
@@ -150,6 +161,7 @@ shared static this()
 
 // --- OpenSSL --------------------------------------------------------------
 
+version (LibP2P_Lite) {} else
 private struct openssl
 {
 	import deimos.openssl.evp;
