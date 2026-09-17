@@ -79,6 +79,10 @@ interface CapableTransport
 	/// Start listening; `onInbound` is called with each connection, on a fiber
 	/// of the transport's. Returns the address actually listening on.
 	Multiaddr listen(const Multiaddr local, void delegate(UpgradedConn) onInbound);
+	/// Our address on this transport a NAT'd peer could reach after a hole punch
+	/// (a server-reflexive webrtc-direct address), or Multiaddr.init if none.
+	/// Gathered lazily; may block briefly the first time.
+	Multiaddr reflexiveAddr();
 	void close() nothrow;
 }
 
@@ -169,6 +173,20 @@ final class Swarm
 	}
 
 	/// A transport that secures and multiplexes on its own.
+	/// Reflexive addresses our self-securing transports offer for a hole punch
+	/// (webrtc-direct srflx), for DCUtR to advertise over the relay.
+	Multiaddr[] reflexiveAddrs()
+	{
+		Multiaddr[] out_;
+		foreach (t; capable)
+		{
+			auto a = t.reflexiveAddr();
+			if (a.bytes.length)
+				out_ ~= a;
+		}
+		return out_;
+	}
+
 	void addCapableTransport(CapableTransport t)
 	{
 		capable ~= t;

@@ -58,6 +58,12 @@ final class Host
 		return swarm.listenAddrs;
 	}
 
+	/// Reflexive addresses (webrtc-direct srflx) for a hole punch, for DCUtR.
+	Multiaddr[] reflexiveAddrs()
+	{
+		return swarm.reflexiveAddrs();
+	}
+
 	void listen(Multiaddr addr)
 	{
 		swarm.listen(addr);

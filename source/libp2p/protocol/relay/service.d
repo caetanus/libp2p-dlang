@@ -138,6 +138,16 @@ final class Relay : Notifiee, Transport
 		return out_;
 	}
 
+	// Addresses to offer in a DCUtR exchange: our dialable addresses plus any
+	// reflexive webrtc-direct address, so a two-NAT peer has a candidate to punch to.
+	private ubyte[][] punchAddrs()
+	{
+		auto out_ = advertised();
+		foreach (a; host.reflexiveAddrs())
+			out_ ~= a.encode;
+		return out_;
+	}
+
 	// --- as a relay: reservations --------------------------------------------------------------
 
 	size_t reservationCount() const @safe pure nothrow
@@ -487,7 +497,7 @@ final class Relay : Notifiee, Transport
 		auto s = c.newStream(dcutrProtocol);
 		scope (exit)
 			s.close();
-		return initiateHolePunch(s, advertised());
+		return initiateHolePunch(s, punchAddrs());
 	}
 
 	/// Swap addresses, wait half a round trip, dial `peer` directly. Returns the
@@ -520,7 +530,7 @@ final class Relay : Notifiee, Transport
 	{
 		scope (exit)
 			s.close();
-		auto theirs = respondHolePunch(s, advertised());
+		auto theirs = respondHolePunch(s, punchAddrs());
 		auto peer = c.remotePeer;
 		punches++;
 		fibers.spawn({
