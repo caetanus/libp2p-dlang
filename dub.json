@@ -134,6 +134,25 @@
 					"path": "../d-webrtc-v3"
 				}
 			}
+		},
+		{
+			"name": "gossipsub-harness",
+			"targetType": "executable",
+			"targetName": "gossipsub-harness",
+			"mainSourceFile": "interop/gossipsub-harness/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/gossipsub-harness"
+			],
+			"importPaths": [
+				"source",
+				"interop/gossipsub-harness"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		}
 	],
 	"libs": [
