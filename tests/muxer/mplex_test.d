@@ -199,3 +199,91 @@ unittest
 	got.flag.should.equal(Flag.closeReceiver);
 	got.payload.should.equal([cast(ubyte) 0xAB, 0xCD]);
 }
+
+// --- adversarial: a hostile peer past the Noise handshake reaches the muxer with
+// arbitrary bytes. mplex must reject malformed frames cleanly (tell the app, don't
+// crash/hang), matching the coverage yamux_test already has. -------------------
+
+private ulong mplexHeader(ulong id, ulong flag)
+{
+	return (id << 3) | flag;
+}
+
+@("mplex: a frame with an unknown flag ends the session, and the app is told")
+unittest
+{
+	string victimErr;
+	runPair(
+		(Stream s) {
+		// flag 7 is one past resetInitiator(6): readMplexFrame must refuse it.
+		s.write(encodeVarint(mplexHeader(1, 7)));
+		s.write(encodeVarint(0));
+		s.close();
+	},
+		(Stream s) {
+		auto m = new Mplex(s, false);
+		scope (exit)
+			m.close();
+		try
+			m.accept();
+		catch (Exception e)
+			victimErr = e.msg;
+	});
+	victimErr.length.should.be.greaterThan(0); // the app learned why, not a silent hang
+}
+
+@("mplex: a second newStream for an open id ends the session, and the app is told")
+unittest
+{
+	string victimErr;
+	runPair(
+		(Stream s) {
+		s.write(encodeVarint(mplexHeader(5, cast(ulong) Flag.newStream)));
+		s.write(encodeVarint(0));
+		s.write(encodeVarint(mplexHeader(5, cast(ulong) Flag.newStream))); // duplicate id
+		s.write(encodeVarint(0));
+		s.close();
+	},
+		(Stream s) {
+		auto m = new Mplex(s, false);
+		scope (exit)
+			m.close();
+		try
+		{
+			m.accept(); // the first newStream is fine
+			m.accept(); // the duplicate has ended the session by now
+		}
+		catch (Exception e)
+			victimErr = e.msg;
+	});
+	victimErr.length.should.be.greaterThan(0);
+}
+
+@("mplex: a message for an unknown stream is ignored, not fatal")
+unittest
+{
+	bool delivered;
+	runPair(
+		(Stream s) {
+		// A message frame for a stream nobody opened, then a real stream+message.
+		s.write(encodeVarint(mplexHeader(99, cast(ulong) Flag.messageInitiator)));
+		s.write(encodeVarint(3));
+		s.write(cast(ubyte[]) "abc".dup);
+		s.write(encodeVarint(mplexHeader(1, cast(ulong) Flag.newStream)));
+		s.write(encodeVarint(0));
+		s.write(encodeVarint(mplexHeader(1, cast(ulong) Flag.messageInitiator)));
+		s.write(encodeVarint(2));
+		s.write(cast(ubyte[]) "hi".dup);
+		s.close();
+	},
+		(Stream s) {
+		auto m = new Mplex(s, false);
+		scope (exit)
+			m.close();
+		auto st = m.accept(); // the phantom stream did not end the session
+		auto buf = new ubyte[2];
+		st.readExact(buf);
+		delivered = buf == cast(ubyte[]) "hi";
+	});
+	delivered.should.equal(true);
+}
