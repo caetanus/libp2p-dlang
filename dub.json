@@ -55,6 +55,19 @@
 			}
 		},
 		{
+			"name": "webrtc-stun-smoke",
+			"targetType": "executable",
+			"targetName": "webrtc-stun-smoke",
+			"mainSourceFile": "interop/webrtc-stun/app.d",
+			"sourcePaths": ["source", "interop/webrtc-stun"],
+			"importPaths": ["source", "interop/webrtc-stun"],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
+		},
+		{
 			"name": "ut",
 			"targetType": "executable",
 			"targetName": "libp2p-test",
