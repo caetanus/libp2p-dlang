@@ -291,6 +291,7 @@ final class WsStream : Stream
 	void reset() nothrow
 	{
 		closed = true;
+		innerClosed = true; // reset disposes inner; mark it so a later close() doesn't double-dispose
 		inner.reset();
 	}
 
