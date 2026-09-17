@@ -7,6 +7,8 @@ module app;
 
 import webrtc.ice.agent : Agent, Role, Credentials, TransportAddr;
 import webrtc.ice.candidate : Candidate, CandidateType;
+import libp2p.transport.webrtc.transport : WebRtcTransport;
+import libp2p.crypto.keys : Keypair;
 import vibe.core.net : listenUDP, resolveHost, NetworkAddress;
 import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
 import core.time : msecs;
@@ -78,6 +80,15 @@ int main()
             }
             if (result != 0)
                 writeln("FAIL: no srflx gathered (STUN unreachable?)");
+
+            // And the transport's own reflexiveAddr(): the webrtc-direct srflx address
+            // it will advertise over DCUtR for a hole punch.
+            auto tp = new WebRtcTransport(Keypair.generateEd25519());
+            auto ra = tp.reflexiveAddr();
+            if (ra.bytes.length)
+                writeln("OK transport.reflexiveAddr: ", ra.toString);
+            else
+                writeln("NOTE transport.reflexiveAddr empty (no STUN answer)");
         }
         catch (Exception e)
         {

@@ -37,7 +37,7 @@ import vibe.core.task : InterruptException;
 import webrtc.connection.connection : Connection, Perspective, OutboundDatagram, ConnState, noiseChannel;
 import webrtc.datachannel.channels : ChannelEvent, ChannelEventKind;
 import webrtc.dtls.certificate : Certificate;
-import webrtc.ice.agent : Credentials, TransportAddr;
+import webrtc.ice.agent : Agent, IceRole = Role, Credentials, TransportAddr;
 import webrtc.ice.candidate : Candidate, CandidateType;
 import webrtc.stun.message : isStunMessage, StunMessage = Message, attrUsername;
 
@@ -127,6 +127,9 @@ final class WebRtcTransport : CapableTransport
 	private Certificate cert;
 	private WebRtcConfig cfg;
 	private UdpMux[] muxes;
+	private UDPConnection punchSock; /// held open so a hole punch reuses the mapping
+	private Multiaddr punchAddr; /// our gathered srflx webrtc-direct address
+	private bool punchGathered;
 
 	this(Keypair identity, WebRtcConfig cfg = WebRtcConfig.init)
 	{
@@ -168,6 +171,81 @@ final class WebRtcTransport : CapableTransport
 			catch (Exception)
 			{
 			}
+	}
+
+	/// Our server-reflexive webrtc-direct address, gathered once via STUN on a
+	/// socket kept open so a later hole punch reuses the same NAT mapping. Returns
+	/// Multiaddr.init if no STUN server answered (no reflexive address to advertise).
+	Multiaddr reflexiveAddr()
+	{
+		import std.algorithm.searching : find;
+		import std.range : empty, front;
+		import std.string : lastIndexOf;
+		import std.conv : to;
+		import core.time : msecs;
+
+		if (punchGathered)
+			return punchAddr;
+		punchGathered = true;
+		try
+		{
+			punchSock = listenUDP(0, "0.0.0.0");
+			immutable port = punchSock.localAddress.port;
+			immutable local = TransportAddr("0.0.0.0", port);
+			auto pwd = randomUfrag() ~ randomUfrag() ~ randomUfrag();
+			auto agent = new Agent(IceRole.controlling, Credentials(randomUfrag(), pwd), uniform!ulong());
+			agent.addLocalCandidate(Candidate.host("0.0.0.0", port, false));
+			foreach (sv; cfg.stunServers)
+				try
+				{
+					immutable colon = sv.lastIndexOf(':');
+					if (colon < 0)
+						continue;
+					auto na = resolveHost(sv[0 .. colon], AddressFamily.INET, true);
+					agent.addStunServer(TransportAddr(na.toAddressString, sv[colon + 1 .. $].to!ushort));
+				}
+				catch (Exception)
+				{
+				}
+
+			foreach (i; 0 .. 50)
+			{
+				foreach (o; agent.gatherOutbound(i * 100))
+					try
+					{
+						auto dst = resolveHost(o.dst.ip, AddressFamily.INET, false);
+						dst.port = o.dst.port;
+						punchSock.send(o.data, &dst);
+					}
+					catch (Exception)
+					{
+					}
+
+				auto srflx = agent.gatheredCandidates.find!(c => c.typ == CandidateType.serverReflexive);
+				if (!srflx.empty)
+				{
+					punchAddr = Multiaddr.parse("/ip4/" ~ srflx.front.address ~ "/udp/"
+							~ srflx.front.port.to!string ~ "/webrtc-direct/certhash/"
+							~ multibaseEncode(fingerprint().toMultihash.encode));
+					return punchAddr;
+				}
+
+				NetworkAddress from;
+				ubyte[2048] buf;
+				ubyte[] got;
+				try
+					got = punchSock.recv(100.msecs, buf[], &from);
+				catch (Exception)
+				{
+				}
+				if (got.length)
+					agent.handleInbound(got, TransportAddr(from.toAddressString, from.port), local, i * 100);
+			}
+		}
+		catch (Exception)
+		{
+		}
+		return punchAddr; // Multiaddr.init if nothing answered
 	}
 
 	// --- dialing ---------------------------------------------------------------------------
