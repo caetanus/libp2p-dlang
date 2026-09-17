@@ -22,15 +22,23 @@
 module libp2p.muxer.yamux;
 
 import std.algorithm.comparison : min;
+import core.time : Duration, seconds;
 
 import vibe.core.core : runTask;
-import vibe.core.sync : LocalManualEvent, createManualEvent, TaskMutex;
+import vibe.core.sync : LocalManualEvent, createManualEvent, InterruptibleTaskMutex;
 import vibe.core.task : Task, InterruptException;
 
 import libp2p.core.ending;
 import libp2p.core.stream;
 import libp2p.muxer.muxer;
 import libp2p.core.upgrade : MuxerFactory;
+import libp2p.util.timeout : withTimeout;
+
+/// How long a best-effort teardown frame (GoAway/FIN/RST) may take before we give
+/// up on it. Bounded so an unresponsive peer — one that stopped reading, leaving
+/// our socket buffer full — cannot hang close()/reset(); the peer learns the
+/// session ended from the transport closing regardless.
+private enum Duration teardownWriteTimeout = 3.seconds;
 
 enum yamuxProtocolId = "/yamux/1.0.0";
 
@@ -69,7 +77,7 @@ final class YamuxConn : Muxer
 	private YamuxStream[] backlog; // inbound, not yet accepted
 	private LocalManualEvent arrived;
 
-	private TaskMutex writeLock;
+	private InterruptibleTaskMutex writeLock;
 	private Task reader;
 
 	private bool closed;
@@ -82,7 +90,7 @@ final class YamuxConn : Muxer
 		this.cfg = cfg;
 		nextId = client ? 1 : 2;
 		arrived = createManualEvent();
-		writeLock = new TaskMutex;
+		writeLock = new InterruptibleTaskMutex;
 		reader = runTask(&readLoop);
 	}
 
@@ -163,11 +171,7 @@ final class YamuxConn : Muxer
 			return;
 		closed = true;
 		cause = why;
-		try
-			sendFrame(typeGoAway, 0, 0, goAwayCode);
-		catch (Exception)
-		{
-		} // the transport may already be gone; the peer will find out
+		sendBestEffort(typeGoAway, 0, 0, goAwayCode); // bounded; the peer finds out regardless
 		foreach (s; streams)
 			s.sessionEnded(why);
 		streams = null;
@@ -342,6 +346,21 @@ final class YamuxConn : Muxer
 		transport.write(buf);
 	}
 
+	// A courtesy frame sent while tearing down (GoAway/FIN/RST): bounded so an
+	// unresponsive peer cannot park us on a full socket buffer, and swallowed on
+	// failure. The interruptible write lock is what lets the deadline fire even if
+	// another writer holds the lock parked in transport.write.
+	private void sendBestEffort(ubyte type, ushort flags, uint id, uint length) nothrow
+	{
+		try
+			withTimeout(teardownWriteTimeout, "yamux teardown frame", {
+				sendFrame(type, flags, id, length);
+			});
+		catch (Exception)
+		{
+		}
+	}
+
 	private void forget(uint id) nothrow
 	{
 		streams.remove(id);
@@ -423,11 +442,7 @@ private final class YamuxStream : Stream
 		if (localClosed || wasReset || sessionCause !is null)
 			return;
 		localClosed = true;
-		try
-			conn.sendFrame(typeWindowUpdate, flagFin, id, 0);
-		catch (Exception)
-		{
-		} // the session is gone; nothing left to tell
+		conn.sendBestEffort(typeWindowUpdate, flagFin, id, 0); // bounded (see sendBestEffort)
 		// Discard whatever the peer sent that we never read, WITHOUT handing its
 		// receive window back here: that would be a second blocking send right after
 		// the FIN, and if the FIN swallowed an interruption it could hang a teardown.
@@ -444,11 +459,7 @@ private final class YamuxStream : Stream
 		if (wasReset || sessionCause !is null)
 			return;
 		wasReset = true;
-		try
-			conn.sendFrame(typeWindowUpdate, flagRst, id, 0);
-		catch (Exception)
-		{
-		}
+		conn.sendBestEffort(typeWindowUpdate, flagRst, id, 0); // bounded (see sendBestEffort)
 		conn.forget(id);
 		changed.emit();
 	}

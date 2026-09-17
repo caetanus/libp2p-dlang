@@ -14,7 +14,8 @@ import std.algorithm.comparison : min;
 import std.exception : enforce;
 
 import vibe.core.core : runTask;
-import vibe.core.sync : LocalManualEvent, createManualEvent, TaskMutex;
+import core.time : Duration, seconds;
+import vibe.core.sync : LocalManualEvent, createManualEvent, InterruptibleTaskMutex;
 import vibe.core.task : Task, InterruptException;
 
 import libp2p.core.ending;
@@ -22,8 +23,13 @@ import libp2p.core.stream;
 import libp2p.core.upgrade : MuxerFactory;
 import libp2p.multiformats.varint;
 import libp2p.muxer.muxer;
+import libp2p.util.timeout : withTimeout;
 
 enum mplexProtocolId = "/mplex/6.7.0";
+
+/// Bound on a best-effort teardown frame (close/reset), so an unresponsive peer
+/// that stopped reading cannot park us on a full socket buffer during close.
+private enum Duration teardownWriteTimeout = 3.seconds;
 enum size_t maxFrameSize = 1024 * 1024;
 
 enum Flag : ubyte
@@ -100,7 +106,7 @@ final class Mplex : Muxer
 	private LocalManualEvent arrived;
 	private LocalManualEvent drained; /// a full buffer was read from
 
-	private TaskMutex writeLock;
+	private InterruptibleTaskMutex writeLock;
 	private Task reader;
 	private bool closed;
 	private Exception cause;
@@ -112,7 +118,7 @@ final class Mplex : Muxer
 		this.cfg = cfg;
 		arrived = createManualEvent();
 		drained = createManualEvent();
-		writeLock = new TaskMutex;
+		writeLock = new InterruptibleTaskMutex;
 		reader = runTask(&readLoop);
 	}
 
@@ -269,6 +275,20 @@ final class Mplex : Muxer
 		writeMplexFrame(transport, id, flag, payload);
 	}
 
+	// A courtesy close/reset frame during teardown: bounded so an unresponsive
+	// peer cannot hang us, and swallowed on failure. The interruptible write lock
+	// lets the deadline fire even if another writer holds the lock parked in write.
+	private void sendBestEffort(ulong id, Flag flag) nothrow
+	{
+		try
+			withTimeout(teardownWriteTimeout, "mplex teardown frame", {
+				sendFrame(id, flag, null);
+			});
+		catch (Exception)
+		{
+		}
+	}
+
 	private void forget(ulong id, bool ours) nothrow
 	{
 		streams.remove(Key(id, ours));
@@ -346,12 +366,14 @@ private final class MplexStream : Stream
 		if (localClosed || wasReset || sessionCause !is null)
 			return;
 		localClosed = true;
-		try
-			conn.sendFrame(id, ours ? Flag.closeInitiator : Flag.closeReceiver, null);
-		catch (Exception)
-		{
-		}
+		conn.sendBestEffort(id, ours ? Flag.closeInitiator : Flag.closeReceiver); // bounded
 		buffered = null;
+		// Freeing the buffer makes room the session reader may be parked waiting
+		// for (it sleeps on `drained` when any substream hits maxBufferLen). forget
+		// emits drained, but only runs when the remote half is already closed — so
+		// wake the reader here too, or a close while the remote is still open
+		// strands the whole session's reader.
+		conn.drained.emit();
 		if (remoteClosed)
 			conn.forget(id, ours);
 		changed.emit();
@@ -362,11 +384,7 @@ private final class MplexStream : Stream
 		if (wasReset || sessionCause !is null)
 			return;
 		wasReset = true;
-		try
-			conn.sendFrame(id, ours ? Flag.resetInitiator : Flag.resetReceiver, null);
-		catch (Exception)
-		{
-		}
+		conn.sendBestEffort(id, ours ? Flag.resetInitiator : Flag.resetReceiver); // bounded
 		conn.forget(id, ours);
 		changed.emit();
 	}
