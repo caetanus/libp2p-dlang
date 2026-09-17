@@ -237,3 +237,69 @@ unittest
 
 	gotAtServer.should.equal("via-name");
 }
+
+// Tracks whether the underlying transport was disposed, for the R5 regression.
+private final class CloseTrackMem : Stream
+{
+	private ubyte[]* outbuf;
+	private ubyte[]* inbuf;
+	bool wasClosed;
+	this(ubyte[]* o, ubyte[]* i)
+	{
+		outbuf = o;
+		inbuf = i;
+	}
+
+	size_t read(ubyte[] buf)
+	{
+		if (buf.length == 0)
+			return 0;
+		if ((*inbuf).length == 0)
+			throw new EndOfStream("mem: empty");
+		immutable n = min(buf.length, (*inbuf).length);
+		buf[0 .. n] = (*inbuf)[0 .. n];
+		*inbuf = (*inbuf)[n .. $];
+		return n;
+	}
+
+	void write(const(ubyte)[] data)
+	{
+		*outbuf ~= data;
+	}
+
+	void close() nothrow
+	{
+		wasClosed = true;
+	}
+
+	void reset() nothrow {}
+}
+
+// R5: receiving a peer CLOSE sets the protocol-closed flag; a later close() must
+// still tear the underlying transport down instead of early-returning on it.
+@("ws-stream: close() disposes inner even after a peer CLOSE (regression: R5)")
+unittest
+{
+	ubyte[] ab, ba;
+	auto clientInner = new CloseTrackMem(&ab, &ba);
+	auto serverInner = new CloseTrackMem(&ba, &ab);
+	auto client = new WsStream(clientInner, true);
+	auto server = new WsStream(serverInner, false);
+
+	client.close(); // sends a CLOSE frame to the server
+
+	// The server reads the peer CLOSE: it flips to protocol-closed and reports EOF.
+	ubyte[32] buf;
+	bool sawEof;
+	try
+		server.read(buf[]);
+	catch (EndOfStream)
+		sawEof = true;
+	sawEof.should.equal(true);
+	serverInner.wasClosed.should.equal(false); // the peer-CLOSE path did not dispose it
+
+	// Layered cleanup (Noise/yamux) now closes the ws-stream. Before the fix this
+	// early-returned on the protocol-closed flag and leaked the transport.
+	server.close();
+	serverInner.wasClosed.should.equal(true);
+}
