@@ -6,7 +6,9 @@ import fluent.asserts;
 import libp2p.transport.ws;
 import libp2p.core.stream : Stream;
 import libp2p.core.ending : EndOfStream;
+import libp2p.multiformats.multiaddr : Multiaddr;
 import std.algorithm.comparison : min;
+import tests.util.loop;
 
 // An in-memory duplex: `write` appends to one shared buffer, `read` drains the
 // other, so two WsStreams can talk without a socket.
@@ -163,4 +165,42 @@ unittest
 	auto pong = wsDecodeFrame(ba, used);
 	pong.op.should.equal(WsOp.pong);
 	(cast(string) pong.payload).should.equal("ka");
+}
+
+@("ws-transport: dial and accept exchange bytes over a real /ws loopback")
+unittest
+{
+	string gotAtServer, gotAtClient;
+	Multiaddr bound;
+
+	onLoop({
+		auto t = new WsTransport; // no TLS provider → plain /ws
+		auto l = t.listen(Multiaddr.parse("/ip4/127.0.0.1/tcp/0/ws"));
+		scope (exit)
+			l.close();
+		bound = l.address;
+
+		auto server = spawn({
+			auto c = l.accept();
+			scope (exit)
+				c.close();
+			auto buf = new ubyte[64];
+			auto n = c.read(buf);
+			gotAtServer = cast(string) buf[0 .. n].idup;
+			c.write(cast(const(ubyte)[]) "world");
+		});
+
+		auto c = t.dial(bound);
+		scope (exit)
+			c.close();
+		c.write(cast(const(ubyte)[]) "hello");
+		auto buf = new ubyte[64];
+		auto n = c.read(buf);
+		gotAtClient = cast(string) buf[0 .. n].idup;
+		server.join();
+	});
+
+	gotAtServer.should.equal("hello");
+	gotAtClient.should.equal("world");
+	bound.toString.should.not.equal("/ip4/127.0.0.1/tcp/0/ws"); // a real port
 }

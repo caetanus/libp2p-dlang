@@ -14,11 +14,20 @@ module libp2p.transport.ws;
 import std.algorithm.comparison : min;
 import std.base64 : Base64;
 import std.bitmanip : nativeToBigEndian, bigEndianToNative;
+import std.conv : to;
 import std.digest.sha : sha1Of;
+import std.exception : enforce;
 import std.random : uniform;
+import std.socket : AddressFamily;
+import std.string : indexOf, strip, toLower, splitLines;
+
+import vibe.core.net : resolveHost;
 
 import libp2p.core.ending : ConnClosed, EndOfStream;
-import libp2p.core.stream : Stream;
+import libp2p.core.stream : Stream, readExact;
+import libp2p.multiformats.multiaddr : Multiaddr, Component;
+import libp2p.transport.tcp : TcpTransport;
+import libp2p.transport.transport : Transport, RawConn, Listener, StreamRawConn;
 
 /// RFC 6455 §5.2 opcodes. libp2p traffic rides `binary`; the rest are control.
 enum WsOp : ubyte
@@ -332,5 +341,182 @@ final class WsStream : Stream
 		ubyte[4096] tmp;
 		immutable n = inner.read(tmp[]);
 		rbuf ~= tmp[0 .. n];
+	}
+}
+
+// --- transport ---------------------------------------------------------------
+
+private bool isWsHost(string name) @safe pure nothrow
+{
+	return name == "ip4" || name == "ip6" || name == "dns4" || name == "dns6" || name == "dns";
+}
+
+private struct WsAddr
+{
+	string host; // the literal IP or the DNS name (kept for SNI + Host header)
+	string hostProto; // ip4 | ip6 | dns4 | dns6 | dns
+	ushort port;
+	bool hasTls; // /tls before /ws → wss
+}
+
+private WsAddr parseWsAddr(const Multiaddr addr) @safe
+{
+	auto c = addr.components;
+	if (c.length >= 2 && c[$ - 1].name == "p2p")
+		c = c[0 .. $ - 1]; // the canonical form names who is there; still a ws address
+	enforce(c.length >= 3 && c[$ - 1].name == "ws" && c[1].name == "tcp" && isWsHost(c[0].name),
+		"ws: not a websocket address: " ~ addr.toString);
+	WsAddr w;
+	w.host = c[0].text;
+	w.hostProto = c[0].name;
+	w.port = cast(ushort)((c[1].value[0] << 8) | c[1].value[1]);
+	auto mid = c[2 .. $ - 1];
+	if (mid.length == 1 && mid[0].name == "tls")
+		w.hasTls = true;
+	else
+		enforce(mid.length == 0, "ws: unexpected components before /ws in " ~ addr.toString);
+	return w;
+}
+
+// Read an HTTP head (request or response) up to the blank line, a byte at a time.
+private string readHttpHead(Stream s)
+{
+	ubyte[] head;
+	ubyte[1] b;
+	while (head.length < 8192)
+	{
+		s.readExact(b[]);
+		head ~= b[0];
+		if (head.length >= 4 && head[$ - 4 .. $] == cast(const(ubyte)[]) "\r\n\r\n")
+			return cast(string) head.idup;
+	}
+	throw new ConnClosed("ws: HTTP head too long");
+}
+
+private string headerValue(string head, string lowerName) @safe
+{
+	foreach (line; head.splitLines)
+	{
+		immutable c = line.indexOf(':');
+		if (c < 0)
+			continue;
+		if (line[0 .. c].strip.toLower == lowerName)
+			return line[c + 1 .. $].strip.idup;
+	}
+	return null;
+}
+
+/**
+ * WebSocket transport. Dials/listens on `/…/tcp/<port>/ws` and, with a
+ * `TlsProvider`, `/…/tcp/<port>/tls/ws` (wss). It reuses the TCP transport for
+ * the socket, resolves any `/dns*` host itself (keeping the hostname for TLS SNI
+ * and the WS Host header — the swarm must not pre-resolve these), runs the RFC
+ * 6455 Upgrade, and hands up a `WsStream`; the swarm's own upgrade adds Noise and
+ * yamux on top.
+ */
+final class WsTransport : Transport
+{
+	private TlsProvider tls;
+	private TcpTransport tcp;
+
+	this(TlsProvider tls = null)
+	{
+		this.tls = tls;
+		this.tcp = new TcpTransport;
+	}
+
+	bool canHandle(const Multiaddr addr)
+	{
+		try
+		{
+			auto c = addr.components;
+			if (c.length >= 2 && c[$ - 1].name == "p2p")
+				c = c[0 .. $ - 1];
+			if (c.length < 3 || c[$ - 1].name != "ws" || c[1].name != "tcp" || !isWsHost(c[0].name))
+				return false;
+			auto mid = c[2 .. $ - 1];
+			if (mid.length == 0)
+				return true; // /ws
+			if (mid.length == 1 && mid[0].name == "tls")
+				return tls !is null; // /tls/ws needs a TLS provider
+			return false;
+		}
+		catch (Exception)
+			return false;
+	}
+
+	RawConn dial(const Multiaddr remote)
+	{
+		auto w = parseWsAddr(remote);
+		auto base = Multiaddr.parse("/" ~ ipForm(w) ~ "/tcp/" ~ w.port.to!string);
+		auto raw = tcp.dial(base);
+		Stream inner = raw;
+		if (w.hasTls)
+		{
+			enforce(tls !is null, "ws: /tls/ws needs a TlsProvider");
+			inner = tls.connect(raw, w.host); // SNI = the hostname the cert is for
+		}
+		immutable key = wsClientKey();
+		inner.write(cast(const(ubyte)[]) buildClientUpgrade(w.host, "/", key));
+		enforce(serverHandshakeOk(readHttpHead(inner), wsAcceptFor(key)),
+			"ws: server rejected the upgrade");
+		return new StreamRawConn(new WsStream(inner, true), raw.localAddr, Multiaddr(remote.bytes.dup));
+	}
+
+	Listener listen(const Multiaddr local)
+	{
+		auto w = parseWsAddr(local);
+		auto base = Multiaddr.parse("/" ~ ipForm(w) ~ "/tcp/" ~ w.port.to!string);
+		return new WsListener(tcp.listen(base), tls, w.hasTls);
+	}
+
+	// Resolve a /dns* host to an IP for the TCP connect; pass an IP host through.
+	private string ipForm(WsAddr w)
+	{
+		if (w.hostProto == "ip4" || w.hostProto == "ip6")
+			return w.hostProto ~ "/" ~ w.host;
+		immutable fam = w.hostProto == "dns6" ? AddressFamily.INET6 : AddressFamily.INET;
+		auto na = resolveHost(w.host, fam, false);
+		immutable proto = na.family == AddressFamily.INET6 ? "ip6" : "ip4";
+		return proto ~ "/" ~ na.toAddressString;
+	}
+}
+
+final class WsListener : Listener
+{
+	private Listener inner;
+	private TlsProvider tls;
+	private bool hasTls;
+
+	this(Listener inner, TlsProvider tls, bool hasTls) @safe nothrow
+	{
+		this.inner = inner;
+		this.tls = tls;
+		this.hasTls = hasTls;
+	}
+
+	RawConn accept()
+	{
+		auto raw = inner.accept();
+		Stream s = raw;
+		if (hasTls)
+		{
+			enforce(tls !is null, "ws: /tls/ws needs a TlsProvider");
+			s = tls.accept(raw);
+		}
+		immutable key = headerValue(readHttpHead(s), "sec-websocket-key");
+		enforce(key.length > 0, "ws: client upgrade missing Sec-WebSocket-Key");
+		s.write(cast(const(ubyte)[]) buildServerUpgrade(wsAcceptFor(key)));
+		return new StreamRawConn(new WsStream(s, false), address(), raw.remoteAddr);
+	}
+
+	Multiaddr address()
+	{
+		return Multiaddr.parse(inner.address.toString ~ (hasTls ? "/tls/ws" : "/ws"));
+	}
+
+	void close() nothrow
+	{
+		inner.close();
 	}
 }

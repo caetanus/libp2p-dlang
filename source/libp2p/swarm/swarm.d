@@ -259,7 +259,10 @@ final class Swarm
 		foreach (a; addrs)
 		{
 			auto m = Multiaddr(a.bytes.dup);
-			if (needsResolution(m))
+			// A transport that already handles the unresolved address resolves the
+			// name itself (WebSocket keeps the hostname for TLS SNI + the Host
+			// header); only names no transport claims are resolved here.
+			if (needsResolution(m) && !handledRaw(m))
 			{
 				if (resolver is null)
 					throw new Exception("no DNS resolver in this build: " ~ m.toString);
@@ -269,6 +272,20 @@ final class Swarm
 				out_ ~= m;
 		}
 		return out_;
+	}
+
+	private bool handledRaw(const Multiaddr m)
+	{
+		foreach (t; transports)
+		{
+			try
+				if (t.canHandle(m))
+					return true;
+			catch (Exception)
+			{
+			}
+		}
+		return false;
 	}
 
 	private Connection dialOne(const Multiaddr target, Nullable!PeerId expected)
