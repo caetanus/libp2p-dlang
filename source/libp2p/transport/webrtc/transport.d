@@ -864,7 +864,10 @@ private final class Session : Muxer
 		}
 		closed_ = true;
 		cause = new ConnClosed("webrtc: connection closed");
-		foreach (s; streams)
+		// .byValue, not the AA directly: a plain foreach over an associative array
+		// lowers to _aaApply, which isn't nothrow in some druntimes (LDC 1.41), and
+		// this method is nothrow. byValue iterates without it.
+		foreach (s; streams.byValue)
 			s.ended(cause);
 		changed.emit();
 		fibers.stopAll();
