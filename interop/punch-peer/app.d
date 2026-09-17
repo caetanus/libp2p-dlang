@@ -82,6 +82,15 @@ int main(string[] args)
             host.peerstore.addAddrs(relayId, [relayMa]);
 
             writeln("my peer id: ", host.id.toBase58);
+            // Gather + show our reflexive webrtc-direct address up front: an empty
+            // list means STUN was unreachable from here (e.g. no route/DNS out of
+            // the netns) — the punch cannot work without it, so this is the first
+            // thing to check when a run fails.
+            auto myReflexive = host.reflexiveAddrs();
+            if (myReflexive.length == 0)
+                writeln("WARNING: no reflexive address gathered — STUN unreachable from here.");
+            foreach (a; myReflexive)
+                writeln("my reflexive addr: ", a.toString);
             stdout.flush();
 
             if (role == "responder")
@@ -115,8 +124,16 @@ int main(string[] args)
                 relay.connectVia(relayId, peer); // relayed connection first
                 writeln("relayed — triggering hole punch (DCUtR)...");
                 stdout.flush();
-                auto got = relay.holePunch(peer);
-                writeln("DCUtR done; authenticated ", got.toBase58);
+                // A punch that opens no path throws ("no direct address answered");
+                // don't bail on it — fall through so the FAIL branch below can dump
+                // the connection state, which is what tells us why it didn't punch.
+                try
+                {
+                    auto got = relay.holePunch(peer);
+                    writeln("DCUtR done; authenticated ", got.toBase58);
+                }
+                catch (Exception e)
+                    writeln("DCUtR punch did not complete: ", e.msg);
                 stdout.flush();
 
                 Connection direct;
@@ -131,6 +148,9 @@ int main(string[] args)
                 if (direct is null)
                 {
                     writeln("FAIL: no direct /webrtc-direct/ connection formed (still relayed).");
+                    writeln("connections to the peer right now:");
+                    foreach (c; host.swarm.connectionsTo(peer))
+                        writeln("  ", c.remoteAddr.toString);
                     stdout.flush();
                 }
                 else
