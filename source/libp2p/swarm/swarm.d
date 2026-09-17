@@ -559,6 +559,11 @@ final class Swarm
 
 	private Connection admit(ref Upgraded up, Endpoint role, Multiaddr local, Multiaddr remote, ref Lease established)
 	{
+		// A dial or handshake that was in flight when close() ran resumes here
+		// after the swarm is already closed. Do not adopt it into a pool that
+		// close() already drained (it would never be torn down); the caller's
+		// scope(failure) disposes the muxer.
+		enforce(!closed, "swarm: closed while a connection was upgrading");
 		auto c = new Connection(this, up.muxer, role, up.remotePeer, up.remoteKey, local, remote, established);
 		pool ~= c;
 		c.start();
