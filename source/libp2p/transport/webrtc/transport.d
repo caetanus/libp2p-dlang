@@ -130,6 +130,7 @@ final class WebRtcTransport : CapableTransport
 	private UDPConnection punchSock; /// held open so a hole punch reuses the mapping
 	private Multiaddr punchAddr; /// our gathered srflx webrtc-direct address
 	private bool punchGathered;
+	private UdpMux punchMux; /// the one mux allowed on punchSock at a time (see punch)
 
 	this(Keypair identity, WebRtcConfig cfg = WebRtcConfig.init)
 	{
@@ -334,6 +335,16 @@ final class WebRtcTransport : CapableTransport
 		immutable dialer = asDialer;
 		immutable persp = dialer ? Perspective.dialer : Perspective.listener;
 
+		// One socket, one reader: eventcore allows a single read-notification
+		// callback per socket, so two muxes reading punchSock at once abort the
+		// process ("Overwriting notification callback"). punchSock hosts exactly
+		// one mux at a time — the one this punch creates, held until its
+		// connection closes (a live punched connection keeps reading it). A
+		// second overlapping punch fails fast here and stays relayed rather than
+		// crashing; true parallel punches need one mux demuxing by remote (later).
+		enforce(punchMux is null,
+			"webrtc: a punch is already active on this transport's socket; concurrent punches are not yet supported");
+
 		// Reuse the gathering socket, so the mapping the peer punches to holds.
 		// A failed punch closes it with the mux, so drop the now-stale gather
 		// state: the next punch re-gathers a fresh mapping, which the next DCUtR
@@ -344,6 +355,7 @@ final class WebRtcTransport : CapableTransport
 			punchAddr = Multiaddr.init;
 		}
 		auto mux = new UdpMux(this, punchSock, false);
+		punchMux = mux; // claim the socket; mux.close() releases it (see UdpMux.close)
 		scope (failure)
 			mux.close();
 
@@ -589,6 +601,15 @@ private final class UdpMux
 		if (closed)
 			return;
 		closed = true;
+		// If this is the mux holding the punch socket, release the guard and drop
+		// the gather state: closing takes punchSock down with it, so the next
+		// punch must re-gather a fresh socket (as the failure path also does).
+		if (transport.punchMux is this)
+		{
+			transport.punchMux = null;
+			transport.punchGathered = false;
+			transport.punchAddr = Multiaddr.init;
+		}
 		fibers.stopAll();
 		foreach (s; sessions.values)
 			s.close();
