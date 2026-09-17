@@ -83,6 +83,11 @@ interface CapableTransport
 	/// (a server-reflexive webrtc-direct address), or Multiaddr.init if none.
 	/// Gathered lazily; may block briefly the first time.
 	Multiaddr reflexiveAddr();
+	/// Punch a direct connection to `remote` at its reflexive address `peerSrflx`,
+	/// reusing the mapping reflexiveAddr() gathered. Both peers call this at once
+	/// (DCUtR), with `asDialer` splitting the one asymmetric role a hole punch
+	/// still needs (the securing handshake's client vs. server).
+	UpgradedConn punch(const Multiaddr peerSrflx, PeerId remote, bool asDialer, Nullable!PeerId expected);
 	void close() nothrow;
 }
 
@@ -190,6 +195,24 @@ final class Swarm
 	void addCapableTransport(CapableTransport t)
 	{
 		capable ~= t;
+	}
+
+	/// Punch a direct connection to `peer` at its reflexive address `addr` (a
+	/// webrtc-direct srflx a capable transport gathered), and adopt it into the
+	/// pool like any dialed one. `asDialer` carries the DCUtR initiator/responder
+	/// split down to the one asymmetric role a hole punch keeps; the endpoint role
+	/// follows it, so the limiter and gater see the initiator as a dialer.
+	Connection punch(const Multiaddr addr, PeerId peer, bool asDialer)
+	{
+		enforce(!closed, "swarm: closed");
+		foreach (t; capable)
+			if (t.canHandle(addr))
+			{
+				auto up = withTimeout(cfg.dialTimeout + cfg.handshakeTimeout, "punch " ~ addr.toString,
+					() => t.punch(addr, peer, asDialer, nullable(peer)));
+				return admitCapable(up, asDialer ? Endpoint.dialer : Endpoint.listener);
+			}
+		throw new Exception("swarm: no capable transport for punch address " ~ addr.toString);
 	}
 
 	// --- listening ---------------------------------------------------------------------

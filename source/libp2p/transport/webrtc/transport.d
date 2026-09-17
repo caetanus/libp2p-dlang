@@ -319,11 +319,11 @@ final class WebRtcTransport : CapableTransport
 	///    holes — which needs a shared ufrag up front, since neither can wait to
 	///    learn the other's from a first packet. Both derive `punchUfrag` from the
 	///    two peer ids, so they agree without any exchange.
-	///  - DTLS is asymmetric — exactly one client and one server. `persp` carries
-	///    the split (dialer = DTLS client, listener = DTLS server), assigned from
-	///    the DCUtR initiator/responder roles. Noise follows DTLS: the DTLS client
-	///    is the Noise responder, the server the initiator.
-	UpgradedConn punch(const Multiaddr peerSrflx, PeerId remote, Perspective persp, Nullable!PeerId expected)
+	///  - DTLS is asymmetric — exactly one client and one server. `asDialer`
+	///    carries the split (true = DTLS client, false = DTLS server), assigned
+	///    from the DCUtR initiator/responder roles. Noise follows DTLS: the DTLS
+	///    client is the Noise responder, the server the initiator.
+	UpgradedConn punch(const Multiaddr peerSrflx, PeerId remote, bool asDialer, Nullable!PeerId expected)
 	{
 		// A gathered srflx means reflexiveAddr() bound punchSock and STUN answered:
 		// the socket is live and the peer has our reflexive address to aim at.
@@ -331,7 +331,8 @@ final class WebRtcTransport : CapableTransport
 		auto parsed = parseWebRTCDialAddr(Multiaddr(peerSrflx.bytes.dup));
 		enforce(!parsed.isNull, "webrtc: peer's punch address is not webrtc-direct: " ~ peerSrflx.toString);
 		auto target = parsed.get;
-		immutable dialer = persp == Perspective.dialer;
+		immutable dialer = asDialer;
+		immutable persp = dialer ? Perspective.dialer : Perspective.listener;
 
 		// Reuse the gathering socket, so the mapping the peer punches to holds.
 		auto mux = new UdpMux(this, punchSock, false);

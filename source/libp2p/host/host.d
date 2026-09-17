@@ -64,6 +64,13 @@ final class Host
 		return swarm.reflexiveAddrs();
 	}
 
+	/// Punch a direct connection to `peer` at a reflexive address, for DCUtR.
+	/// `asDialer` splits the securing handshake's roles across the two peers.
+	Connection punch(const Multiaddr addr, PeerId peer, bool asDialer)
+	{
+		return swarm.punch(addr, peer, asDialer);
+	}
+
 	void listen(Multiaddr addr)
 	{
 		swarm.listen(addr);

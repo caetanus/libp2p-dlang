@@ -500,7 +500,21 @@ final class Relay : Notifiee, Transport
 		return initiateHolePunch(s, punchAddrs());
 	}
 
-	/// Swap addresses, wait half a round trip, dial `peer` directly. Returns the
+	/// Reach `peer` at one of the addresses it offered. A plain address is dialed
+	/// (TCP simultaneous-open); a webrtc-direct reflexive address is punched,
+	/// where the two peers split one asymmetric role — `asDialer` from our DCUtR
+	/// side (initiator dials, responder listens). Either way the direct
+	/// connection lands in the pool.
+	private Connection dialOrPunch(const(ubyte)[] raw, PeerId peer, bool asDialer)
+	{
+		auto addr = Multiaddr.decode(raw);
+		immutable webrtc = addr.components.canFind!(c => c.name == "webrtc-direct");
+		if (!addr.components.canFind!(c => c.name == "p2p"))
+			addr = addr ~ Multiaddr.parse("/p2p/" ~ peer.toBase58);
+		return webrtc ? host.punch(addr, peer, asDialer) : host.swarm.dial(addr);
+	}
+
+	/// Swap addresses, wait half a round trip, reach `peer` directly. Returns the
 	/// peer the direct connection authenticated as.
 	PeerId holePunch(PeerId peer)
 	{
@@ -510,13 +524,7 @@ final class Relay : Notifiee, Transport
 		foreach (raw; res.peerAddrs)
 		{
 			try
-			{
-				auto addr = Multiaddr.decode(raw);
-				if (!addr.components.canFind!(c => c.name == "p2p"))
-					addr = addr ~ Multiaddr.parse("/p2p/" ~ peer.toBase58);
-				auto direct = host.swarm.dial(addr);
-				return direct.remotePeer;
-			}
+				return dialOrPunch(raw, peer, true).remotePeer; // initiator: the DTLS client
 			catch (InterruptException e)
 				throw e; // the hole punch was cancelled, not this address failing
 			catch (Exception e)
@@ -540,10 +548,7 @@ final class Relay : Notifiee, Transport
 			{
 				try
 				{
-					auto addr = Multiaddr.decode(raw);
-					if (!addr.components.canFind!(x => x.name == "p2p"))
-						addr = addr ~ Multiaddr.parse("/p2p/" ~ peer.toBase58);
-					host.swarm.dial(addr);
+					dialOrPunch(raw, peer, false); // responder: the DTLS server
 					return;
 				}
 				catch (InterruptException e)
