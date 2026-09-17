@@ -172,6 +172,25 @@
 					"path": "../d-webrtc-v3"
 				}
 			}
+		},
+		{
+			"name": "autonat-harness",
+			"targetType": "executable",
+			"targetName": "autonat-harness",
+			"mainSourceFile": "interop/autonat-harness/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/autonat-harness"
+			],
+			"importPaths": [
+				"source",
+				"interop/autonat-harness"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		}
 	],
 	"libs": [
