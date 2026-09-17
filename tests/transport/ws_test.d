@@ -204,3 +204,36 @@ unittest
 	gotAtClient.should.equal("world");
 	bound.toString.should.not.equal("/ip4/127.0.0.1/tcp/0/ws"); // a real port
 }
+
+@("ws-transport: dials a /dns4 host, resolving the name (regression: use_dns)")
+unittest
+{
+	import std.string : replace;
+
+	string gotAtServer;
+	onLoop({
+		auto t = new WsTransport;
+		auto l = t.listen(Multiaddr.parse("/ip4/127.0.0.1/tcp/0/ws"));
+		scope (exit)
+			l.close();
+		// same listener, addressed by name: exercises ipForm's /dns resolve path
+		auto viaName = l.address.toString.replace("/ip4/127.0.0.1/", "/dns4/localhost/");
+
+		auto server = spawn({
+			auto c = l.accept();
+			scope (exit)
+				c.close();
+			auto buf = new ubyte[32];
+			auto n = c.read(buf);
+			gotAtServer = cast(string) buf[0 .. n].idup;
+		});
+
+		auto c = t.dial(Multiaddr.parse(viaName));
+		scope (exit)
+			c.close();
+		c.write(cast(const(ubyte)[]) "via-name");
+		server.join();
+	});
+
+	gotAtServer.should.equal("via-name");
+}

@@ -476,7 +476,7 @@ final class WsTransport : Transport
 		if (w.hostProto == "ip4" || w.hostProto == "ip6")
 			return w.hostProto ~ "/" ~ w.host;
 		immutable fam = w.hostProto == "dns6" ? AddressFamily.INET6 : AddressFamily.INET;
-		auto na = resolveHost(w.host, fam, false);
+		auto na = resolveHost(w.host, fam, true); // use_dns: a /dns* host is a name, not a literal
 		immutable proto = na.family == AddressFamily.INET6 ? "ip6" : "ip4";
 		return proto ~ "/" ~ na.toAddressString;
 	}
