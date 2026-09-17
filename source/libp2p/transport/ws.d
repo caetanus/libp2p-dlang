@@ -237,7 +237,8 @@ final class WsStream : Stream
 	private bool client; // client→server frames are masked
 	private ubyte[] rbuf; // bytes read from `inner`, not yet decoded
 	private ubyte[] pending; // decoded payload not yet returned to the caller
-	private bool closed;
+	private bool closed; // protocol: a CLOSE frame was sent or received
+	private bool innerClosed; // resource: the underlying transport was disposed
 
 	this(Stream inner, bool client) @safe nothrow
 	{
@@ -268,15 +269,23 @@ final class WsStream : Stream
 
 	void close() nothrow
 	{
-		if (closed)
-			return;
-		closed = true;
-		try
-			sendFrame(WsOp.close, null);
-		catch (Exception)
+		// Protocol-closed and resource-disposed are separate: a peer's CLOSE frame
+		// sets `closed` (see fillPending) without disposing the transport, so a
+		// later close() must still tear `inner` down — otherwise the socket leaks.
+		if (!closed)
 		{
+			closed = true;
+			try
+				sendFrame(WsOp.close, null);
+			catch (Exception)
+			{
+			}
 		}
-		inner.close();
+		if (!innerClosed)
+		{
+			innerClosed = true;
+			inner.close();
+		}
 	}
 
 	void reset() nothrow
