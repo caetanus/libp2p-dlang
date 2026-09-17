@@ -115,6 +115,10 @@ struct WebRtcConfig
 	/// source port could make unbounded numbers of them. Beyond this the packet
 	/// is dropped and the peer's own STUN retransmit retries once a slot frees.
 	uint maxPendingInbound = 32;
+	/// STUN servers ("host:port") probed for our server-reflexive candidate, so a
+	/// two-NAT peer has a reflexive address to punch to. Resolved per connection
+	/// and fed to the ICE agent, which probes them out the connection's own socket.
+	string[] stunServers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
 }
 
 final class WebRtcTransport : CapableTransport
@@ -142,6 +146,28 @@ final class WebRtcTransport : CapableTransport
 			return Multiaddr(addr.bytes.dup).components.canFind!(c => c.name == "webrtc-direct");
 		catch (Exception)
 			return false;
+	}
+
+	// Resolve the configured STUN servers and hand them to a connection's ICE
+	// agent, which probes them out this connection's own socket to learn our
+	// server-reflexive candidate (an unresolvable server just yields no srflx).
+	private void applyStunServers(Connection conn)
+	{
+		import std.string : lastIndexOf;
+		import std.conv : to;
+
+		foreach (s; cfg.stunServers)
+			try
+			{
+				immutable colon = s.lastIndexOf(':');
+				if (colon < 0)
+					continue;
+				auto na = resolveHost(s[0 .. colon], AddressFamily.INET, true);
+				conn.addStunServer(TransportAddr(na.toAddressString, s[colon + 1 .. $].to!ushort));
+			}
+			catch (Exception)
+			{
+			}
 	}
 
 	// --- dialing ---------------------------------------------------------------------------
@@ -172,6 +198,9 @@ final class WebRtcTransport : CapableTransport
 		conn.addRemoteCandidate(host(target.host, target.port, target.ipv6));
 		// Pin the server's certificate to the certhash in the address (fail-closed).
 		conn.setExpectedFingerprint(target.fingerprint.digest);
+		applyStunServers(conn); // gather our srflx out this dial's socket
+
+
 
 		auto session = new Session(this, mux, conn, remoteAddr);
 		mux.add(remoteAddr, session);
@@ -474,6 +503,7 @@ private final class UdpMux
 		conn.addLocalCandidate(host(localIp(ipv6), localPort, ipv6));
 		conn.setRemoteCredentials(creds);
 		conn.addRemoteCandidate(host(remote.ip, remote.port, ipv6));
+		transport.applyStunServers(conn); // gather our srflx out this socket
 		// The listener does not pin: the client's identity is proven over Noise.
 		auto session = new Session(transport, this, conn, remote);
 		session.kick();
