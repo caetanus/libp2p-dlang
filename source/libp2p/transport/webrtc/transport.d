@@ -335,6 +335,14 @@ final class WebRtcTransport : CapableTransport
 		immutable persp = dialer ? Perspective.dialer : Perspective.listener;
 
 		// Reuse the gathering socket, so the mapping the peer punches to holds.
+		// A failed punch closes it with the mux, so drop the now-stale gather
+		// state: the next punch re-gathers a fresh mapping, which the next DCUtR
+		// round re-advertises anyway. (Runs after mux.close, being declared first.)
+		scope (failure)
+		{
+			punchGathered = false;
+			punchAddr = Multiaddr.init;
+		}
 		auto mux = new UdpMux(this, punchSock, false);
 		scope (failure)
 			mux.close();
