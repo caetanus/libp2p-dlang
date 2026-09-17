@@ -130,7 +130,7 @@ final class WebRtcTransport : CapableTransport
 	private UDPConnection punchSock; /// held open so a hole punch reuses the mapping
 	private Multiaddr punchAddr; /// our gathered srflx webrtc-direct address
 	private bool punchGathered;
-	private UdpMux punchMux; /// the one mux allowed on punchSock at a time (see punch)
+	private UdpMux punchMux; /// the single persistent mux on punchSock every punch shares
 
 	this(Keypair identity, WebRtcConfig cfg = WebRtcConfig.init)
 	{
@@ -337,27 +337,16 @@ final class WebRtcTransport : CapableTransport
 
 		// One socket, one reader: eventcore allows a single read-notification
 		// callback per socket, so two muxes reading punchSock at once abort the
-		// process ("Overwriting notification callback"). punchSock hosts exactly
-		// one mux at a time — the one this punch creates, held until its
-		// connection closes (a live punched connection keeps reading it). A
-		// second overlapping punch fails fast here and stays relayed rather than
-		// crashing; true parallel punches need one mux demuxing by remote (later).
-		enforce(punchMux is null,
-			"webrtc: a punch is already active on this transport's socket; concurrent punches are not yet supported");
-
-		// Reuse the gathering socket, so the mapping the peer punches to holds.
-		// A failed punch closes it with the mux, so drop the now-stale gather
-		// state: the next punch re-gathers a fresh mapping, which the next DCUtR
-		// round re-advertises anyway. (Runs after mux.close, being declared first.)
-		scope (failure)
-		{
-			punchGathered = false;
-			punchAddr = Multiaddr.init;
-		}
-		auto mux = new UdpMux(this, punchSock, false);
-		punchMux = mux; // claim the socket; mux.close() releases it (see UdpMux.close)
-		scope (failure)
-			mux.close();
+		// process ("Overwriting notification callback"). So punchSock has ONE
+		// persistent mux that every punch shares, each adding a session keyed by
+		// the peer's address; the mux's single reader demuxes to them. This lets a
+		// long-lived peer be punched by many others, one after another or at once,
+		// without a second reader — a per-punch mux would either crash (concurrent)
+		// or, guarded, leave the socket claimed until the first connection died
+		// (so only the first peer could ever punch).
+		if (punchMux is null || punchMux.closed)
+			punchMux = new UdpMux(this, punchSock, false, true);
+		auto mux = punchMux;
 
 		// One ufrag both sides compute alike, doubling as the ICE password.
 		immutable ufrag = punchUfrag(PeerId.fromPublicKey(identity.publicKey).bytes, remote.bytes);
@@ -423,6 +412,8 @@ final class WebRtcTransport : CapableTransport
 		foreach (m; muxes)
 			m.close();
 		muxes = null;
+		if (punchMux !is null)
+			punchMux.close(); // the persistent punch mux isn't in muxes
 	}
 
 	/// The listener's half of a new connection: the peer proved its identity
@@ -523,17 +514,19 @@ private final class UdpMux
 	private WebRtcTransport transport;
 	private UDPConnection sock;
 	private bool listening;
+	private bool persistent; // keep the mux alive when its last session leaves (the punch mux)
 	private Session[TransportAddr] sessions;
 	private InboundLimiter admission; // caps unauthenticated inbound handshakes
 	private FiberGroup fibers;
 	private bool closed;
 	void delegate(UpgradedConn) onInbound;
 
-	this(WebRtcTransport transport, UDPConnection sock, bool listening)
+	this(WebRtcTransport transport, UDPConnection sock, bool listening, bool persistent = false)
 	{
 		this.transport = transport;
 		this.sock = sock;
 		this.listening = listening;
+		this.persistent = persistent;
 		admission = InboundLimiter(transport.cfg.maxPendingInbound);
 		fibers = new FiberGroup((Exception e) nothrow { logDebug("libp2p: webrtc inbound not admitted: %s", e.msg); });
 		fibers.spawn(&readLoop);
@@ -573,7 +566,9 @@ private final class UdpMux
 	void remove(TransportAddr remote) nothrow
 	{
 		sessions.remove(remote);
-		if (!listening && sessions.length == 0)
+		// A persistent mux (the shared punch socket) outlives its sessions so the
+		// next peer can punch; only a one-shot dial mux closes when it empties.
+		if (!listening && !persistent && sessions.length == 0)
 			close();
 	}
 
