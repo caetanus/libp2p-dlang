@@ -342,11 +342,15 @@ final class Kademlia
 	private KadMessage request(PeerId peer, KadMessage msg)
 	{
 		auto c = host.connect(peer);
-		auto s = c.newStream(kadProtocolId);
-		scope (exit)
-			s.close();
 		KadMessage reply;
+		// Open the stream INSIDE the deadline: a real DHT peer that accepts the
+		// connection but stalls the multistream negotiation (or never answers)
+		// would otherwise block here forever — and the query only checks its
+		// deadline between requests, so one stuck peer hangs the whole lookup.
 		withTimeout(cfg.requestTimeout, "kad request", {
+			auto s = c.newStream(kadProtocolId);
+			scope (exit)
+				s.close();
 			s.writeLengthPrefixed(msg.encode);
 			reply = KadMessage.decode(s.readLengthPrefixed(cfg.maxPacket));
 		});
@@ -368,10 +372,12 @@ final class Kademlia
 		auto msg = message(MessageType.addProvider, key);
 		msg.providerPeers = [KadPeer(host.id, host.addrs, ConnectionType.connected)];
 		auto c = host.connect(peer);
-		auto s = c.newStream(kadProtocolId);
-		scope (exit)
-			s.close();
-		withTimeout(cfg.requestTimeout, "kad add provider", { s.writeLengthPrefixed(msg.encode); });
+		withTimeout(cfg.requestTimeout, "kad add provider", {
+			auto s = c.newStream(kadProtocolId); // inside the deadline (see request)
+			scope (exit)
+				s.close();
+			s.writeLengthPrefixed(msg.encode);
+		});
 		learned(peer, host.peerstore.addrs(peer), NodeStatus.connected);
 	}
 
