@@ -486,9 +486,19 @@ private final class UdpMux
 	{
 		if (closed)
 			return;
-		auto to = resolveHost(d.dst.ip, AddressFamily.UNSPEC, false);
-		to.port = d.dst.port;
-		sock.send(d.data, &to);
+		// UDP is best-effort: one datagram to an unreachable destination (a STUN
+		// server we can't route to from a loopback-bound socket, say) must never
+		// throw out of the batch drain and starve the rest — the connectivity
+		// checks and the srflx probe travel in the same gatherOutbound batch.
+		try
+		{
+			auto to = resolveHost(d.dst.ip, AddressFamily.UNSPEC, false);
+			to.port = d.dst.port;
+			sock.send(d.data, &to);
+		}
+		catch (Exception)
+		{
+		}
 	}
 
 	void close() nothrow
