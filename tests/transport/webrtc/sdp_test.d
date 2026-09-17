@@ -62,3 +62,30 @@ unittest
 	// Two draws differ (probabilistically certain over 62^64).
 	randomUfrag().should.not.equal(u);
 }
+
+@("punch ufrag is deterministic, order-independent, and in the ufrag charset")
+unittest
+{
+	// Two stand-in peer ids (any bytes; punchUfrag hashes them).
+	auto a = cast(const(ubyte)[])[0x00, 0x24, 0x08, 0x01, 0x12, 0x20, 0xAA, 0xBB];
+	auto b = cast(const(ubyte)[])[0x00, 0x24, 0x08, 0x01, 0x12, 0x20, 0xCC, 0xDD, 0xEE];
+
+	auto u = punchUfrag(a, b);
+
+	// Same shape as randomUfrag: spec prefix + 32 alphanumerics (SHA-256 body).
+	u.startsWith("libp2p+webrtc+v1/").should.equal(true);
+	u.length.should.equal("libp2p+webrtc+v1/".length + 32);
+	auto suffix = u["libp2p+webrtc+v1/".length .. $];
+	suffix.all!(c => (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))
+		.should.equal(true);
+
+	// Deterministic: same inputs, same string (both peers must derive it alike).
+	punchUfrag(a, b).should.equal(u);
+
+	// Order-independent: whichever peer computes it, the pair maps to one ufrag.
+	punchUfrag(b, a).should.equal(u);
+
+	// Different peers → different ufrag.
+	auto c = cast(const(ubyte)[])[0x00, 0x24, 0x08, 0x01, 0x12, 0x20, 0x11, 0x22];
+	punchUfrag(a, c).should.not.equal(u);
+}

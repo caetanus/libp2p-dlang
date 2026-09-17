@@ -80,3 +80,32 @@ string randomUfrag()
 		c = alphabet[uniform(0, alphabet.length)];
 	return ufragPrefix ~ s.idup;
 }
+
+/// A ufrag both sides of a hole punch derive identically, so each can send valid
+/// connectivity checks at once — symmetric ICE, which a two-NAT punch needs to
+/// open both holes — without waiting to learn the other's ufrag from a first
+/// packet (the asymmetric dial path's USERNAME-learning, kept as a fallback).
+///
+/// Order-independent: the two peer ids are put in byte-wise lexicographic order
+/// before hashing, so both ends feed the hash the same input and get the same
+/// string. The body is SHA-256 of `min(idA,idB) ~ max(idA,idB)` mapped into the
+/// 62-char ufrag alphabet — 32 chars, and the ufrag doubles as the ICE password
+/// like everywhere else here. This is not a wire format: the two-CGNAT punch
+/// path is ours on both ends, so it only has to match itself.
+string punchUfrag(const(ubyte)[] idA, const(ubyte)[] idB)
+{
+	import std.digest.sha : sha256Of;
+
+	enum alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+	const(ubyte)[] lo = idA, hi = idB;
+	if (idA > idB) // D array comparison is lexicographic; order both ends the same
+	{
+		lo = idB;
+		hi = idA;
+	}
+	auto h = sha256Of(lo ~ hi);
+	char[] s = new char[h.length];
+	foreach (i, b; h)
+		s[i] = alphabet[b % alphabet.length];
+	return ufragPrefix ~ s.idup;
+}

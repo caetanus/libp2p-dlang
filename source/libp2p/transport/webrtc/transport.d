@@ -52,7 +52,7 @@ import libp2p.muxer.muxer : Muxer;
 import libp2p.swarm.swarm : CapableTransport, UpgradedConn;
 import libp2p.transport.webrtc.fingerprint;
 import libp2p.transport.webrtc.noise;
-import libp2p.transport.webrtc.sdp : randomUfrag;
+import libp2p.transport.webrtc.sdp : randomUfrag, punchUfrag;
 import libp2p.transport.webrtc.stream : WebRtcStream;
 import libp2p.util.fibers : FiberGroup;
 import libp2p.util.timeout : withTimeout;
@@ -304,6 +304,80 @@ final class WebRtcTransport : CapableTransport
 		peer.tryPublicKey(up.remoteKey);
 		up.localAddr = mux.localMultiaddr(target.ipv6);
 		up.remoteAddr = Multiaddr(remote.bytes.dup);
+		return up;
+	}
+
+	// --- hole punch ------------------------------------------------------------------------
+
+	/// A direct connection to a two-NAT peer, punched to its reflexive
+	/// webrtc-direct address (`peerSrflx`) over the very socket our own reflexive
+	/// address was gathered on — so the NAT mapping the peer aims at is the one we
+	/// send from. Called by DCUtR on both sides at once; the roles are asymmetric
+	/// where they must be and symmetric where they must be:
+	///
+	///  - ICE is symmetric — both ends send connectivity checks to open both
+	///    holes — which needs a shared ufrag up front, since neither can wait to
+	///    learn the other's from a first packet. Both derive `punchUfrag` from the
+	///    two peer ids, so they agree without any exchange.
+	///  - DTLS is asymmetric — exactly one client and one server. `persp` carries
+	///    the split (dialer = DTLS client, listener = DTLS server), assigned from
+	///    the DCUtR initiator/responder roles. Noise follows DTLS: the DTLS client
+	///    is the Noise responder, the server the initiator.
+	UpgradedConn punch(const Multiaddr peerSrflx, PeerId remote, Perspective persp, Nullable!PeerId expected)
+	{
+		// A gathered srflx means reflexiveAddr() bound punchSock and STUN answered:
+		// the socket is live and the peer has our reflexive address to aim at.
+		enforce(punchAddr.bytes.length > 0, "webrtc: no gathered reflexive address to punch from (call reflexiveAddr first)");
+		auto parsed = parseWebRTCDialAddr(Multiaddr(peerSrflx.bytes.dup));
+		enforce(!parsed.isNull, "webrtc: peer's punch address is not webrtc-direct: " ~ peerSrflx.toString);
+		auto target = parsed.get;
+		immutable dialer = persp == Perspective.dialer;
+
+		// Reuse the gathering socket, so the mapping the peer punches to holds.
+		auto mux = new UdpMux(this, punchSock, false);
+		scope (failure)
+			mux.close();
+
+		// One ufrag both sides compute alike, doubling as the ICE password.
+		immutable ufrag = punchUfrag(PeerId.fromPublicKey(identity.publicKey).bytes, remote.bytes);
+		auto creds = Credentials(ufrag, ufrag);
+		immutable ipv6 = target.ipv6;
+		auto localAddr = TransportAddr(mux.localIp(ipv6), mux.localPort);
+		auto conn = new Connection(persp, cert, localAddr, creds, uniform!ulong());
+		conn.addLocalCandidate(host(mux.localIp(ipv6), mux.localPort, ipv6));
+		conn.setRemoteCredentials(creds);
+		conn.addRemoteCandidate(host(target.host, target.port, ipv6));
+		// The DTLS client pins the server's certificate to the certhash in the
+		// peer's address; the server proves its identity over Noise, so it pins
+		// nothing (mirrors dial vs. the listener's admit path).
+		if (dialer)
+			conn.setExpectedFingerprint(target.fingerprint.digest);
+
+		auto remoteAddr = TransportAddr(target.host, target.port);
+		auto session = new Session(this, mux, conn, remoteAddr);
+		mux.add(remoteAddr, session);
+		scope (failure)
+			session.close();
+		session.kick();
+		withTimeout(cfg.connectTimeout, "webrtc punch", { session.waitReady(); });
+
+		auto peerFp = Fingerprint.raw(conn.peerFingerprint());
+		auto noiseStream = withTimeout(cfg.connectTimeout, "webrtc punch noise channel",
+			() => session.noiseStream());
+		scope (exit)
+			noiseStream.close();
+		auto peer = withTimeout(cfg.connectTimeout, "webrtc punch noise",
+			() => dialer ? outbound(identity, noiseStream, peerFp, fingerprint())
+				: inbound(identity, noiseStream, peerFp, fingerprint()));
+		enforce(expected.isNull || expected.get == peer,
+			"webrtc: the peer is " ~ peer.toString ~ ", not " ~ expected.get.toString);
+
+		UpgradedConn up;
+		up.muxer = session;
+		up.remotePeer = peer;
+		peer.tryPublicKey(up.remoteKey);
+		up.localAddr = punchAddr.bytes.length ? punchAddr : mux.localMultiaddr(ipv6);
+		up.remoteAddr = Multiaddr(peerSrflx.bytes.dup);
 		return up;
 	}
 
