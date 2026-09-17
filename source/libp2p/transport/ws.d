@@ -11,10 +11,14 @@
  */
 module libp2p.transport.ws;
 
+import std.algorithm.comparison : min;
 import std.base64 : Base64;
 import std.bitmanip : nativeToBigEndian, bigEndianToNative;
 import std.digest.sha : sha1Of;
 import std.random : uniform;
+
+import libp2p.core.ending : ConnClosed, EndOfStream;
+import libp2p.core.stream : Stream;
 
 /// RFC 6455 §5.2 opcodes. libp2p traffic rides `binary`; the rest are control.
 enum WsOp : ubyte
@@ -201,4 +205,132 @@ WsFrame wsDecodeFrame(scope const(ubyte)[] buf, out size_t consumed) @safe
 
 	consumed = off + len;
 	return WsFrame(op, fin, payload);
+}
+
+/// The TLS layer a `wss` (`/tls/ws`) address needs, kept out of libp2p-core so
+/// this transport doesn't force a TLS stack on builds that only dial `/ws`. The
+/// app supplies one (e.g. backed by OpenSSL / vibe-stream:tls); `connect` must do
+/// a client handshake with SNI set to `sniHost` (the cert is issued for the
+/// hostname, not the resolved IP).
+interface TlsProvider
+{
+	Stream connect(Stream inner, string sniHost);
+	Stream accept(Stream inner);
+}
+
+/// A libp2p byte stream over a WebSocket: it frames every `write` as one binary
+/// frame (client-masked per RFC 6455) and reassembles inbound frames into bytes,
+/// answering pings and honouring close. Noise + yamux run on top of this, so the
+/// frames carry opaque libp2p bytes.
+final class WsStream : Stream
+{
+	private Stream inner;
+	private bool client; // client→server frames are masked
+	private ubyte[] rbuf; // bytes read from `inner`, not yet decoded
+	private ubyte[] pending; // decoded payload not yet returned to the caller
+	private bool closed;
+
+	this(Stream inner, bool client) @safe nothrow
+	{
+		this.inner = inner;
+		this.client = client;
+	}
+
+	size_t read(ubyte[] buf)
+	{
+		if (buf.length == 0)
+			return 0;
+		if (closed)
+			throw new ConnClosed("ws: closed locally");
+		while (pending.length == 0)
+			fillPending(); // reads/handles frames until a data frame lands (or throws)
+		immutable n = min(buf.length, pending.length);
+		buf[0 .. n] = pending[0 .. n];
+		pending = pending[n .. $];
+		return n;
+	}
+
+	void write(const(ubyte)[] data)
+	{
+		if (closed)
+			throw new ConnClosed("ws: closed locally");
+		sendFrame(WsOp.binary, data);
+	}
+
+	void close() nothrow
+	{
+		if (closed)
+			return;
+		closed = true;
+		try
+			sendFrame(WsOp.close, null);
+		catch (Exception)
+		{
+		}
+		inner.close();
+	}
+
+	void reset() nothrow
+	{
+		closed = true;
+		inner.reset();
+	}
+
+	private void sendFrame(WsOp op, scope const(ubyte)[] payload)
+	{
+		ubyte[4] key; // stays [0,0,0,0] for a server frame (unmasked)
+		if (client)
+			key = wsMaskKey();
+		inner.write(wsEncodeFrame(op, payload, client, key));
+	}
+
+	// Decode inbound frames until a data frame's payload is buffered in `pending`.
+	// Control frames are handled inline: ping → pong, pong → ignore, close → end.
+	private void fillPending()
+	{
+		while (true)
+		{
+			size_t consumed;
+			WsFrame fr;
+			try
+				fr = wsDecodeFrame(rbuf, consumed);
+			catch (WsIncomplete)
+			{
+				readMore();
+				continue;
+			}
+			rbuf = rbuf[consumed .. $];
+
+			switch (fr.op)
+			{
+			case WsOp.binary:
+			case WsOp.text:
+			case WsOp.cont:
+				pending ~= fr.payload;
+				return;
+			case WsOp.ping:
+				sendFrame(WsOp.pong, fr.payload);
+				break;
+			case WsOp.pong:
+				break;
+			case WsOp.close:
+				closed = true;
+				try
+					sendFrame(WsOp.close, null);
+				catch (Exception)
+				{
+				}
+				throw new EndOfStream("ws: peer closed the connection");
+			default:
+				break; // ignore unknown opcodes
+			}
+		}
+	}
+
+	private void readMore()
+	{
+		ubyte[4096] tmp;
+		immutable n = inner.read(tmp[]);
+		rbuf ~= tmp[0 .. n];
+	}
 }

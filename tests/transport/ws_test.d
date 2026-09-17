@@ -4,6 +4,42 @@ module tests.transport.ws_test;
 
 import fluent.asserts;
 import libp2p.transport.ws;
+import libp2p.core.stream : Stream;
+import libp2p.core.ending : EndOfStream;
+import std.algorithm.comparison : min;
+
+// An in-memory duplex: `write` appends to one shared buffer, `read` drains the
+// other, so two WsStreams can talk without a socket.
+private final class MemStream : Stream
+{
+	private ubyte[]* outbuf;
+	private ubyte[]* inbuf;
+	this(ubyte[]* o, ubyte[]* i)
+	{
+		outbuf = o;
+		inbuf = i;
+	}
+
+	size_t read(ubyte[] buf)
+	{
+		if (buf.length == 0)
+			return 0;
+		if ((*inbuf).length == 0)
+			throw new EndOfStream("mem: empty");
+		immutable n = min(buf.length, (*inbuf).length);
+		buf[0 .. n] = (*inbuf)[0 .. n];
+		*inbuf = (*inbuf)[n .. $];
+		return n;
+	}
+
+	void write(const(ubyte)[] data)
+	{
+		*outbuf ~= data;
+	}
+
+	void close() nothrow {}
+	void reset() nothrow {}
+}
 
 @("ws: Sec-WebSocket-Accept matches the RFC 6455 §1.3 example")
 unittest
@@ -82,4 +118,49 @@ unittest
 	serverHandshakeOk(resp, accept).should.equal(true);
 	serverHandshakeOk(resp, "wrong").should.equal(false);
 	serverHandshakeOk("HTTP/1.1 400 Bad Request\r\n\r\n", accept).should.equal(false);
+}
+
+@("ws-stream: bytes round-trip through the framing (client masks, server doesn't)")
+unittest
+{
+	ubyte[] ab, ba; // a→b and b→a
+	auto a = new WsStream(new MemStream(&ab, &ba), true); // client
+	auto b = new WsStream(new MemStream(&ba, &ab), false); // server
+
+	a.write(cast(ubyte[]) "hello libp2p".dup);
+	(ab[1] & 0x80).should.equal(0x80); // client frame is masked
+
+	ubyte[64] buf;
+	auto n = b.read(buf[]);
+	(cast(string) buf[0 .. n]).should.equal("hello libp2p");
+
+	b.write(cast(ubyte[]) "hi phone".dup);
+	(ba[1] & 0x80).should.equal(0); // server frame is unmasked
+	n = a.read(buf[]);
+	(cast(string) buf[0 .. n]).should.equal("hi phone");
+}
+
+@("ws-stream: a ping is answered with a pong and the data still arrives")
+unittest
+{
+	ubyte[] ab, ba;
+	auto aInner = new MemStream(&ab, &ba);
+	auto a = new WsStream(aInner, true);
+	auto b = new WsStream(new MemStream(&ba, &ab), false);
+
+	// client puts a ping ahead of its data (both land in the a→b buffer)
+	ubyte[4] k = [1, 2, 3, 4];
+	aInner.write(wsEncodeFrame(WsOp.ping, cast(ubyte[]) "ka".dup, true, k));
+	a.write(cast(ubyte[]) "data".dup);
+
+	ubyte[16] buf;
+	auto n = b.read(buf[]);
+	(cast(string) buf[0 .. n]).should.equal("data");
+
+	// the server answered the ping with a pong on the b→a buffer
+	(ba.length > 0).should.equal(true);
+	size_t used;
+	auto pong = wsDecodeFrame(ba, used);
+	pong.op.should.equal(WsOp.pong);
+	(cast(string) pong.payload).should.equal("ka");
 }
