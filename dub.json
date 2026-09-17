@@ -1,6 +1,6 @@
 {
 	"name": "libp2p",
-	"description": "libp2p for D — fibers on vibe-core, crypto on libsodium",
+	"description": "libp2p for D \u2014 fibers on vibe-core, crypto on libsodium",
 	"authors": [
 		"caetano"
 	],
@@ -59,8 +59,14 @@
 			"targetType": "executable",
 			"targetName": "webrtc-stun-smoke",
 			"mainSourceFile": "interop/webrtc-stun/app.d",
-			"sourcePaths": ["source", "interop/webrtc-stun"],
-			"importPaths": ["source", "interop/webrtc-stun"],
+			"sourcePaths": [
+				"source",
+				"interop/webrtc-stun"
+			],
+			"importPaths": [
+				"source",
+				"interop/webrtc-stun"
+			],
 			"dependencies": {
 				"webrtc": {
 					"path": "../d-webrtc-v3"
@@ -90,6 +96,44 @@
 			"dflags": [
 				"-unittest"
 			]
+		},
+		{
+			"name": "relay-node",
+			"targetType": "executable",
+			"targetName": "relay-node",
+			"mainSourceFile": "interop/relay-node/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/relay-node"
+			],
+			"importPaths": [
+				"source",
+				"interop/relay-node"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
+		},
+		{
+			"name": "punch-peer",
+			"targetType": "executable",
+			"targetName": "punch-peer",
+			"mainSourceFile": "interop/punch-peer/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/punch-peer"
+			],
+			"importPaths": [
+				"source",
+				"interop/punch-peer"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		}
 	],
 	"libs": [
