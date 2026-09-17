@@ -153,6 +153,25 @@
 					"path": "../d-webrtc-v3"
 				}
 			}
+		},
+		{
+			"name": "kad-live",
+			"targetType": "executable",
+			"targetName": "kad-live",
+			"mainSourceFile": "interop/kad-live/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/kad-live"
+			],
+			"importPaths": [
+				"source",
+				"interop/kad-live"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		}
 	],
 	"libs": [
