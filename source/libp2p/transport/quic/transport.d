@@ -16,6 +16,7 @@ import std.format : format;
 import std.range : empty, front;
 import std.socket : AddressFamily;
 import std.typecons : Nullable;
+import core.time : seconds;
 
 import vibe.core.net : NetworkAddress, resolveHost;
 
@@ -24,17 +25,31 @@ import libp2p.core.peer_id : PeerId;
 import libp2p.multiformats.multiaddr : Multiaddr, Component;
 import libp2p.swarm.swarm : CapableTransport, UpgradedConn;
 import libp2p.transport.quic.connection : QuicConnection;
-import libp2p.transport.quic.udp : QuicClient, QuicListener;
+import libp2p.transport.quic.udp : QuicClient, QuicListener, QuicPump;
+import libp2p.transport.quic.punch : QuicPunchSocket;
+
+/// QUIC transport configuration.
+struct QuicConfig
+{
+    /// STUN servers ("host:port") probed for our server-reflexive address, on the
+    /// socket a later hole punch reuses. Mirrors WebRtcConfig's default list.
+    string[] stunServers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
+}
 
 final class QuicTransport : CapableTransport
 {
     private Keypair _identity;
+    private QuicConfig _cfg;
     private QuicListener[] _listeners;
     private QuicClient[] _clients;
+    private QuicPunchSocket _punchSock; // shared srflx-gathering + punch socket
+    private Multiaddr _reflexive;
+    private bool _gathered;
 
-    this(Keypair identity)
+    this(Keypair identity, QuicConfig cfg = QuicConfig.init)
     {
         _identity = identity;
+        _cfg = cfg;
     }
 
     bool canHandle(const Multiaddr addr)
@@ -113,15 +128,54 @@ final class QuicTransport : CapableTransport
         return toQuicMultiaddr(listener.localAddress);
     }
 
-    /// QUIC is not (yet) in the DCUtR hole-punch path.
+    /// Our server-reflexive /quic-v1 address, gathered once via STUN on a socket
+    /// kept open so a later hole punch reuses the same NAT mapping. Multiaddr.init
+    /// if no STUN server answered.
     Multiaddr reflexiveAddr()
     {
-        return Multiaddr.init;
+        if (_gathered)
+            return _reflexive;
+        _gathered = true;
+        try
+        {
+            if (_punchSock is null)
+                _punchSock = new QuicPunchSocket(_identity);
+            auto srflx = _punchSock.gatherReflexive(_cfg.stunServers, 2.seconds);
+            if (!srflx.isNull)
+                _reflexive = toQuicMultiaddr(srflx.get);
+        }
+        catch (Exception)
+        {
+        }
+        return _reflexive;
     }
 
+    /// Punch a direct QUIC connection to `remote` at its reflexive address, reusing
+    /// the socket reflexiveAddr() gathered on. Both peers call this at once (DCUtR);
+    /// `asDialer` splits the one asymmetric role QUIC needs — the dialer runs the
+    /// QUIC client handshake, the other side the server. TLS identity replaces any
+    /// certhash pin.
     UpgradedConn punch(const Multiaddr peerSrflx, PeerId remote, bool asDialer, Nullable!PeerId expected)
     {
-        throw new Exception("quic: hole punch not implemented yet");
+        if (_punchSock is null)
+            _punchSock = new QuicPunchSocket(_identity);
+        auto ma = Multiaddr(peerSrflx.bytes.dup);
+        auto peer = toUdpAddress(ma.components);
+
+        auto pump = asDialer ? _punchSock.punchClient(peer) : _punchSock.punchServer(peer, 10.seconds);
+        pump.waitForHandshake();
+        auto conn = pump.connection;
+        auto rp = conn.remotePeerId();
+        enforce(expected.isNull || expected.get == rp,
+            "quic punch: the peer is " ~ rp.toString ~ ", not " ~ expected.get.toString);
+
+        UpgradedConn up;
+        up.muxer = conn;
+        up.remotePeer = rp;
+        rp.tryPublicKey(up.remoteKey);
+        up.localAddr = toQuicMultiaddr(_punchSock.localAddress);
+        up.remoteAddr = ma;
+        return up;
     }
 
     void close() nothrow
@@ -135,6 +189,12 @@ final class QuicTransport : CapableTransport
         foreach (cl; _clients)
             try
                 cl.close();
+            catch (Exception)
+            {
+            }
+        if (_punchSock !is null)
+            try
+                _punchSock.close();
             catch (Exception)
             {
             }

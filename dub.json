@@ -417,6 +417,62 @@
 					"path": "../d-webrtc-v3"
 				}
 			}
+		},
+		{
+			"name": "quic-punch-example",
+			"targetType": "executable",
+			"targetName": "quic-punch-example",
+			"mainSourceFile": "examples/quic_punch/app.d",
+			"sourcePaths": [
+				"source",
+				"examples/quic_punch"
+			],
+			"importPaths": [
+				"source",
+				"examples/quic_punch"
+			],
+			"versions": [
+				"Libp2pQuic"
+			],
+			"libs": [
+				"ngtcp2",
+				"ngtcp2_crypto_ossl",
+				"ssl",
+				"crypto"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
+		},
+		{
+			"name": "quic-srflx-example",
+			"targetType": "executable",
+			"targetName": "quic-srflx-example",
+			"mainSourceFile": "examples/quic_srflx/app.d",
+			"sourcePaths": [
+				"source",
+				"examples/quic_srflx"
+			],
+			"importPaths": [
+				"source",
+				"examples/quic_srflx"
+			],
+			"versions": [
+				"Libp2pQuic"
+			],
+			"libs": [
+				"ngtcp2",
+				"ngtcp2_crypto_ossl",
+				"ssl",
+				"crypto"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		}
 	],
 	"libs": [

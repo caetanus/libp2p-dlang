@@ -508,10 +508,14 @@ final class Relay : Notifiee, Transport
 	private Connection dialOrPunch(const(ubyte)[] raw, PeerId peer, bool asDialer)
 	{
 		auto addr = Multiaddr.decode(raw);
-		immutable webrtc = addr.components.canFind!(c => c.name == "webrtc-direct");
+		// webrtc-direct and quic-v1 both carry their own security+muxing and reuse a
+		// gathered srflx socket, so they punch; anything else is a plain (TCP)
+		// simultaneous-open dial.
+		immutable punchable = addr.components.canFind!(c => c.name == "webrtc-direct"
+				|| c.name == "quic-v1");
 		if (!addr.components.canFind!(c => c.name == "p2p"))
 			addr = addr ~ Multiaddr.parse("/p2p/" ~ peer.toBase58);
-		return webrtc ? host.punch(addr, peer, asDialer) : host.swarm.dial(addr);
+		return punchable ? host.punch(addr, peer, asDialer) : host.swarm.dial(addr);
 	}
 
 	/// Swap addresses, wait half a round trip, reach `peer` directly. Returns the
