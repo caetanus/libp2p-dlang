@@ -86,8 +86,15 @@
 				"source",
 				"examples/quic_check"
 			],
-			"versions": ["Libp2pQuic"],
-			"libs": ["ngtcp2", "ngtcp2_crypto_ossl", "ssl", "crypto"],
+			"versions": [
+				"Libp2pQuic"
+			],
+			"libs": [
+				"ngtcp2",
+				"ngtcp2_crypto_ossl",
+				"ssl",
+				"crypto"
+			],
 			"dependencies": {
 				"webrtc": {
 					"path": "../d-webrtc-v3"
@@ -99,11 +106,28 @@
 			"targetType": "executable",
 			"targetName": "quic-udp-example",
 			"mainSourceFile": "examples/quic_udp/app.d",
-			"sourcePaths": [ "source", "examples/quic_udp" ],
-			"importPaths": [ "source", "examples/quic_udp" ],
-			"versions": ["Libp2pQuic"],
-			"libs": ["ngtcp2", "ngtcp2_crypto_ossl", "ssl", "crypto"],
-			"dependencies": { "webrtc": { "path": "../d-webrtc-v3" } }
+			"sourcePaths": [
+				"source",
+				"examples/quic_udp"
+			],
+			"importPaths": [
+				"source",
+				"examples/quic_udp"
+			],
+			"versions": [
+				"Libp2pQuic"
+			],
+			"libs": [
+				"ngtcp2",
+				"ngtcp2_crypto_ossl",
+				"ssl",
+				"crypto"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		},
 		{
 			"name": "ut",
@@ -331,6 +355,34 @@
 			"importPaths": [
 				"source",
 				"interop/relay-data"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
+		},
+		{
+			"name": "quic-stream-example",
+			"targetType": "executable",
+			"targetName": "quic-stream-example",
+			"mainSourceFile": "examples/quic_stream/app.d",
+			"sourcePaths": [
+				"source",
+				"examples/quic_stream"
+			],
+			"importPaths": [
+				"source",
+				"examples/quic_stream"
+			],
+			"versions": [
+				"Libp2pQuic"
+			],
+			"libs": [
+				"ngtcp2",
+				"ngtcp2_crypto_ossl",
+				"ssl",
+				"crypto"
 			],
 			"dependencies": {
 				"webrtc": {

@@ -31,6 +31,7 @@ final class QuicPump
     private void delegate(scope const(ubyte)[]) _send;
     private Timer _timer;
     private LocalManualEvent _handshakeEvent;
+    private bool _closed;
 
     this(QuicConnection conn, void delegate(scope const(ubyte)[]) send)
     {
@@ -38,6 +39,8 @@ final class QuicPump
         _send = send;
         _handshakeEvent = createManualEvent();
         _timer = createTimer(() @trusted nothrow { onTimer(); });
+        // A stream write nudges us to flush immediately (same fiber, synchronous).
+        _conn.onWantWrite = () @trusted nothrow { serviceOutNothrow(); };
     }
 
     /// Send whatever is pending now (e.g. a client's opening Initial).
@@ -49,6 +52,8 @@ final class QuicPump
     /// Feed one received QUIC packet in, then flush any response.
     void deliver(scope const(ubyte)[] packet)
     {
+        if (_closed)
+            return;
         _conn.deliver(packet);
         serviceOut();
     }
@@ -67,6 +72,10 @@ final class QuicPump
 
     void close()
     {
+        if (_closed)
+            return;
+        _closed = true;
+        _conn.onWantWrite = null; // no re-entry into a freed conn
         _timer.stop();
         _conn.close();
     }
@@ -74,14 +83,9 @@ final class QuicPump
     // Drain outbound packets, re-arm the loss/idle timer, signal handshake done.
     private void serviceOut()
     {
-        ubyte[2048] scratch;
-        for (;;)
-        {
-            auto pkt = _conn.writeOne(scratch[]);
-            if (pkt.length == 0)
-                break;
-            _send(pkt);
-        }
+        if (_closed)
+            return;
+        _conn.collectOutgoing((scope const(ubyte)[] pkt) { _send(pkt); });
         immutable due = _conn.timeout();
         if (due == Duration.max)
             _timer.stop();
@@ -89,6 +93,16 @@ final class QuicPump
             _timer.rearm(due < Duration.zero ? Duration.zero : due);
         if (_conn.handshakeComplete)
             _handshakeEvent.emit();
+    }
+
+    // serviceOut for nothrow contexts (the wantWrite hook, the timer).
+    private void serviceOutNothrow() nothrow
+    {
+        try
+            serviceOut();
+        catch (Exception)
+        {
+        }
     }
 
     private void onTimer() nothrow
@@ -159,6 +173,7 @@ final class QuicClient
     void close()
     {
         _pump.close();
+        _udp.close(); // ends the recv-parked readLoop fiber
     }
 }
 
@@ -232,6 +247,7 @@ final class QuicListener
     {
         foreach (p; _pumps)
             p.close();
+        _udp.close(); // ends the recv-parked readLoop fiber
     }
 }
 
