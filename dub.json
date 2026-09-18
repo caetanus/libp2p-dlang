@@ -155,6 +155,25 @@
 			}
 		},
 		{
+			"name": "mplex-dd",
+			"targetType": "executable",
+			"targetName": "mplex-dd",
+			"mainSourceFile": "interop/mplex-dd/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/mplex-dd"
+			],
+			"importPaths": [
+				"source",
+				"interop/mplex-dd"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
+		},
+		{
 			"name": "kad-live",
 			"targetType": "executable",
 			"targetName": "kad-live",

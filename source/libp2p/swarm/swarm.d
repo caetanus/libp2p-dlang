@@ -57,6 +57,10 @@ struct SwarmConfig
 	/// fibers; at the ceiling the connection stops accepting, and the muxer resets
 	/// the peer's streams past its own backlog. 0 is unlimited.
 	uint maxInboundStreams = 256;
+	/// Stream muxers offered in negotiation order. Empty ⇒ [yamux] (the default).
+	/// Set e.g. [new MplexFactory] to offer mplex — used to validate the mplex muxer
+	/// D↔D over a real connection, self-standing (no rust interop).
+	MuxerFactory[] muxers;
 }
 
 /// A connection that arrives already authenticated and multiplexed: what a
@@ -149,7 +153,7 @@ final class Swarm
 		this.limiter = new Limiter(cfg.limits);
 		version (LibP2P_Lite) {} else resolver = new CaresDns;   // lite (the phone): no c-ares, IP addresses only
 		upgradeCfg.security = [new NoiseTransport(identity)];
-		upgradeCfg.muxers = [new YamuxFactory];
+		upgradeCfg.muxers = cfg.muxers.length ? cfg.muxers : [cast(MuxerFactory) new YamuxFactory];
 		// An admission that fails is one connection not made; the swarm goes on.
 		fibers = new FiberGroup((Exception e) nothrow {
 			logDebug("libp2p: inbound connection not admitted: %s", e.msg);
