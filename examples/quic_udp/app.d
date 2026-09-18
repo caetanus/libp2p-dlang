@@ -25,7 +25,7 @@ int main()
             bool serverDone;
             auto serverId = Keypair.generateEd25519();
             auto listener = new QuicListener(serverId, 0);
-            listener.onAccept = (QuicConnection conn) nothrow { serverDone = true; };
+            listener.onAccept = (QuicConnection conn, NetworkAddress from) nothrow { serverDone = true; };
             immutable port = listener.localAddress.port;
             writeln("QUIC listener on 127.0.0.1:", port);
 

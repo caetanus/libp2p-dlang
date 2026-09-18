@@ -389,6 +389,34 @@
 					"path": "../d-webrtc-v3"
 				}
 			}
+		},
+		{
+			"name": "quic-host-example",
+			"targetType": "executable",
+			"targetName": "quic-host-example",
+			"mainSourceFile": "examples/quic_host/app.d",
+			"sourcePaths": [
+				"source",
+				"examples/quic_host"
+			],
+			"importPaths": [
+				"source",
+				"examples/quic_host"
+			],
+			"versions": [
+				"Libp2pQuic"
+			],
+			"libs": [
+				"ngtcp2",
+				"ngtcp2_crypto_ossl",
+				"ssl",
+				"crypto"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		}
 	],
 	"libs": [

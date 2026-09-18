@@ -45,7 +45,7 @@ int main()
         {
             auto serverId = Keypair.generateEd25519();
             auto listener = new QuicListener(serverId, 0);
-            listener.onAccept = (QuicConnection conn) nothrow {
+            listener.onAccept = (QuicConnection conn, NetworkAddress from) nothrow {
                 runTask(() nothrow {
                     try
                     {

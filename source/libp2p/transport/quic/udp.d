@@ -127,14 +127,19 @@ final class QuicClient
     private QuicPump _pump;
     private NetworkAddress _peer;
 
-    this(Keypair identity, NetworkAddress peer)
+    this(Keypair identity, NetworkAddress peer, string bindHost = "127.0.0.1")
     {
         _peer = peer;
-        _udp = listenUDP(0, "127.0.0.1"); // ephemeral local
+        _udp = listenUDP(0, bindHost); // ephemeral local
         _conn = QuicConnection.dial(identity, addrBytes(_udp.localAddress), addrBytes(peer));
         _pump = new QuicPump(_conn, &send);
         runTask(&readLoop);
         _pump.kick(); // opening Initial
+    }
+
+    NetworkAddress localAddress()
+    {
+        return _udp.localAddress;
     }
 
     private void send(scope const(ubyte)[] pkt)
@@ -185,12 +190,12 @@ final class QuicListener
     private UDPConnection _udp;
     private QuicPump[string] _pumps; // keyed by source address
     private Keypair _identity;
-    void delegate(QuicConnection) nothrow onAccept;
+    void delegate(QuicConnection, NetworkAddress) nothrow onAccept;
 
-    this(Keypair identity, ushort port)
+    this(Keypair identity, ushort port, string bindHost = "127.0.0.1")
     {
         _identity = identity;
-        _udp = listenUDP(port, "127.0.0.1");
+        _udp = listenUDP(port, bindHost);
         runTask(&readLoop);
     }
 
@@ -227,12 +232,13 @@ final class QuicListener
                 _pumps[key] = pump;
                 pump.deliver(pkt);
                 auto cb = onAccept;
+                auto peerAddr = from;
                 runTask(() nothrow {
                     try
                     {
                         pump.waitForHandshake();
                         if (cb !is null)
-                            cb(conn);
+                            cb(conn, peerAddr);
                     }
                     catch (Exception)
                     {
