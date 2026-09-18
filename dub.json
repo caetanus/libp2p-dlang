@@ -473,6 +473,25 @@
 					"path": "../d-webrtc-v3"
 				}
 			}
+		},
+		{
+			"name": "tcp-reuse-example",
+			"targetType": "executable",
+			"targetName": "tcp-reuse-example",
+			"mainSourceFile": "examples/tcp_reuse/app.d",
+			"sourcePaths": [
+				"source",
+				"examples/tcp_reuse"
+			],
+			"importPaths": [
+				"source",
+				"examples/tcp_reuse"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		}
 	],
 	"libs": [

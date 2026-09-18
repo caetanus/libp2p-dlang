@@ -138,7 +138,10 @@ final class TcpListener : Listener
 	private this(NetworkAddress bind)
 	{
 		arrived = createManualEvent();
-		listener = listenTCP(&onConnection, bind, TCPListenOptions.disableAutoClose | TCPListenOptions.reuseAddress);
+		// reusePort so a hole punch can dial out from this same listen port
+		// (SO_REUSEPORT on both sockets); see libp2p.transport.tcp_reuse.
+		listener = listenTCP(&onConnection, bind, TCPListenOptions.disableAutoClose
+				| TCPListenOptions.reuseAddress | TCPListenOptions.reusePort);
 	}
 
 	private void onConnection(TCPConnection c) @safe nothrow
