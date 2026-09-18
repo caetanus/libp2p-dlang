@@ -58,6 +58,26 @@ final class WsIncomplete : Exception
 	}
 }
 
+/// The frame runs below Noise, so `wsDecodeFrame` sees bytes from an
+/// unauthenticated peer. RFC 6455 allows a 63-bit length; libp2p frames are
+/// tiny (Noise ≤64 KiB, yamux ≤16 KiB), so cap what one frame may declare. This
+/// bounds the receive buffer AND keeps `off + len` from overflowing `size_t`
+/// (which would slip past the "have I got the whole frame yet" check and slice
+/// backwards into a RangeError — an Error the swarm's Exception handlers do not
+/// catch, taking the whole process down).
+enum size_t wsMaxFrameLen = 16 * 1024 * 1024;
+
+/// A peer sent a frame that violates the protocol (here: an oversized length).
+/// An Exception, so the upgrade path closes the connection instead of a
+/// RangeError killing the host.
+final class WsProtocolError : Exception
+{
+	this(string msg) @safe nothrow
+	{
+		super(msg);
+	}
+}
+
 /// The magic GUID RFC 6455 §1.3 appends to the client key before hashing.
 enum WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -194,6 +214,14 @@ WsFrame wsDecodeFrame(scope const(ubyte)[] buf, out size_t consumed) @safe
 		len = cast(size_t) bigEndianToNative!ulong(tmp);
 		off += 8;
 	}
+
+	// Reject an oversized length HERE — before the mask/payload offset arithmetic
+	// and before the caller commits to buffering — so `off + len` cannot overflow
+	// and the receive buffer stays bounded. A real libp2p ws frame is far under
+	// this; a stranger declaring gigabytes (or ulong.max) is refused as an
+	// Exception, not left to exhaust memory or slice backwards into an Error.
+	if (len > wsMaxFrameLen)
+		throw new WsProtocolError("ws: frame length exceeds the maximum");
 
 	ubyte[4] key;
 	if (masked)

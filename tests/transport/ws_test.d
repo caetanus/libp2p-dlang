@@ -303,3 +303,46 @@ unittest
 	server.close();
 	serverInner.wasClosed.should.equal(true);
 }
+
+// S2/S2b: pre-Noise, wsDecodeFrame sees a 63-bit length from an unauthenticated
+// peer. A huge length must be refused as a WsProtocolError (an Exception the
+// upgrade path catches) — NOT left to exhaust the buffer, and NOT overflow
+// off+len into a backwards slice (a RangeError, which is an Error the swarm's
+// Exception handlers don't catch, killing the whole process).
+@("ws: an oversized frame length is a WsProtocolError, not a process-killing Error (S2/S2b)")
+unittest
+{
+	import std.bitmanip : nativeToBigEndian;
+
+	size_t consumed;
+
+	// S2b: len = ulong.max — the value that overflows off+len. If the fix is
+	// missing this raises a RangeError (Error) that escapes this catch and fails
+	// the test; with the fix it is a caught WsProtocolError.
+	ubyte[] killer = [0x82, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+	bool killerRefused;
+	try
+		wsDecodeFrame(killer, consumed);
+	catch (WsProtocolError)
+		killerRefused = true;
+	killerRefused.should.equal(true);
+
+	// S2: a large-but-non-overflowing length (1 GiB) — refused before the buffer
+	// is committed to accumulating it.
+	ubyte[] dos = cast(ubyte[])[0x82, 0x7F] ~ nativeToBigEndian(cast(ulong)(1024UL * 1024 * 1024)).dup;
+	bool dosRefused;
+	try
+		wsDecodeFrame(dos, consumed);
+	catch (WsProtocolError)
+		dosRefused = true;
+	dosRefused.should.equal(true);
+
+	// A frame at the cap is NOT a protocol error (just incomplete without payload).
+	ubyte[] atCap = cast(ubyte[])[0x82, 0x7F] ~ nativeToBigEndian(cast(ulong) wsMaxFrameLen).dup;
+	bool incomplete;
+	try
+		wsDecodeFrame(atCap, consumed);
+	catch (WsIncomplete)
+		incomplete = true;
+	incomplete.should.equal(true);
+}
