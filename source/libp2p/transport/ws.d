@@ -27,7 +27,7 @@ import libp2p.core.ending : ConnClosed, EndOfStream;
 import libp2p.core.stream : Stream, readExact;
 import libp2p.multiformats.multiaddr : Multiaddr, Component;
 import libp2p.transport.tcp : TcpTransport;
-import libp2p.transport.transport : Transport, RawConn, Listener, StreamRawConn;
+import libp2p.transport.transport : Transport, PunchableTransport, RawConn, Listener, StreamRawConn;
 
 /// RFC 6455 §5.2 opcodes. libp2p traffic rides `binary`; the rest are control.
 enum WsOp : ubyte
@@ -459,7 +459,7 @@ private string headerValue(string head, string lowerName) @safe
  * 6455 Upgrade, and hands up a `WsStream`; the swarm's own upgrade adds Noise and
  * yamux on top.
  */
-final class WsTransport : Transport
+final class WsTransport : Transport, PunchableTransport
 {
 	private TlsProvider tls;
 	private TcpTransport tcp;
@@ -494,7 +494,22 @@ final class WsTransport : Transport
 	{
 		auto w = parseWsAddr(remote);
 		auto base = Multiaddr.parse("/" ~ ipForm(w) ~ "/tcp/" ~ w.port.to!string);
-		auto raw = tcp.dial(base);
+		return upgradeClient(tcp.dial(base), w, remote);
+	}
+
+	// PunchableTransport: the ws punch is the TCP punch (dial from our listen port
+	// with reuse) followed by the identical WebSocket upgrade over that socket.
+	RawConn dialReusing(const Multiaddr remote, ushort localPort)
+	{
+		auto w = parseWsAddr(remote);
+		auto base = Multiaddr.parse("/" ~ ipForm(w) ~ "/tcp/" ~ w.port.to!string);
+		return upgradeClient(tcp.dialReusing(base, localPort), w, remote);
+	}
+
+	// Run the client WebSocket handshake over an already-connected raw TCP conn
+	// (optionally under TLS), returning the framed ws stream as a RawConn.
+	private RawConn upgradeClient(RawConn raw, WsAddr w, const Multiaddr remote)
+	{
 		Stream inner = raw;
 		if (w.hasTls)
 		{

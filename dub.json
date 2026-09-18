@@ -511,6 +511,25 @@
 					"path": "../d-webrtc-v3"
 				}
 			}
+		},
+		{
+			"name": "ws-punch-example",
+			"targetType": "executable",
+			"targetName": "ws-punch-example",
+			"mainSourceFile": "examples/ws_punch/app.d",
+			"sourcePaths": [
+				"source",
+				"examples/ws_punch"
+			],
+			"importPaths": [
+				"source",
+				"examples/ws_punch"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		}
 	],
 	"libs": [
