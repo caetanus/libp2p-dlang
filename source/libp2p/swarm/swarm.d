@@ -33,6 +33,7 @@ import libp2p.multiformats.multiaddr : Multiaddr;
 import libp2p.muxer.muxer : Muxer;
 import libp2p.muxer.yamux : YamuxFactory;
 import libp2p.security.noise : NoiseTransport;
+import libp2p.security.security : SecureTransport;
 import libp2p.swarm.connection;
 import libp2p.swarm.limiter;
 import libp2p.transport.transport;
@@ -61,6 +62,10 @@ struct SwarmConfig
 	/// Set e.g. [new MplexFactory] to offer mplex — used to validate the mplex muxer
 	/// D↔D over a real connection, self-standing (no rust interop).
 	MuxerFactory[] muxers;
+	/// Security transports offered in negotiation order, built from the host's
+	/// identity. null ⇒ [Noise] (the default). Set e.g. (k) => [new
+	/// PlaintextTransport(k)] to offer plaintext — used to validate it D↔D.
+	SecureTransport[] delegate(Keypair identity) securityFactory;
 }
 
 /// A connection that arrives already authenticated and multiplexed: what a
@@ -152,7 +157,8 @@ final class Swarm
 		this.gater = gater;
 		this.limiter = new Limiter(cfg.limits);
 		version (LibP2P_Lite) {} else resolver = new CaresDns;   // lite (the phone): no c-ares, IP addresses only
-		upgradeCfg.security = [new NoiseTransport(identity)];
+		upgradeCfg.security = cfg.securityFactory !is null
+			? cfg.securityFactory(identity) : [cast(SecureTransport) new NoiseTransport(identity)];
 		upgradeCfg.muxers = cfg.muxers.length ? cfg.muxers : [cast(MuxerFactory) new YamuxFactory];
 		// An admission that fails is one connection not made; the swarm goes on.
 		fibers = new FiberGroup((Exception e) nothrow {
