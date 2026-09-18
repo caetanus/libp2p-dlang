@@ -180,6 +180,8 @@ final class QuicConnection
     Duration timeout()
     {
         immutable expiry = ngtcp2_conn_get_expiry(_conn);
+        if (expiry == ulong.max)
+            return Duration.max; // no timer armed
         immutable now = nowNanos();
         return expiry <= now ? Duration.zero : nsecs(cast(long)(expiry - now));
     }

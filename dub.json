@@ -95,6 +95,17 @@
 			}
 		},
 		{
+			"name": "quic-udp-example",
+			"targetType": "executable",
+			"targetName": "quic-udp-example",
+			"mainSourceFile": "examples/quic_udp/app.d",
+			"sourcePaths": [ "source", "examples/quic_udp" ],
+			"importPaths": [ "source", "examples/quic_udp" ],
+			"versions": ["Libp2pQuic"],
+			"libs": ["ngtcp2", "ngtcp2_crypto_ossl", "ssl", "crypto"],
+			"dependencies": { "webrtc": { "path": "../d-webrtc-v3" } }
+		},
+		{
 			"name": "ut",
 			"targetType": "executable",
 			"targetName": "libp2p-test",
