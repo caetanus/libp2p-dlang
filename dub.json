@@ -74,6 +74,27 @@
 			}
 		},
 		{
+			"name": "quic-check",
+			"targetType": "executable",
+			"targetName": "quic-check",
+			"mainSourceFile": "examples/quic_check/app.d",
+			"sourcePaths": [
+				"source",
+				"examples/quic_check"
+			],
+			"importPaths": [
+				"source",
+				"examples/quic_check"
+			],
+			"versions": ["Libp2pQuic"],
+			"libs": ["ngtcp2", "ngtcp2_crypto_ossl", "ssl", "crypto"],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
+		},
+		{
 			"name": "ut",
 			"targetType": "executable",
 			"targetName": "libp2p-test",
