@@ -19,12 +19,15 @@ import std.socket : AddressFamily;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
 import vibe.core.task : InterruptException;
 
+import core.time : seconds;
+
 import libp2p.core.ending;
 import libp2p.core.stream : Stream;
 import libp2p.multiformats.multiaddr : Multiaddr, Component;
 import libp2p.transport.transport;
+import libp2p.transport.tcp_reuse : connectReusingPort;
 
-final class TcpTransport : Transport
+final class TcpTransport : Transport, PunchableTransport
 {
 	bool canHandle(const Multiaddr addr)
 	{
@@ -57,6 +60,22 @@ final class TcpTransport : Transport
 	{
 		enforce(canHandle(local), "tcp: cannot listen on " ~ local.toString);
 		return new TcpListener(toNetworkAddress(local));
+	}
+
+	// PunchableTransport: dial from a fixed local port with address reuse, so a
+	// hole punch egresses from the listener's port (its NAT mapping).
+	RawConn dialReusing(const Multiaddr remote, ushort localPort)
+	{
+		enforce(canHandle(remote), "tcp: cannot dial " ~ remote.toString);
+		TCPConnection conn;
+		try
+			conn = connectReusingPort(localPort, toNetworkAddress(remote), 15.seconds);
+		catch (InterruptException e)
+			throw e;
+		catch (Exception e)
+			throw new Exception("tcp: reuse-dial " ~ remote.toString ~ " failed", e);
+		conn.tcpNoDelay = true;
+		return new TcpConn(conn);
 	}
 }
 

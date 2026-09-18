@@ -44,6 +44,17 @@ interface Transport
 	Listener listen(const Multiaddr local);
 }
 
+/// A raw transport that can also dial from a chosen local port with address reuse —
+/// what a TCP-style hole punch needs (egress from the listen port so the peer's NAT
+/// mapping matches). Implemented alongside `Transport`; the swarm uses it only for a
+/// punch.
+interface PunchableTransport
+{
+	/// Dial `remote` egressing from local port `localPort` with SO_REUSEADDR |
+	/// SO_REUSEPORT.
+	RawConn dialReusing(const Multiaddr remote, ushort localPort);
+}
+
 /// A `Stream` dressed as a raw connection: what a relay hands over, so the
 /// upgrade can treat it like a socket.
 final class StreamRawConn : RawConn

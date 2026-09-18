@@ -515,7 +515,9 @@ final class Relay : Notifiee, Transport
 				|| c.name == "quic-v1");
 		if (!addr.components.canFind!(c => c.name == "p2p"))
 			addr = addr ~ Multiaddr.parse("/p2p/" ~ peer.toBase58);
-		return punchable ? host.punch(addr, peer, asDialer) : host.swarm.dial(addr);
+		// TCP (and other raw transports) punch by simultaneous-open: dial from our
+		// own listen port with address reuse so the peer's NAT mapping matches.
+		return punchable ? host.punch(addr, peer, asDialer) : host.swarm.dialPunch(addr, peer);
 	}
 
 	/// Swap addresses, wait half a round trip, reach `peer` directly. Returns the

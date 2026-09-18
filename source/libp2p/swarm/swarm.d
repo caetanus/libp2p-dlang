@@ -17,7 +17,8 @@ module libp2p.swarm.swarm;
 
 import core.time : Duration, seconds;
 import std.algorithm.mutation : move;
-import std.algorithm.searching : canFind;
+import std.algorithm.searching : canFind, find;
+import std.range : empty, front;
 import std.exception : enforce;
 import std.typecons : Nullable, nullable;
 
@@ -225,6 +226,36 @@ final class Swarm
 		throw new Exception("swarm: no capable transport for punch address " ~ addr.toString);
 	}
 
+	/// Dial `addr` as a hole punch on a raw transport (TCP): egress from our own
+	/// listen port with address reuse, so the connect reuses the mapping the peer
+	/// was told to expect. Both peers call this at once (DCUtR); with no matching
+	/// listen port it falls back to a plain dial. `expected` pins the peer.
+	Connection dialPunch(Multiaddr addr, PeerId expected)
+	{
+		enforce(!closed, "swarm: closed");
+		return dialOne(addr, nullable(expected), tcpListenPort(addr));
+	}
+
+	// The port of our own listener that matches `addr`'s transport (TCP today), or
+	// 0 if none — then dialPunch degrades to an ordinary dial.
+	private ushort tcpListenPort(const Multiaddr addr)
+	{
+		if (!addr.components.canFind!(c => c.name == "tcp"))
+			return 0;
+		foreach (l; listeners)
+			try
+			{
+				auto lc = l.address().components;
+				auto tcp = lc.find!(c => c.name == "tcp");
+				if (!tcp.empty)
+					return cast(ushort)((tcp.front.value[0] << 8) | tcp.front.value[1]);
+			}
+			catch (Exception)
+			{
+			}
+		return 0;
+	}
+
 	// --- listening ---------------------------------------------------------------------
 
 	void listen(Multiaddr addr)
@@ -339,7 +370,7 @@ final class Swarm
 		return false;
 	}
 
-	private Connection dialOne(const Multiaddr target, Nullable!PeerId expected)
+	private Connection dialOne(const Multiaddr target, Nullable!PeerId expected, ushort reusePort = 0)
 	{
 		// An address may name its peer (`.../p2p/<id>`); transports dial the
 		// part before it, and the name becomes the peer we expect.
@@ -373,7 +404,15 @@ final class Swarm
 				return admitCapable(up, Endpoint.dialer);
 			}
 
-		RawConn raw = withTimeout(cfg.dialTimeout, "dial " ~ addr.toString, () => transportFor(addr).dial(addr));
+		// A punch (reusePort != 0) egresses from our listen port with address reuse
+		// when the transport supports it (TCP); otherwise a plain dial.
+		RawConn raw = withTimeout(cfg.dialTimeout, "dial " ~ addr.toString, () {
+			auto t = transportFor(addr);
+			if (reusePort != 0)
+				if (auto pt = cast(PunchableTransport) t)
+					return pt.dialReusing(addr, reusePort);
+			return t.dial(addr);
+		});
 		scope (failure)
 			raw.close();
 

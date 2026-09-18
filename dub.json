@@ -492,6 +492,25 @@
 					"path": "../d-webrtc-v3"
 				}
 			}
+		},
+		{
+			"name": "tcp-punch-example",
+			"targetType": "executable",
+			"targetName": "tcp-punch-example",
+			"mainSourceFile": "examples/tcp_punch/app.d",
+			"sourcePaths": [
+				"source",
+				"examples/tcp_punch"
+			],
+			"importPaths": [
+				"source",
+				"examples/tcp_punch"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		}
 	],
 	"libs": [
