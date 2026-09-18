@@ -212,6 +212,44 @@
 			}
 		},
 		{
+			"name": "mdns-dd",
+			"targetType": "executable",
+			"targetName": "mdns-dd",
+			"mainSourceFile": "interop/mdns-dd/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/mdns-dd"
+			],
+			"importPaths": [
+				"source",
+				"interop/mdns-dd"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
+		},
+		{
+			"name": "dns-resolve",
+			"targetType": "executable",
+			"targetName": "dns-resolve",
+			"mainSourceFile": "interop/dns-resolve/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/dns-resolve"
+			],
+			"importPaths": [
+				"source",
+				"interop/dns-resolve"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
+		},
+		{
 			"name": "kad-live",
 			"targetType": "executable",
 			"targetName": "kad-live",
