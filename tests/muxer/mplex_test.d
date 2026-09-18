@@ -287,3 +287,41 @@ unittest
 	});
 	delivered.should.equal(true);
 }
+
+
+// S1 regression: a reset stream must leave the accept backlog, not just `streams`.
+// A peer that opens-then-resets inbound streams a consumer never accepts (at its
+// inbound ceiling) otherwise grew the backlog without bound while never holding an
+// open stream — the substream cap counts `streams`, which the reset empties.
+@("mplex: reset streams do not accumulate in the backlog (S1: unbounded backlog)")
+unittest
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+
+	size_t backlogAfter = size_t.max;
+	runPair(
+		(Stream s) {
+		foreach (ulong id; 0 .. 200) // 200 open+reset pairs, distinct ids
+		{
+			s.write(encodeVarint(mplexHeader(id, cast(ulong) Flag.newStream)));
+			s.write(encodeVarint(0));
+			s.write(encodeVarint(mplexHeader(id, cast(ulong) Flag.resetInitiator)));
+			s.write(encodeVarint(0));
+		}
+		s.close();
+	},
+		(Stream s) {
+		MplexConfig cfg;
+		cfg.maxSubstreams = 8;
+		auto m = new Mplex(s, false, cfg);
+		scope (exit)
+			m.close();
+		// Model a consumer at its ceiling: never accept; let the reader process the
+		// whole flood (isClosed flips when the peer's close reaches the reader).
+		for (int i = 0; i < 3000 && !m.isClosed(); i++)
+			sleep(1.msecs);
+		backlogAfter = m.backlogLength();
+	});
+	backlogAfter.should.be.lessThan(cast(size_t) 9); // bounded by the cap, not the 200 sent
+}

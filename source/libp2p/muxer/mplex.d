@@ -178,6 +178,13 @@ final class Mplex : Muxer
 		return streams.length;
 	}
 
+	/// Inbound streams opened but not yet accepted. Bounded by the substream cap;
+	/// a leak (a reset stream never dropped from here) shows up as unbounded growth.
+	size_t backlogLength() const @safe pure nothrow
+	{
+		return backlog.length;
+	}
+
 	private void end(Exception why) nothrow
 	{
 		if (closed)
@@ -231,7 +238,13 @@ final class Mplex : Muxer
 				auto key = Key(f.id, false);
 				if (key in streams)
 					throw new MplexProtocolError("mplex: newStream for an already-open substream");
-				if (streams.length >= cfg.maxSubstreams)
+				// Cap on the accept BACKLOG, not just `streams`: a stream reset
+				// before it is accepted stays queued (so the app can still accept it
+				// and see the reset), and leaves `streams` — so a peer that
+				// opens-then-resets streams a consumer never drains (at its inbound
+				// ceiling) would grow the backlog without bound while streams.length
+				// stays near zero. Refusing on either count bounds both.
+				if (streams.length >= cfg.maxSubstreams || backlog.length >= cfg.maxSubstreams)
 				{
 					sendFrame(f.id, Flag.resetReceiver, null);
 					return;
