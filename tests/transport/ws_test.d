@@ -346,3 +346,33 @@ unittest
 		incomplete = true;
 	incomplete.should.equal(true);
 }
+
+// RFC 6455 §5.5: control frames (close/ping/pong) are ≤125 bytes and unfragmented.
+// An oversized ping would otherwise force a large allocation + pong echo pre-Noise.
+@("ws: an oversized or fragmented control frame is rejected (RFC 6455 §5.5)")
+unittest
+{
+	size_t consumed;
+	// ping (0x89) declaring 200 bytes via the 126 form: > 125 -> WsProtocolError.
+	ubyte[] bigPing = [0x89, 0x7E, 0x00, 0xC8];
+	bool pingRefused;
+	try
+		wsDecodeFrame(bigPing, consumed);
+	catch (WsProtocolError)
+		pingRefused = true;
+	pingRefused.should.equal(true);
+
+	// a fragmented close (FIN=0, op 0x8) -> WsProtocolError.
+	ubyte[] fragClose = [0x08, 0x00];
+	bool fragRefused;
+	try
+		wsDecodeFrame(fragClose, consumed);
+	catch (WsProtocolError)
+		fragRefused = true;
+	fragRefused.should.equal(true);
+
+	// a well-formed small ping (5 bytes, FIN=1) is NOT rejected here.
+	ubyte[] okPing = [0x89, 0x05, 'h', 'e', 'l', 'l', 'o'];
+	auto fr = wsDecodeFrame(okPing, consumed);
+	fr.op.should.equal(WsOp.ping);
+}

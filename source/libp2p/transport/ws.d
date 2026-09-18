@@ -223,6 +223,13 @@ WsFrame wsDecodeFrame(scope const(ubyte)[] buf, out size_t consumed) @safe
 	if (len > wsMaxFrameLen)
 		throw new WsProtocolError("ws: frame length exceeds the maximum");
 
+	// RFC 6455 §5.5: a control frame (close/ping/pong, high opcode bit set) carries
+	// at most 125 bytes and is never fragmented. Enforce it — otherwise a
+	// pre-Noise peer forces a large ping allocation and an equal-size pong echo.
+	immutable control = (cast(ubyte) op & 0x08) != 0;
+	if (control && (len > 125 || !fin))
+		throw new WsProtocolError("ws: malformed control frame");
+
 	ubyte[4] key;
 	if (masked)
 	{
