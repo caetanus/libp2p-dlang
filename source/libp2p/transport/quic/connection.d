@@ -20,10 +20,13 @@ import vibe.core.sync : LocalManualEvent, createManualEvent;
 
 import libp2p.core.stream : Stream;
 import libp2p.core.ending : EndOfStream, StreamReset, ConnClosed;
+import libp2p.core.peer_id : PeerId;
+import libp2p.crypto.keys : Keypair;
 import libp2p.muxer.muxer : Muxer;
 import libp2p.transport.quic.ngtcp2;
 import libp2p.transport.quic.ngtcp2_crypto;
 import libp2p.transport.quic.tls;
+import libp2p.transport.quic.identity : verifyRemotePeer = remotePeerId;
 import libp2p.transport.quic.engine;
 
 enum QuicRole
@@ -78,14 +81,18 @@ final class QuicConnection : Muxer
         QuicStream[] _acceptQueue; // inbound streams awaiting acceptStream
         LocalManualEvent _acceptEvent;
         bool _closed;
+        Keypair _identity; // this node's stable identity
+        PeerId _remotePeer; // verified once, after the handshake
+        bool _remotePeerKnown;
     }
 
     /// The driver (QuicPump) sets this so a stream's write can flush immediately.
     void delegate() nothrow onWantWrite;
 
-    private this(QuicRole role)
+    private this(QuicRole role, Keypair identity)
     {
         _role = role;
+        _identity = identity;
         _acceptEvent = createManualEvent();
     }
 
@@ -109,12 +116,13 @@ final class QuicConnection : Muxer
 
     /// A fresh client connection to `remote` from `local` (raw sockaddr bytes). Its
     /// first Initial (ClientHello) comes out of the first `writeOne`.
-    static QuicConnection dial(scope const(ubyte)[] local, scope const(ubyte)[] remote)
+    static QuicConnection dial(Keypair identity, scope const(ubyte)[] local,
+        scope const(ubyte)[] remote)
     {
         ensureCryptoInit();
-        auto self = new QuicConnection(QuicRole.client);
+        auto self = new QuicConnection(QuicRole.client, identity);
         self.setPath(local, remote);
-        self._sslCtx = newClientContext();
+        self._sslCtx = newClientContext(identity);
         self._ssl = SSL_new(self._sslCtx);
         enforce(self._ssl !is null, "SSL_new (client) failed");
         SSL_set_connect_state(self._ssl);
@@ -137,15 +145,15 @@ final class QuicConnection : Muxer
     }
 
     /// A server connection built from the client's first Initial `packet`.
-    static QuicConnection accept(scope const(ubyte)[] packet, scope const(ubyte)[] local,
-        scope const(ubyte)[] remote)
+    static QuicConnection accept(Keypair identity, scope const(ubyte)[] packet,
+        scope const(ubyte)[] local, scope const(ubyte)[] remote)
     {
         ngtcp2_pkt_hd hd;
         enforce(ngtcp2_accept(&hd, packet.ptr, packet.length) == 0, "ngtcp2_accept failed");
         ensureCryptoInit();
-        auto self = new QuicConnection(QuicRole.server);
+        auto self = new QuicConnection(QuicRole.server, identity);
         self.setPath(local, remote);
-        self._sslCtx = newServerContext();
+        self._sslCtx = newServerContext(identity);
         self._ssl = SSL_new(self._sslCtx);
         enforce(self._ssl !is null, "SSL_new (server) failed");
         SSL_set_accept_state(self._ssl);
@@ -204,6 +212,20 @@ final class QuicConnection : Muxer
         if (_conn is null)
             return false;
         return ngtcp2_conn_get_handshake_completed(_conn) != 0;
+    }
+
+    /// The peer's verified libp2p PeerId, read from its certificate's libp2p
+    /// extension. Valid only once the handshake has completed; verified once and
+    /// cached. Throws if the certificate is missing or the binding is invalid.
+    PeerId remotePeerId()
+    {
+        if (!_remotePeerKnown)
+        {
+            enforce(handshakeComplete(), "quic: handshake not complete");
+            _remotePeer = verifyRemotePeer(_ssl);
+            _remotePeerKnown = true;
+        }
+        return _remotePeer;
     }
 
     /// Time until ngtcp2's next timer; Duration.zero if already due.

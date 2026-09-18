@@ -16,6 +16,7 @@ import vibe.core.net : NetworkAddress, resolveHost;
 import libp2p.core.stream : Stream;
 import libp2p.core.ending : EndOfStream;
 import libp2p.transport.quic.udp : QuicListener, QuicClient, connectQuic;
+import libp2p.crypto.keys : Keypair;
 import libp2p.transport.quic.connection : QuicConnection;
 
 // Read a stream until the peer FINs, returning everything received.
@@ -42,7 +43,8 @@ int main()
     runTask(() nothrow {
         try
         {
-            auto listener = new QuicListener(0);
+            auto serverId = Keypair.generateEd25519();
+            auto listener = new QuicListener(serverId, 0);
             listener.onAccept = (QuicConnection conn) nothrow {
                 runTask(() nothrow {
                     try
@@ -62,7 +64,8 @@ int main()
 
             auto peer = resolveHost("127.0.0.1");
             peer.port = port;
-            auto client = connectQuic(peer);
+            auto clientId = Keypair.generateEd25519();
+            auto client = connectQuic(clientId, peer);
             client.waitForHandshake();
 
             auto s = client.connection.open();

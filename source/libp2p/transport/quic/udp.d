@@ -14,6 +14,7 @@ import vibe.core.net : UDPConnection, NetworkAddress, listenUDP;
 import vibe.core.core : runTask, createTimer, Timer;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
 
+import libp2p.crypto.keys : Keypair;
 import libp2p.transport.quic.connection : QuicConnection;
 
 // The raw sockaddr bytes QuicConnection.dial/accept take, from a vibe NetworkAddress.
@@ -126,11 +127,11 @@ final class QuicClient
     private QuicPump _pump;
     private NetworkAddress _peer;
 
-    this(NetworkAddress peer)
+    this(Keypair identity, NetworkAddress peer)
     {
         _peer = peer;
         _udp = listenUDP(0, "127.0.0.1"); // ephemeral local
-        _conn = QuicConnection.dial(addrBytes(_udp.localAddress), addrBytes(peer));
+        _conn = QuicConnection.dial(identity, addrBytes(_udp.localAddress), addrBytes(peer));
         _pump = new QuicPump(_conn, &send);
         runTask(&readLoop);
         _pump.kick(); // opening Initial
@@ -183,10 +184,12 @@ final class QuicListener
 {
     private UDPConnection _udp;
     private QuicPump[string] _pumps; // keyed by source address
+    private Keypair _identity;
     void delegate(QuicConnection) nothrow onAccept;
 
-    this(ushort port)
+    this(Keypair identity, ushort port)
     {
+        _identity = identity;
         _udp = listenUDP(port, "127.0.0.1");
         runTask(&readLoop);
     }
@@ -219,7 +222,7 @@ final class QuicListener
                     continue;
                 }
                 // New peer: build a server conn from its first Initial.
-                auto conn = QuicConnection.accept(pkt, addrBytes(_udp.localAddress), addrBytes(from));
+                auto conn = QuicConnection.accept(_identity, pkt, addrBytes(_udp.localAddress), addrBytes(from));
                 auto pump = new QuicPump(conn, sender(from));
                 _pumps[key] = pump;
                 pump.deliver(pkt);
@@ -251,8 +254,8 @@ final class QuicListener
     }
 }
 
-/// Connect to a QUIC server at `peer`.
-QuicClient connectQuic(NetworkAddress peer)
+/// Connect to a QUIC server at `peer`, presenting `identity`.
+QuicClient connectQuic(Keypair identity, NetworkAddress peer)
 {
-    return new QuicClient(peer);
+    return new QuicClient(identity, peer);
 }

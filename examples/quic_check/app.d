@@ -11,6 +11,7 @@ import core.sys.posix.sys.socket : AF_INET;
 import core.sys.posix.netinet.in_ : sockaddr_in;
 import core.sys.posix.arpa.inet : htons, htonl;
 
+import libp2p.crypto.keys : Keypair;
 import libp2p.transport.quic.connection : QuicConnection;
 
 // sockaddr_in(127.0.0.1:port) as raw bytes.
@@ -41,8 +42,11 @@ int main()
     auto clientAddr = loopback(1234);
     auto serverAddr = loopback(5678);
 
+    auto clientId = Keypair.generateEd25519();
+    auto serverId = Keypair.generateEd25519();
+
     // client: local=clientAddr, remote=serverAddr. server mirrors.
-    auto client = QuicConnection.dial(clientAddr, serverAddr);
+    auto client = QuicConnection.dial(clientId, clientAddr, serverAddr);
     scope (exit)
         client.close();
 
@@ -52,7 +56,7 @@ int main()
     writeln("client Initial: ", initial.length, " bytes, first=0x",
         initial.length ? initial[0] : 0);
 
-    auto server = QuicConnection.accept(initial, serverAddr, clientAddr);
+    auto server = QuicConnection.accept(serverId, initial, serverAddr, clientAddr);
     scope (exit)
         server.close();
     server.deliver(initial);
@@ -67,11 +71,28 @@ int main()
 
     writeln("client handshake: ", client.handshakeComplete,
         "  server handshake: ", server.handshakeComplete);
-    if (client.handshakeComplete && server.handshakeComplete)
+    if (!client.handshakeComplete || !server.handshakeComplete)
     {
-        writeln("PASS: QUIC TLS 1.3 handshake completed both ways (in memory)");
-        return 0;
+        writeln("FAIL: handshake did not complete");
+        return 1;
     }
-    writeln("FAIL: handshake did not complete");
-    return 1;
+
+    // Each side reads the other's PeerId from its certificate's libp2p extension
+    // and it must match the identity that side actually holds.
+    import libp2p.core.peer_id : PeerId;
+
+    auto wantServer = PeerId.fromPublicKey(serverId.publicKey);
+    auto wantClient = PeerId.fromPublicKey(clientId.publicKey);
+    auto gotServer = client.remotePeerId();
+    auto gotClient = server.remotePeerId();
+    writeln("client sees server as ", gotServer.toBase58);
+    writeln("server sees client as ", gotClient.toBase58);
+    if (gotServer != wantServer || gotClient != wantClient)
+    {
+        writeln("FAIL: peer id mismatch");
+        return 1;
+    }
+
+    writeln("PASS: QUIC libp2p-TLS handshake + verified peer identities (in memory)");
+    return 0;
 }
