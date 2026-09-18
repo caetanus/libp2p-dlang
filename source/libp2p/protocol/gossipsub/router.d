@@ -383,6 +383,10 @@ final class GossipSub
 	private void onIDontWant(PeerId from, IDontWant d)
 	{
 		auto ps = from in peers;
+		if (ps is null)
+			return; // handleRpc adds the peer before dispatch today, but a null
+					// deref here would crash the host — cheap insurance against a
+					// future path that reaches this without a known peer.
 		foreach (id; d.messageIds)
 		{
 			if (ps.dontSend.length >= idontwantCap)
