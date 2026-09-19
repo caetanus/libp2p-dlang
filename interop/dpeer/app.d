@@ -119,7 +119,13 @@ private int run(string mode, string target)
 	{
 	case "listen":
 	case "listen-webrtc":
-		host.listen(Multiaddr.parse(mode == "listen" ? "/ip4/127.0.0.1/tcp/0" : "/ip4/127.0.0.1/udp/0/webrtc-direct"));
+		// LISTEN_HOST overrides the bind address (default loopback for the local
+		// run-interop.sh; set 0.0.0.0 for cross-network conformance).
+		import std.process : environment;
+
+		immutable lh = environment.get("LISTEN_HOST", "127.0.0.1");
+		host.listen(Multiaddr.parse(mode == "listen" ? "/ip4/" ~ lh ~ "/tcp/0"
+				: "/ip4/" ~ lh ~ "/udp/0/webrtc-direct"));
 		say("LISTEN %s/p2p/%s", host.addrs[0], host.id);
 		// The peer that dials drives; we stay until it leaves, and report OK as
 		// soon as our own half is done.

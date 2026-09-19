@@ -66,12 +66,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
         .build();
 
+    // LISTEN_HOST overrides the bind address (default loopback for run-interop.sh;
+    // set 0.0.0.0 for cross-network conformance).
+    let lh = std::env::var("LISTEN_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     match mode {
         "listen" => {
-            swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
+            swarm.listen_on(format!("/ip4/{lh}/tcp/0").parse()?)?;
         }
         "listen-webrtc" => {
-            swarm.listen_on("/ip4/127.0.0.1/udp/0/webrtc-direct".parse()?)?;
+            swarm.listen_on(format!("/ip4/{lh}/udp/0/webrtc-direct").parse()?)?;
         }
         "dial" => {
             let addr: Multiaddr = args
