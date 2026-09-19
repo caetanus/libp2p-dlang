@@ -133,6 +133,7 @@ final class QuicConnection : Muxer
         self._cb = clientCallbacks();
         wireStreamCallbacks(self._cb);
         ngtcp2_settings_default(&self._settings);
+        self._settings.handshake_timeout = 90_000_000_000; // 90s: keep retransmitting Initials across punch skew
         ngtcp2_transport_params_default(&self._params);
         setStreamLimits(self._params);
         auto dcid = randomCid();
@@ -162,6 +163,7 @@ final class QuicConnection : Muxer
         self._cb = serverCallbacks();
         wireStreamCallbacks(self._cb);
         ngtcp2_settings_default(&self._settings);
+        self._settings.handshake_timeout = 90_000_000_000; // 90s: keep retransmitting Initials across punch skew
         ngtcp2_transport_params_default(&self._params);
         setStreamLimits(self._params);
         self._params.original_dcid = hd.dcid; // MANDATORY, else the TP check fails
