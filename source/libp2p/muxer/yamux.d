@@ -172,8 +172,14 @@ final class YamuxConn : Muxer
 		closed = true;
 		cause = why;
 		sendBestEffort(typeGoAway, 0, 0, goAwayCode); // bounded; the peer finds out regardless
-		foreach (s; streams)
-			s.sessionEnded(why);
+		try
+		{
+			foreach (s; streams)
+				s.sessionEnded(why);
+		}
+		catch (Exception)
+		{
+		}
 		streams = null;
 		arrived.emit();
 		// The transport is closed by whoever owns the reader's stack at this

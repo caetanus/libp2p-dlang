@@ -530,6 +530,34 @@
 					"path": "../d-webrtc-v3"
 				}
 			}
+		},
+		{
+			"name": "wg-punch",
+			"targetType": "executable",
+			"targetName": "wg-punch",
+			"mainSourceFile": "examples/wg_punch/app.d",
+			"sourcePaths": [
+				"source",
+				"examples/wg_punch"
+			],
+			"importPaths": [
+				"source",
+				"examples/wg_punch"
+			],
+			"versions": [
+				"Libp2pQuic"
+			],
+			"libs": [
+				"ngtcp2",
+				"ngtcp2_crypto_ossl",
+				"ssl",
+				"crypto"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		}
 	],
 	"libs": [

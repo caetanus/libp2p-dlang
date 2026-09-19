@@ -1,0 +1,93 @@
+#!/bin/bash
+# vpn — a user-mode WireGuard VPN over the libp2p QUIC hole-punch (serverless).
+#
+# The data plane is userspace WireGuard (wireguard-go) that runs with NO root after a
+# one-time `setcap` (done by `vpn setup`, which uses the docker group as the privileged
+# runner). Everything else — the STUN srflx gather, the simultaneous QUIC hole-punch,
+# and the WG-datagram<->libp2p-stream tunnel — is the `wg-punch` node and runs fully in
+# user mode. No relay, no public server in the data path.
+#
+# Two peers, both behind NAT:
+#   1) each runs:  vpn ticket            # prints its own ticket, keeps the socket open
+#   2) swap tickets out of band (paste)
+#   3) each runs:  vpn connect <peer-ticket> --role dialer|listener --at <unix_ms>
+# (dialer and listener are opposite; --at is a shared wall-clock instant to fire.)
+set -u
+
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+NODE="${VPN_NODE:-$HERE/bin/wg-punch}"
+WGGO="${VPN_WGGO:-/tmp/wgt/gobin/wireguard-go}"     # userspace WireGuard (setcap'd)
+AMB="${VPN_AMB:-/tmp/wgt/gobin/capsh}"              # setcap cap_net_admin+eip -> ambient for ip
+WGTOOLS_IMG="${VPN_WGTOOLS:-wgtools}"               # tiny ubuntu+wireguard-tools+libcap image
+STATE="${VPN_STATE:-$HOME/.wgvpn}"; mkdir -p "$STATE"
+IFACE="${VPN_IFACE:-wgvpn}"
+PROXY="${VPN_PROXY:-51821}"; WGP="${VPN_WGP:-51820}"
+
+runcap(){ "$AMB" --keep=1 --inh=cap_net_admin --addamb=cap_net_admin -- -c "$*"; }
+die(){ echo "vpn: $*" >&2; exit 1; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+
+setup)   # one-time privileged bits, via the docker group (no sudo password)
+  docker run --rm --privileged -v "$(dirname "$WGGO")":/b "$WGTOOLS_IMG" sh -c \
+     "setcap cap_net_admin+eip /b/$(basename "$WGGO"); setcap cap_net_admin+eip /b/$(basename "$AMB")" \
+     || die "setcap failed (is the docker group set up?)"
+  docker run --rm --privileged -v /run:/run "$WGTOOLS_IMG" bash -c \
+     "mkdir -p /run/wireguard && chown $(id -u):$(id -g) /run/wireguard && chmod 700 /run/wireguard" \
+     || die "could not create /run/wireguard"
+  # a WireGuard keypair for this host, if absent
+  if [ ! -s "$STATE/wg.key" ]; then
+    ( umask 077; wg genkey > "$STATE/wg.key" ); wg pubkey < "$STATE/wg.key" > "$STATE/wg.pub"
+  fi
+  echo "setup ok. wg pubkey: $(cat "$STATE/wg.pub")"
+  ;;
+
+pubkey) cat "$STATE/wg.pub" ;;
+
+connect)
+  ROLE=""; PEER=""; ATMS=0; LOCAL_WG="10.9.0.1/24"; PEER_WG_IP="10.9.0.2"; PEER_PUB=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --role) ROLE="$2"; shift 2;;
+    --peer) PEER="$2"; shift 2;;              # "<srflx-multiaddr> <libp2p-peerId>"
+    --at) ATMS="$2"; shift 2;;                # shared wall-clock unix ms to fire
+    --local-wg) LOCAL_WG="$2"; shift 2;;      # our wg addr, e.g. 10.9.0.1/24
+    --peer-wg-ip) PEER_WG_IP="$2"; shift 2;;  # peer wg addr (routed over the tunnel)
+    --peer-pub) PEER_PUB="$2"; shift 2;;      # peer WireGuard public key
+    *) die "unknown arg $1";;
+  esac; done
+  [ -n "$ROLE" ] || die "--role dialer|listener required"
+  [ -n "$PEER" ] || die "--peer '<srflx> <peerId>' required"
+  [ -n "$PEER_PUB" ] || die "--peer-pub <wg pubkey> required"
+  [ -x "$WGGO" ] || die "wireguard-go not found at $WGGO (run: vpn setup)"
+  [ -s "$STATE/wg.key" ] || die "no wg key (run: vpn setup)"
+
+  # bring up userspace WireGuard (no root)
+  pkill -f "wireguard-go -f $IFACE" 2>/dev/null || true
+  runcap "ip link del $IFACE 2>/dev/null" || true
+  sleep 1
+  WG_I_PREFER_BUGGY_USERSPACE_IMPLEMENTATION=1 setsid "$WGGO" -f "$IFACE" \
+     >"$STATE/wireguard-go.log" 2>&1 &
+  sleep 2
+  wg set "$IFACE" private-key "$STATE/wg.key" listen-port "$WGP" \
+     peer "$PEER_PUB" allowed-ips "$PEER_WG_IP/32" \
+     endpoint 127.0.0.1:"$PROXY" persistent-keepalive 15
+  runcap "ip addr add $LOCAL_WG dev $IFACE && ip link set up dev $IFACE"
+  echo "vpn: userspace WireGuard up ($IFACE $LOCAL_WG); peer $PEER_WG_IP via the punch"
+
+  # feed the node the peer's libp2p srflx and punch
+  printf '%s\n' "$PEER" > "$STATE/peer.ticket"
+  exec "$NODE" --mode punch --role "$ROLE" --service udp \
+     --proxy-port "$PROXY" --wg-port "$WGP" \
+     --out-file "$STATE/our.ticket" --peer-file "$STATE/peer.ticket" --fire-at "$ATMS"
+  ;;
+
+down)
+  pkill -f "wireguard-go -f $IFACE" 2>/dev/null || true
+  pkill -x "$(basename "$NODE")" 2>/dev/null || true
+  runcap "ip link del $IFACE 2>/dev/null" || true
+  echo "vpn: down"
+  ;;
+
+*) echo "usage: vpn {setup|pubkey|connect --role R --peer '<srflx> <peerId>' --peer-pub K [--at ms] [--local-wg A/24] [--peer-wg-ip IP]|down}" >&2; exit 1;;
+esac

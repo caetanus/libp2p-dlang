@@ -191,8 +191,14 @@ final class Mplex : Muxer
 			return;
 		closed = true;
 		cause = why;
-		foreach (s; streams)
-			s.sessionEnded(why);
+		try
+		{
+			foreach (s; streams)
+				s.sessionEnded(why);
+		}
+		catch (Exception)
+		{
+		}
 		streams = null;
 		arrived.emit();
 		drained.emit();

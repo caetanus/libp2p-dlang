@@ -105,13 +105,13 @@ final class Gossipsub : Notifiee
 			host.removeNotifiee(this);
 			foreach (id; meshsubProtocolIds)
 				host.removeStreamHandler(id);
+			fibers.stopAll();
+			foreach (p, link; links)
+				drop(link);
 		}
 		catch (Exception)
 		{
 		}
-		fibers.stopAll();
-		foreach (p, link; links)
-			drop(link);
 		links = null;
 	}
 
