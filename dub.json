@@ -577,6 +577,25 @@
 					"path": "../d-webrtc-v3"
 				}
 			}
+		},
+		{
+			"name": "webrtc-punch",
+			"targetType": "executable",
+			"targetName": "webrtc-punch",
+			"mainSourceFile": "examples/webrtc_punch/app.d",
+			"sourcePaths": [
+				"source",
+				"examples/webrtc_punch"
+			],
+			"importPaths": [
+				"source",
+				"examples/webrtc_punch"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		}
 	],
 	"libs": [

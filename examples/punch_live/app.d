@@ -12,7 +12,8 @@ module app;
 import std.stdio : writeln, stderr, stdout;
 import std.getopt : getopt;
 import std.conv : to;
-import std.string : split;
+import std.string : split, strip;
+import std.file : exists, readText, write;
 import core.time : msecs, MonoTime, seconds;
 import std.datetime.systime : Clock;
 
@@ -31,6 +32,9 @@ __gshared string g_peer;      // ip:port (the peer's observed/srflx TCP address)
 __gshared long g_atMs = 0;    // shared wall-clock fire instant
 __gshared string g_role = "dialer";
 __gshared string g_proto = "tcp"; // tcp | ws
+__gshared string g_reflector; // ip:port of a TCP srflx reflector (learn our external addr)
+__gshared string g_outFile;   // write our learned srflx here
+__gshared string g_peerFile;  // poll here for the peer's srflx
 
 // Read an HTTP head (to the blank line) off a punched TCP connection.
 private string readHttpHead(ref TCPConnection c)
@@ -97,7 +101,7 @@ private long nowMs()
 int main(string[] args)
 {
     getopt(args, "local-port", &g_localPort, "peer", &g_peer, "at", &g_atMs, "role", &g_role,
-        "proto", &g_proto);
+        "proto", &g_proto, "reflector", &g_reflector, "out-file", &g_outFile, "peer-file", &g_peerFile);
     int rc = 1;
     runTask(() nothrow {
         try
@@ -116,6 +120,21 @@ int main(string[] args)
                 }
                 catch (Exception) {}
             }, "0.0.0.0", TCPListenOptions.reuseAddress | TCPListenOptions.reusePort);
+
+            // Bind an OS-assigned (free) port to avoid a fixed-port conflict that
+            // would make the NAT remap us; Linux nf_nat then preserves it, so our
+            // srflx port == this local port. Print it for the orchestrator to relay.
+            if (g_localPort == 0)
+                g_localPort = lst.bindAddress.port;
+            writeln("LOCALPORT ", g_localPort);
+            stdout.flush();
+            // learn the peer's srflx from the rendezvous file (the orchestrator relays it)
+            if (g_peer.length == 0 && g_peerFile.length)
+                while (g_peer.length == 0)
+                {
+                    if (exists(g_peerFile)) g_peer = readText(g_peerFile).strip;
+                    if (g_peer.length == 0) sleep(300.msecs);
+                }
 
             auto pp = g_peer.split(":");
             auto peer = resolveHost(pp[0]);
