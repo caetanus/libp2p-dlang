@@ -558,6 +558,25 @@
 					"path": "../d-webrtc-v3"
 				}
 			}
+		},
+		{
+			"name": "punch-live",
+			"targetType": "executable",
+			"targetName": "punch-live",
+			"mainSourceFile": "examples/punch_live/app.d",
+			"sourcePaths": [
+				"source",
+				"examples/punch_live"
+			],
+			"importPaths": [
+				"source",
+				"examples/punch_live"
+			],
+			"dependencies": {
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			}
 		}
 	],
 	"libs": [
