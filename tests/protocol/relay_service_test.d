@@ -381,3 +381,37 @@ unittest
 	});
 	(got == expected).should.equal(true);
 }
+
+// auto-DCUtR: the same upgrade, but nobody calls holePunch. A dials B through
+// the relay; Relay.connected() sees the relayed dial and runs the exchange +
+// punch on its own (autoHolePunch, on by default). On loopback the punch is
+// orchestration only, as above — the point here is that it fires with no
+// explicit trigger and lands a second, non-relayed connection.
+@("dcutr: auto-DCUtR upgrades a relayed connection with no explicit punch")
+unittest
+{
+	bool direct;
+	onLoop({
+		auto relay = makeNode();
+		scope (exit)
+			relay.close();
+		auto a = makeNode();
+		scope (exit)
+			a.close();
+		auto b = makeNode();
+		scope (exit)
+			b.close();
+		a.relay.setObservedAddrs([a.host.addrs[0].encode]);
+		b.relay.setObservedAddrs([b.host.addrs[0].encode]);
+		a.host.peerstore.addAddrs(relay.host.id, relay.host.addrs);
+		b.host.peerstore.addAddrs(relay.host.id, relay.host.addrs);
+
+		b.relay.reserve(relay.host.id);
+		// A relayed dial, and nothing else — no holePunch call in the test.
+		a.relay.connectVia(relay.host.id, b.host.id);
+		direct = waitUntil(() => a.host.swarm.connectionsTo(b.host.id)
+				.canFind!(c => !c.remoteAddr.toString.canFind("/p2p-circuit")));
+		waitUntil(() => b.relay.punchCount == 0);
+	});
+	direct.should.equal(true);
+}

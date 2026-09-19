@@ -12,8 +12,10 @@
 ///               and the direct connection is adopted into the pool. PASS iff a
 ///               non-relayed /webrtc-direct/ connection forms and ping runs on it.
 ///
-/// The punch is DRIVEN here on purpose (explicit holePunch) — auto-DCUtR on a
-/// relayed connection is the thin-consumer piece (item 3), out of scope for 2e.
+/// By default the punch is DRIVEN here (explicit holePunch), so the harness can
+/// measure it. With --auto the initiator instead relies on auto-DCUtR: it only
+/// dials through the relay and the Relay service upgrades the link on its own
+/// (Relay.autoHolePunch, default on) — same PASS condition, no explicit punch.
 ///
 ///   punch-peer --relay /ip4/<pub>/tcp/<port>/p2p/<relayId> --role responder
 ///   punch-peer --relay /ip4/<pub>/tcp/<port>/p2p/<relayId> --role initiator --peer <responderId>
@@ -47,7 +49,8 @@ private Connection directTo(Host host, PeerId peer)
 int main(string[] args)
 {
     string relayStr, role = "responder", peerStr;
-    auto help = getopt(args, "relay", &relayStr, "role", &role, "peer", &peerStr);
+    bool autoMode;
+    auto help = getopt(args, "relay", &relayStr, "role", &role, "peer", &peerStr, "auto", &autoMode);
     if (help.helpWanted || relayStr.length == 0)
     {
         writeln("punch-peer --relay <multiaddr/p2p/relayId> --role responder|initiator [--peer <id>]");
@@ -78,6 +81,7 @@ int main(string[] args)
             auto host = new Host(key, [new TcpTransport]);
             host.swarm.addCapableTransport(new WebRtcTransport(key)); // srflx + punch
             auto relay = new Relay(host);
+            relay.autoHolePunch = !autoMode; // --auto lets the service upgrade the link itself
             new Ping(host);
             host.peerstore.addAddrs(relayId, [relayMa]);
 
@@ -122,22 +126,33 @@ int main(string[] args)
                 writeln("reaching ", peer.toBase58, " through the relay...");
                 stdout.flush();
                 relay.connectVia(relayId, peer); // relayed connection first
-                writeln("relayed — triggering hole punch (DCUtR)...");
-                stdout.flush();
-                // A punch that opens no path throws ("no direct address answered");
-                // don't bail on it — fall through so the FAIL branch below can dump
-                // the connection state, which is what tells us why it didn't punch.
-                try
+                if (autoMode)
                 {
-                    auto got = relay.holePunch(peer);
-                    writeln("DCUtR done; authenticated ", got.toBase58);
+                    writeln("relayed — waiting for auto-DCUtR to upgrade the link...");
+                    stdout.flush();
+                    // No explicit punch: Relay.connected() saw the relayed dial and
+                    // is running the DCUtR exchange + punch on its own.
                 }
-                catch (Exception e)
-                    writeln("DCUtR punch did not complete: ", e.msg);
-                stdout.flush();
+                else
+                {
+                    writeln("relayed — triggering hole punch (DCUtR)...");
+                    stdout.flush();
+                    // A punch that opens no path throws ("no direct address answered");
+                    // don't bail on it — fall through so the FAIL branch below can dump
+                    // the connection state, which is what tells us why it didn't punch.
+                    try
+                    {
+                        auto got = relay.holePunch(peer);
+                        writeln("DCUtR done; authenticated ", got.toBase58);
+                    }
+                    catch (Exception e)
+                        writeln("DCUtR punch did not complete: ", e.msg);
+                    stdout.flush();
+                }
 
                 Connection direct;
-                immutable deadline = MonoTime.currTime + 10.seconds;
+                // auto-DCUtR has to run the exchange itself, so give it a bit longer.
+                immutable deadline = MonoTime.currTime + (autoMode ? 20.seconds : 10.seconds);
                 while (MonoTime.currTime < deadline)
                 {
                     direct = directTo(host, peer);

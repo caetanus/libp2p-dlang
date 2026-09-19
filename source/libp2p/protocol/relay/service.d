@@ -34,6 +34,7 @@ import vibe.core.task : InterruptException;
 
 import libp2p.core.ending : Ending;
 import libp2p.core.peer_id : PeerId;
+import libp2p.core.upgrade : Endpoint;
 import libp2p.core.stream;
 import libp2p.host.host;
 import libp2p.multiformats.multiaddr : Multiaddr, Component;
@@ -88,6 +89,10 @@ final class Relay : Notifiee, Transport
 	private size_t circuits;
 	private size_t[PeerId] circuitsBy;
 	private size_t punches;
+	/// When set, a relayed connection we dialed auto-triggers DCUtR to upgrade
+	/// it to a direct one (the responder side already answers automatically).
+	bool autoHolePunch = true;
+	private bool[PeerId] autoPunching; // initiator punches in flight, one per peer
 	private ubyte[][] observed;
 	private FiberGroup fibers;
 
@@ -177,8 +182,31 @@ final class Relay : Notifiee, Transport
 		return punches;
 	}
 
-	void connected(Connection)
+	void connected(Connection c)
 	{
+		// The side that dialed through the relay is the DCUtR initiator; the side
+		// that accepted answers in serveDcutr. A direct connection (including the
+		// one a punch just made) is not relayed, so it never re-triggers this.
+		if (!autoHolePunch || c.role != Endpoint.dialer)
+			return;
+		if (!c.remoteAddr.components.canFind!(x => x.name == "p2p-circuit"))
+			return;
+		auto peer = c.remotePeer;
+		if (peer in autoPunching)
+			return; // already upgrading this peer
+		autoPunching[peer] = true;
+		fibers.spawn({
+			scope (exit)
+				autoPunching.remove(peer);
+			try
+				holePunch(peer);
+			catch (InterruptException)
+			{
+			} // shutting down
+			catch (Exception e)
+				logDebug("libp2p: auto-DCUtR to %s did not complete: %s",
+					peer.toString, e.msg); // the relayed link stays as the fallback
+		});
 	}
 
 	/// A reservation asks to be reachable through this link; when the link
