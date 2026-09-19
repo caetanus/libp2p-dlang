@@ -1,93 +1,151 @@
 #!/bin/bash
-# vpn — a user-mode WireGuard VPN over the libp2p QUIC hole-punch (serverless).
+# vpn — user-mode WireGuard VPN over the libp2p QUIC hole-punch (serverless).
 #
-# The data plane is userspace WireGuard (wireguard-go) that runs with NO root after a
-# one-time `setcap` (done by `vpn setup`, which uses the docker group as the privileged
-# runner). Everything else — the STUN srflx gather, the simultaneous QUIC hole-punch,
-# and the WG-datagram<->libp2p-stream tunnel — is the `wg-punch` node and runs fully in
-# user mode. No relay, no public server in the data path.
+# Data plane: userspace WireGuard (wireguard-go), run with NO root after a one-time
+# `vpn setup` (setcap cap_net_admin+eip, via sudo or the docker group). The srflx
+# gather, the simultaneous QUIC hole-punch and the WG<->stream tunnel are the
+# user-mode `wg-punch` node. No relay, no public server in the data path.
 #
-# Two peers, both behind NAT:
-#   1) each runs:  vpn ticket            # prints its own ticket, keeps the socket open
-#   2) swap tickets out of band (paste)
-#   3) each runs:  vpn connect <peer-ticket> --role dialer|listener --at <unix_ms>
-# (dialer and listener are opposite; --at is a shared wall-clock instant to fire.)
+# Serverless connect (both peers behind NAT):
+#   peer1$ vpn connect --role listener        # prints a ticket, then asks for the peer's
+#   peer2$ vpn connect --role dialer          # prints a ticket (with the fire time)
+#   paste each side's ticket into the other; both punch at the shared instant.
 set -u
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 NODE="${VPN_NODE:-$HERE/bin/wg-punch}"
-WGGO="${VPN_WGGO:-/tmp/wgt/gobin/wireguard-go}"     # userspace WireGuard (setcap'd)
-AMB="${VPN_AMB:-/tmp/wgt/gobin/capsh}"              # setcap cap_net_admin+eip -> ambient for ip
-WGTOOLS_IMG="${VPN_WGTOOLS:-wgtools}"               # tiny ubuntu+wireguard-tools+libcap image
 STATE="${VPN_STATE:-$HOME/.wgvpn}"; mkdir -p "$STATE"
+BIN="${VPN_BIN:-$STATE/bin}"; mkdir -p "$BIN"
+WGGO="$BIN/wireguard-go"            # userspace WireGuard (setcap'd by `vpn setup`)
+AMB="$BIN/capsh"                    # setcap cap_net_admin+eip -> raises ambient for ip
+WGTOOLS_IMG="${VPN_WGTOOLS:-wgtools}"
 IFACE="${VPN_IFACE:-wgvpn}"
 PROXY="${VPN_PROXY:-51821}"; WGP="${VPN_WGP:-51820}"
 
-runcap(){ "$AMB" --keep=1 --inh=cap_net_admin --addamb=cap_net_admin -- -c "$*"; }
 die(){ echo "vpn: $*" >&2; exit 1; }
+# run a privileged (CAP_NET_ADMIN) command: as root, directly; as a user, via the
+# setcap'd capsh which raises the ambient capability for the child (ip/link).
+runcap(){ if [ "$(id -u)" = 0 ]; then bash -c "$*"; else "$AMB" --keep=1 --inh=cap_net_admin --addamb=cap_net_admin -- -c "$*"; fi; }
+now_ms(){ date +%s%3N; }
+
+setcap_both(){  # one-time privilege: prefer sudo, else the docker group
+  if sudo -n true 2>/dev/null; then
+    sudo setcap cap_net_admin+eip "$WGGO" && sudo setcap cap_net_admin+eip "$AMB"
+    sudo mkdir -p /run/wireguard && sudo chown "$(id -u):$(id -g)" /run/wireguard && sudo chmod 700 /run/wireguard
+  elif docker info >/dev/null 2>&1; then
+    docker run --rm --privileged -v "$BIN":/b "$WGTOOLS_IMG" sh -c \
+      "setcap cap_net_admin+eip /b/wireguard-go && setcap cap_net_admin+eip /b/capsh" || return 1
+    docker run --rm --privileged -v /run:/run "$WGTOOLS_IMG" bash -c \
+      "mkdir -p /run/wireguard && chown $(id -u):$(id -g) /run/wireguard && chmod 700 /run/wireguard" || return 1
+  else
+    die "need sudo or the docker group for the one-time setcap"
+  fi
+}
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
 
-setup)   # one-time privileged bits, via the docker group (no sudo password)
-  docker run --rm --privileged -v "$(dirname "$WGGO")":/b "$WGTOOLS_IMG" sh -c \
-     "setcap cap_net_admin+eip /b/$(basename "$WGGO"); setcap cap_net_admin+eip /b/$(basename "$AMB")" \
-     || die "setcap failed (is the docker group set up?)"
-  docker run --rm --privileged -v /run:/run "$WGTOOLS_IMG" bash -c \
-     "mkdir -p /run/wireguard && chown $(id -u):$(id -g) /run/wireguard && chmod 700 /run/wireguard" \
-     || die "could not create /run/wireguard"
-  # a WireGuard keypair for this host, if absent
-  if [ ! -s "$STATE/wg.key" ]; then
-    ( umask 077; wg genkey > "$STATE/wg.key" ); wg pubkey < "$STATE/wg.key" > "$STATE/wg.pub"
+setup)
+  # userspace WireGuard binary
+  if [ ! -x "$WGGO" ]; then
+    if command -v go >/dev/null; then
+      t="$(mktemp -d)"; git clone --depth 1 https://git.zx2c4.com/wireguard-go "$t/wg" >/dev/null 2>&1 \
+        || die "git clone wireguard-go failed"
+      ( cd "$t/wg" && go build -o "$WGGO" . ) || die "go build wireguard-go failed"; rm -rf "$t"
+    else
+      die "no wireguard-go at $WGGO and no Go to build it — drop a linux-amd64 wireguard-go there"
+    fi
   fi
-  echo "setup ok. wg pubkey: $(cat "$STATE/wg.pub")"
+  cp -f /usr/bin/capsh "$AMB" 2>/dev/null || die "capsh (libcap) not found"
+  setcap_both || die "setcap failed"
+  if [ ! -s "$STATE/wg.key" ]; then ( umask 077; wg genkey > "$STATE/wg.key" ); wg pubkey < "$STATE/wg.key" > "$STATE/wg.pub"; fi
+  echo "vpn: setup ok"
+  echo "  wireguard-go: $(getcap "$WGGO")"
+  echo "  wg pubkey:    $(cat "$STATE/wg.pub")"
   ;;
 
-pubkey) cat "$STATE/wg.pub" ;;
+pubkey) cat "$STATE/wg.pub" 2>/dev/null || die "no key (run: vpn setup)";;
 
 connect)
-  ROLE=""; PEER=""; ATMS=0; LOCAL_WG="10.9.0.1/24"; PEER_WG_IP="10.9.0.2"; PEER_PUB=""
+  ROLE=""; WGIP=""; PEER_TICKET=""; GRACE=60; EMIT=""; PEER_FILE=""
   while [ $# -gt 0 ]; do case "$1" in
     --role) ROLE="$2"; shift 2;;
-    --peer) PEER="$2"; shift 2;;              # "<srflx-multiaddr> <libp2p-peerId>"
-    --at) ATMS="$2"; shift 2;;                # shared wall-clock unix ms to fire
-    --local-wg) LOCAL_WG="$2"; shift 2;;      # our wg addr, e.g. 10.9.0.1/24
-    --peer-wg-ip) PEER_WG_IP="$2"; shift 2;;  # peer wg addr (routed over the tunnel)
-    --peer-pub) PEER_PUB="$2"; shift 2;;      # peer WireGuard public key
+    --wg-ip) WGIP="$2"; shift 2;;               # our WG address (default .1 dialer / .2 listener)
+    --peer-ticket) PEER_TICKET="$2"; shift 2;;  # non-interactive: the peer's ticket blob
+    --peer-ticket-file) PEER_FILE="$2"; shift 2;; # headless: poll this file for the peer ticket
+    --emit-ticket) EMIT="$2"; shift 2;;         # headless: write our ticket to this file
+    --grace) GRACE="$2"; shift 2;;              # seconds until the shared fire instant (dialer)
     *) die "unknown arg $1";;
   esac; done
-  [ -n "$ROLE" ] || die "--role dialer|listener required"
-  [ -n "$PEER" ] || die "--peer '<srflx> <peerId>' required"
-  [ -n "$PEER_PUB" ] || die "--peer-pub <wg pubkey> required"
-  [ -x "$WGGO" ] || die "wireguard-go not found at $WGGO (run: vpn setup)"
-  [ -s "$STATE/wg.key" ] || die "no wg key (run: vpn setup)"
+  [ "$ROLE" = dialer ] || [ "$ROLE" = listener ] || die "--role dialer|listener required"
+  [ -x "$WGGO" ] || die "run: vpn setup"
+  [ -s "$STATE/wg.key" ] || die "run: vpn setup"
+  [ -n "$WGIP" ] || { [ "$ROLE" = dialer ] && WGIP=10.9.0.1 || WGIP=10.9.0.2; }
+
+  rm -f "$STATE/our.ticket" "$STATE/peer.node"
+  # start the node — it gathers our srflx, writes it, then waits for peer.node
+  setsid "$NODE" --mode punch --role "$ROLE" --service udp \
+    --proxy-port "$PROXY" --wg-port "$WGP" \
+    --out-file "$STATE/our.ticket" --peer-file "$STATE/peer.node" --fire-at 0 \
+    >"$STATE/node.log" 2>&1 &
+  NODEPID=$!
+  trap 'kill $NODEPID 2>/dev/null; pkill -f "wireguard-go -f $IFACE" 2>/dev/null; runcap "ip link del $IFACE 2>/dev/null" 2>/dev/null' EXIT
+  for i in $(seq 1 40); do [ -s "$STATE/our.ticket" ] && break; sleep 0.5; done
+  [ -s "$STATE/our.ticket" ] || die "node did not gather a reflexive address (STUN unreachable?)"
+  OURS="$(head -1 "$STATE/our.ticket")"          # "<srflx> <peerId>"
+  WGPUB="$(cat "$STATE/wg.pub")"
+
+  if [ "$ROLE" = dialer ]; then FT=$(( $(now_ms) + GRACE*1000 )); TICKET="$OURS $WGPUB $WGIP $FT"
+  else TICKET="$OURS $WGPUB $WGIP"; fi
+  echo "==== YOUR TICKET (send to the peer) ===="
+  echo "$TICKET"
+  echo "======================================="
+  [ -n "$EMIT" ] && printf '%s\n' "$TICKET" > "$EMIT"
+
+  if [ -z "$PEER_TICKET" ] && [ -n "$PEER_FILE" ]; then
+    echo "vpn: waiting for peer ticket at $PEER_FILE ..."
+    for i in $(seq 1 600); do [ -s "$PEER_FILE" ] && { PEER_TICKET="$(head -1 "$PEER_FILE")"; break; }; sleep 0.5; done
+  fi
+  if [ -z "$PEER_TICKET" ]; then
+    printf 'paste the peer ticket, then Enter:\n> '
+    read -r PEER_TICKET
+  fi
+  # shellcheck disable=SC2086
+  set -- $PEER_TICKET
+  [ $# -ge 4 ] || die "bad peer ticket (need '<srflx> <peerId> <wgpub> <wgip> [fireMs]')"
+  PSRFLX="$1"; PPEER="$2"; PPUB="$3"; PWGIP="$4"; PFT="${5:-}"
+  [ "$ROLE" = dialer ] && SHARED_FT="$FT" || SHARED_FT="$PFT"
+  [ -n "$SHARED_FT" ] || die "no fire instant (the dialer's ticket must carry it)"
 
   # bring up userspace WireGuard (no root)
   pkill -f "wireguard-go -f $IFACE" 2>/dev/null || true
   runcap "ip link del $IFACE 2>/dev/null" || true
   sleep 1
-  WG_I_PREFER_BUGGY_USERSPACE_IMPLEMENTATION=1 setsid "$WGGO" -f "$IFACE" \
-     >"$STATE/wireguard-go.log" 2>&1 &
+  WG_I_PREFER_BUGGY_USERSPACE_IMPLEMENTATION=1 setsid "$WGGO" -f "$IFACE" >"$STATE/wireguard-go.log" 2>&1 &
   sleep 2
   wg set "$IFACE" private-key "$STATE/wg.key" listen-port "$WGP" \
-     peer "$PEER_PUB" allowed-ips "$PEER_WG_IP/32" \
-     endpoint 127.0.0.1:"$PROXY" persistent-keepalive 15
-  runcap "ip addr add $LOCAL_WG dev $IFACE && ip link set up dev $IFACE"
-  echo "vpn: userspace WireGuard up ($IFACE $LOCAL_WG); peer $PEER_WG_IP via the punch"
+    peer "$PPUB" allowed-ips "$PWGIP/32" endpoint 127.0.0.1:"$PROXY" persistent-keepalive 15
+  runcap "ip addr add $WGIP/24 dev $IFACE && ip link set up dev $IFACE"
+  echo "vpn: userspace WireGuard up ($IFACE $WGIP) — peer $PWGIP over the punch; firing at $SHARED_FT"
 
-  # feed the node the peer's libp2p srflx and punch
-  printf '%s\n' "$PEER" > "$STATE/peer.ticket"
-  exec "$NODE" --mode punch --role "$ROLE" --service udp \
-     --proxy-port "$PROXY" --wg-port "$WGP" \
-     --out-file "$STATE/our.ticket" --peer-file "$STATE/peer.ticket" --fire-at "$ATMS"
+  # hand the node the peer's libp2p srflx + the shared fire instant → it punches
+  printf '%s %s %s\n' "$PSRFLX" "$PPEER" "$SHARED_FT" > "$STATE/peer.node"
+  wait "$NODEPID"
   ;;
 
 down)
   pkill -f "wireguard-go -f $IFACE" 2>/dev/null || true
   pkill -x "$(basename "$NODE")" 2>/dev/null || true
-  runcap "ip link del $IFACE 2>/dev/null" || true
+  runcap "ip link del $IFACE 2>/dev/null" 2>/dev/null || true
   echo "vpn: down"
   ;;
 
-*) echo "usage: vpn {setup|pubkey|connect --role R --peer '<srflx> <peerId>' --peer-pub K [--at ms] [--local-wg A/24] [--peer-wg-ip IP]|down}" >&2; exit 1;;
+*) cat >&2 <<USAGE
+usage:
+  vpn setup                      one-time: build/setcap userspace WireGuard, gen key
+  vpn pubkey                     print this host's WireGuard public key
+  vpn connect --role dialer|listener [--wg-ip A] [--grace S] [--peer-ticket "..."]
+  vpn down
+USAGE
+  exit 1;;
 esac

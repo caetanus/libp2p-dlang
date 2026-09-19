@@ -154,9 +154,11 @@ private Muxer doPunch(QuicTransport t, PeerId myId)
         }
     }
     auto parts = peerLine.split;
-    enforce(parts.length >= 2, "peer line must be '<srflx multiaddr> <peerId>'");
+    enforce(parts.length >= 2, "peer line must be '<srflx multiaddr> <peerId> [fireAtMs]'");
     auto peerAddr = Multiaddr.parse(parts[0]);
     auto peerId = PeerId.fromBase58(parts[1]);
+    if (parts.length >= 3) // a shared wall-clock fire instant, carried in the ticket
+        g_fireAtMs = parts[2].to!long;
     writeln("peer: ", parts[0], " ", parts[1]);
     stdout.flush();
 
