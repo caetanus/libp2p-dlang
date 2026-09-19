@@ -154,12 +154,18 @@ private Muxer doPunch(QuicTransport t, PeerId myId)
         }
     }
     auto parts = peerLine.split;
-    enforce(parts.length >= 2, "peer line must be '<srflx multiaddr> <peerId> [fireAtMs]'");
+    enforce(parts.length >= 2, "peer line must be '<srflx> <peerId|any> [fireAtMs] [role]'");
     auto peerAddr = Multiaddr.parse(parts[0]);
-    auto peerId = PeerId.fromBase58(parts[1]);
+    // "any": accept whatever peer punches (auth comes from the WireGuard keys, which
+    // are derived from the shared secret) — used by DHT discovery, where the libp2p
+    // PeerId is not exchanged.
+    immutable anyPeer = parts[1] == "any";
+    auto peerId = anyPeer ? myId : PeerId.fromBase58(parts[1]);
     if (parts.length >= 3) // a shared wall-clock fire instant, carried in the ticket
         g_fireAtMs = parts[2].to!long;
-    writeln("peer: ", parts[0], " ", parts[1]);
+    if (parts.length >= 4) // role can be decided by discovery (dialer/listener)
+        g_role = parts[3];
+    writeln("peer: ", parts[0], " ", parts[1], " role=", g_role);
     stdout.flush();
 
     // Fire simultaneously: sleep until the shared wall-clock instant.
@@ -173,7 +179,8 @@ private Muxer doPunch(QuicTransport t, PeerId myId)
     }
     writeln("PUNCH now (asDialer=", g_role == "dialer", ")");
     stdout.flush();
-    auto up = t.punch(peerAddr, peerId, g_role == "dialer", nullable(peerId));
+    auto expected = anyPeer ? Nullable!PeerId.init : nullable(peerId);
+    auto up = t.punch(peerAddr, peerId, g_role == "dialer", expected);
     writeln("PUNCH ok: direct QUIC to ", up.remotePeer.toBase58, " at ", up.remoteAddr.toString);
     stdout.flush();
     return up.muxer;

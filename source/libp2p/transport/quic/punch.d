@@ -13,7 +13,7 @@ import std.socket : AddressFamily;
 import std.string : lastIndexOf;
 import std.conv : to;
 import std.typecons : Nullable, nullable;
-import core.time : Duration, msecs, MonoTime;
+import core.time : Duration, msecs, seconds, MonoTime;
 
 import vibe.core.net : UDPConnection, NetworkAddress, listenUDP, resolveHost;
 import vibe.core.core : runTask, sleep;
@@ -165,27 +165,35 @@ final class QuicPunchSocket
     QuicPump punchServer(NetworkAddress peer, Duration budget)
     {
         immutable key = peer.toString();
-        foreach (_; 0 .. 5)
+        // Keep the NAT mapping toward the peer fresh for the WHOLE window (not just a
+        // burst at the start): the dialer may fire seconds later (discovery/clock
+        // skew), and its Initial only gets in while our mapping is open.
+        void pad()
         {
             try
             {
-                ubyte[1] pad = [0]; // fixed bit clear: skipped by looksLikeQuic
+                ubyte[1] p = [0]; // fixed bit clear: skipped by looksLikeQuic
                 auto to = peer;
-                _udp.send(pad[], &to);
+                _udp.send(p[], &to);
             }
             catch (Exception)
             {
             }
-            sleep(10.msecs);
         }
 
         immutable deadline = MonoTime.currTime + budget;
+        auto lastPad = MonoTime.currTime - 10.seconds;
         auto ec = _acceptEvent.emitCount;
         while (MonoTime.currTime < deadline)
         {
             if (auto p = key in _accepted)
                 return *p;
-            ec = _acceptEvent.wait(200.msecs, ec);
+            if (MonoTime.currTime - lastPad >= 1500.msecs)
+            {
+                pad();
+                lastPad = MonoTime.currTime;
+            }
+            ec = _acceptEvent.wait(500.msecs, ec);
         }
         throw new Exception("quic punch: no inbound handshake from " ~ key);
     }

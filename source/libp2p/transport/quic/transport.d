@@ -162,7 +162,7 @@ final class QuicTransport : CapableTransport
         auto ma = Multiaddr(peerSrflx.bytes.dup);
         auto peer = toUdpAddress(ma.components);
 
-        auto pump = asDialer ? _punchSock.punchClient(peer) : _punchSock.punchServer(peer, 10.seconds);
+        auto pump = asDialer ? _punchSock.punchClient(peer) : _punchSock.punchServer(peer, 60.seconds);
         pump.waitForHandshake();
         auto conn = pump.connection;
         auto rp = conn.remotePeerId();

@@ -26,7 +26,11 @@ die(){ echo "vpn: $*" >&2; exit 1; }
 # run a privileged (CAP_NET_ADMIN) command: as root, directly; as a user, via the
 # setcap'd capsh which raises the ambient capability for the child (ip/link).
 runcap(){ if [ "$(id -u)" = 0 ]; then bash -c "$*"; else "$AMB" --keep=1 --inh=cap_net_admin --addamb=cap_net_admin -- -c "$*"; fi; }
-now_ms(){ date +%s%3N; }
+# portable ms (some `date` builds ignore %3N and emit full ns)
+now_ms(){ local n; n=$(date +%s%N); echo $(( n / 1000000 )); }
+# a shared fire instant: round now+grace up to the next 15s boundary, so two peers
+# that discover each other within the same window agree without exchanging it.
+fire_at(){ local ms=$(( $(now_ms) + $1*1000 + 29999 )); echo $(( (ms / 30000) * 30000 )); }
 
 setcap_both(){  # one-time privilege: prefer sudo, else the docker group
   if sudo -n true 2>/dev/null; then
@@ -130,6 +134,60 @@ connect)
 
   # hand the node the peer's libp2p srflx + the shared fire instant → it punches
   printf '%s %s %s\n' "$PSRFLX" "$PPEER" "$SHARED_FT" > "$STATE/peer.node"
+  wait "$NODEPID"
+  ;;
+
+connect-dht)
+  # Serverless discovery: derive keys from a shared secret, exchange only the srflx
+  # over the hyperdht (no paste). Requires the vpn-rendezvous tool (d-hyperswarm).
+  SECRET=""; GRACE=10
+  while [ $# -gt 0 ]; do case "$1" in
+    --secret) SECRET="$2"; shift 2;;
+    --grace) GRACE="$2"; shift 2;;
+    *) die "unknown arg $1";;
+  esac; done
+  [ -n "$SECRET" ] || die "--secret required"
+  [ -x "$WGGO" ] || die "run: vpn setup"
+  RZ="${VPN_RENDEZVOUS:-$HOME/lab/d-hyperswarm/bin/vpn-rendezvous}"
+  [ -x "$RZ" ] || die "vpn-rendezvous not found at $RZ (build it in d-hyperswarm)"
+  derive_wg(){ printf '%s' "$1" | openssl dgst -sha256 -binary | base64; }
+  DPRIV="$(derive_wg "wg-dialer:$SECRET")";   DPUB="$(printf '%s' "$DPRIV" | wg pubkey)"
+  LPRIV="$(derive_wg "wg-listener:$SECRET")"; LPUB="$(printf '%s' "$LPRIV" | wg pubkey)"
+
+  rm -f "$STATE/our.ticket" "$STATE/peer.node"
+  setsid "$NODE" --mode punch --role dialer --service udp \
+    --proxy-port "$PROXY" --wg-port "$WGP" \
+    --out-file "$STATE/our.ticket" --peer-file "$STATE/peer.node" --fire-at 0 \
+    >"$STATE/node.log" 2>&1 &
+  NODEPID=$!
+  trap 'kill $NODEPID 2>/dev/null; pkill -f "wireguard-go -f $IFACE" 2>/dev/null; runcap "ip link del $IFACE 2>/dev/null" 2>/dev/null' EXIT
+  for i in $(seq 1 40); do [ -s "$STATE/our.ticket" ] && break; sleep 0.5; done
+  [ -s "$STATE/our.ticket" ] || die "node did not gather a reflexive address"
+  # our srflx: /ip4/<ip>/udp/<port>/quic-v1
+  SRFLX="$(head -1 "$STATE/our.ticket" | awk '{print $1}')"
+  SIP="$(echo "$SRFLX" | sed -E 's#/ip4/([^/]+)/udp/([0-9]+)/.*#\1#')"
+  SPORT="$(echo "$SRFLX" | sed -E 's#/ip4/([^/]+)/udp/([0-9]+)/.*#\2#')"
+  echo "vpn: srflx $SIP:$SPORT — discovering peer over the DHT..."
+  RES="$("$RZ" --secret "$SECRET" --srflx-ip "$SIP" --srflx-port "$SPORT" | grep '^PEER ')"
+  [ -n "$RES" ] || die "no peer found over the DHT under this secret"
+  # PEER <ip> <port> ROLE <dialer|listener>
+  set -- $RES; PIP="$2"; PPORT="$3"; ROLE="$5"
+  echo "vpn: peer $PIP:$PPORT, my role=$ROLE"
+
+  if [ "$ROLE" = dialer ]; then MYPRIV="$DPRIV"; PPUB="$LPUB"; WGIP=10.9.0.1; PWGIP=10.9.0.2
+  else MYPRIV="$LPRIV"; PPUB="$DPUB"; WGIP=10.9.0.2; PWGIP=10.9.0.1; fi
+  ( umask 077; printf '%s\n' "$MYPRIV" > "$STATE/wg.key" )
+
+  pkill -f "wireguard-go -f $IFACE" 2>/dev/null || true
+  runcap "ip link del $IFACE 2>/dev/null" || true; sleep 1
+  WG_I_PREFER_BUGGY_USERSPACE_IMPLEMENTATION=1 setsid "$WGGO" -f "$IFACE" >"$STATE/wireguard-go.log" 2>&1 &
+  sleep 2
+  wg set "$IFACE" private-key "$STATE/wg.key" listen-port "$WGP" \
+    peer "$PPUB" allowed-ips "$PWGIP/32" endpoint 127.0.0.1:"$PROXY" persistent-keepalive 15
+  runcap "ip addr add $WGIP/24 dev $IFACE && ip link set up dev $IFACE"
+  FT=$(fire_at "$GRACE")
+  echo "vpn: WireGuard up ($IFACE $WGIP) — peer $PWGIP; punching (role $ROLE) at $FT"
+  printf '/ip4/%s/udp/%s/quic-v1 any %s %s\n' "$PIP" "$PPORT" "$FT" "$ROLE" > "$STATE/peer.node"
   wait "$NODEPID"
   ;;
 

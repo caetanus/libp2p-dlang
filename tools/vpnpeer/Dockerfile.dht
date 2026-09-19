@@ -1,0 +1,5 @@
+FROM vpnpeer:latest
+COPY vpn-rendezvous /opt/vpn/bin/vpn-rendezvous
+COPY entry-dht.sh /entry-dht.sh
+RUN chmod +x /entry-dht.sh /opt/vpn/bin/vpn-rendezvous
+ENTRYPOINT ["/entry-dht.sh"]
