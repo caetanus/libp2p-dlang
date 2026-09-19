@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"fmt"
 	"os"
 	"time"
@@ -13,8 +14,13 @@ import (
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
+	"github.com/libp2p/go-libp2p/p2p/security/noise"
+	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
+	tcp "github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -25,7 +31,25 @@ func main() {
 	if len(os.Args) > 1 {
 		mode = os.Args[1]
 	}
-	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
+	lh := os.Getenv("LISTEN_HOST")
+	if lh == "" {
+		lh = "0.0.0.0"
+	}
+	listenAddr := "/ip4/" + lh + "/tcp/0"
+	switch mode {
+	case "listen-ws":
+		listenAddr = "/ip4/" + lh + "/tcp/0/ws"
+	case "listen-quic":
+		listenAddr = "/ip4/" + lh + "/udp/0/quic-v1"
+	}
+	h, err := libp2p.New(
+		libp2p.Transport(tcp.NewTCPTransport),
+		libp2p.Transport(quic.NewTransport),
+		libp2p.Transport(ws.New),
+		libp2p.Security(noise.ID, noise.New),
+		libp2p.Muxer(yamux.ID, yamux.DefaultTransport),
+		libp2p.ListenAddrStrings(listenAddr),
+	)
 	if err != nil {
 		die("host: %v", err)
 	}
@@ -33,8 +57,34 @@ func main() {
 	ps := ping.NewPingService(h)
 	ctx := context.Background()
 
-	if mode == "listen" {
-		fmt.Printf("LISTEN %s/p2p/%s\n", h.Addrs()[0], h.ID())
+	if len(mode) >= 6 && mode[:6] == "listen" {
+		// pick the addr matching the requested transport
+		var chosen ma.Multiaddr
+		want := "/tcp/"
+		if mode == "listen-quic" {
+			want = "/quic"
+		}
+		for _, a := range h.Addrs() {
+			s := a.String()
+			if mode == "listen-ws" {
+				if strings.Contains(s, "/ws") {
+					chosen = a
+					break
+				}
+			} else if mode == "listen-quic" {
+				if strings.Contains(s, "/quic") {
+					chosen = a
+					break
+				}
+			} else if strings.Contains(s, want) && !strings.Contains(s, "/ws") && !strings.Contains(s, "/quic") {
+				chosen = a
+				break
+			}
+		}
+		if chosen == nil {
+			chosen = h.Addrs()[0]
+		}
+		fmt.Printf("LISTEN %s/p2p/%s\n", chosen, h.ID())
 		select {}
 	}
 

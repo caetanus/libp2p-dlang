@@ -47,12 +47,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             noise::Config::new,
             yamux::Config::default,
         )?
+        .with_quic()
         // webrtc-direct beside TCP: it secures and multiplexes itself.
         .with_other_transport(|id| {
             let cert = webrtc::tokio::Certificate::generate(&mut rand::thread_rng())?;
             Ok(webrtc::tokio::Transport::new(id.clone(), cert)
                 .map(|(peer, conn), _| (peer, libp2p::core::muxing::StreamMuxerBox::new(conn))))
         })?
+        .with_dns()?
+        .with_websocket(noise::Config::new, yamux::Config::default)
+        .await?
         .with_behaviour(|key| Behaviour {
             // Ping often enough that a short test does not have to wait for it.
             ping: ping::Behaviour::new(
@@ -72,6 +76,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match mode {
         "listen" => {
             swarm.listen_on(format!("/ip4/{lh}/tcp/0").parse()?)?;
+        }
+        "listen-ws" => {
+            swarm.listen_on(format!("/ip4/{lh}/tcp/0/ws").parse()?)?;
+        }
+        "listen-quic" => {
+            swarm.listen_on(format!("/ip4/{lh}/udp/0/quic-v1").parse()?)?;
         }
         "listen-webrtc" => {
             swarm.listen_on(format!("/ip4/{lh}/udp/0/webrtc-direct").parse()?)?;

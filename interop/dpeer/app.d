@@ -31,7 +31,9 @@ import libp2p.multiformats.multiaddr : Multiaddr;
 import libp2p.protocol.identify;
 import libp2p.protocol.ping;
 import libp2p.transport.tcp : TcpTransport;
+import libp2p.transport.ws : WsTransport;
 import libp2p.transport.webrtc.transport : WebRtcTransport;
+version (Libp2pQuic) import libp2p.transport.quic.transport : QuicTransport;
 
 private enum deadline = 30.seconds;
 
@@ -89,10 +91,14 @@ private int run(string mode, string target)
 	cfg.agentVersion = "libp2p-dlang/interop";
 	cfg.swarm.idleTimeout = 30.seconds;
 	auto key = Keypair.generateEd25519;
-	auto host = new Host(key, [new TcpTransport], cfg);
+	import libp2p.transport.transport : Transport;
+
+	auto host = new Host(key, [cast(Transport) new TcpTransport, new WsTransport], cfg);
 	scope (exit)
 		host.close();
-	host.swarm.addCapableTransport(new WebRtcTransport(key)); // webrtc-direct beside TCP
+	host.swarm.addCapableTransport(new WebRtcTransport(key)); // webrtc-direct
+	version (Libp2pQuic)
+		host.swarm.addCapableTransport(new QuicTransport(key)); // /quic-v1
 
 	bool pinged, identified;
 	PingConfig pc;
@@ -118,14 +124,31 @@ private int run(string mode, string target)
 	switch (mode)
 	{
 	case "listen":
+	case "listen-ws":
+	case "listen-quic":
 	case "listen-webrtc":
 		// LISTEN_HOST overrides the bind address (default loopback for the local
 		// run-interop.sh; set 0.0.0.0 for cross-network conformance).
 		import std.process : environment;
 
 		immutable lh = environment.get("LISTEN_HOST", "127.0.0.1");
-		host.listen(Multiaddr.parse(mode == "listen" ? "/ip4/" ~ lh ~ "/tcp/0"
-				: "/ip4/" ~ lh ~ "/udp/0/webrtc-direct"));
+		string laddr;
+		switch (mode)
+		{
+		case "listen-ws":
+			laddr = "/ip4/" ~ lh ~ "/tcp/0/ws";
+			break;
+		case "listen-quic":
+			laddr = "/ip4/" ~ lh ~ "/udp/0/quic-v1";
+			break;
+		case "listen-webrtc":
+			laddr = "/ip4/" ~ lh ~ "/udp/0/webrtc-direct";
+			break;
+		default:
+			laddr = "/ip4/" ~ lh ~ "/tcp/0";
+			break;
+		}
+		host.listen(Multiaddr.parse(laddr));
 		say("LISTEN %s/p2p/%s", host.addrs[0], host.id);
 		// The peer that dials drives; we stay until it leaves, and report OK as
 		// soon as our own half is done.
