@@ -21,6 +21,7 @@ import (
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	tcp "github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
+	libp2pwebrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -41,11 +42,14 @@ func main() {
 		listenAddr = "/ip4/" + lh + "/tcp/0/ws"
 	case "listen-quic":
 		listenAddr = "/ip4/" + lh + "/udp/0/quic-v1"
+	case "listen-webrtc":
+		listenAddr = "/ip4/" + lh + "/udp/0/webrtc-direct"
 	}
 	h, err := libp2p.New(
 		libp2p.Transport(tcp.NewTCPTransport),
 		libp2p.Transport(quic.NewTransport),
 		libp2p.Transport(ws.New),
+		libp2p.Transport(libp2pwebrtc.New),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Muxer(yamux.ID, yamux.DefaultTransport),
 		libp2p.ListenAddrStrings(listenAddr),
@@ -63,6 +67,8 @@ func main() {
 		want := "/tcp/"
 		if mode == "listen-quic" {
 			want = "/quic"
+		} else if mode == "listen-webrtc" {
+			want = "/webrtc-direct"
 		}
 		for _, a := range h.Addrs() {
 			s := a.String()
@@ -73,6 +79,11 @@ func main() {
 				}
 			} else if mode == "listen-quic" {
 				if strings.Contains(s, "/quic") {
+					chosen = a
+					break
+				}
+			} else if mode == "listen-webrtc" {
+				if strings.Contains(s, "/webrtc-direct") {
 					chosen = a
 					break
 				}
