@@ -95,7 +95,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // webrtc-direct dials from a listening socket: the transport wants
             // one before it will dial.
             if addr.to_string().contains("/webrtc-direct/") {
-                swarm.listen_on("/ip4/127.0.0.1/udp/0/webrtc-direct".parse()?)?;
+                // Bind the dial-side webrtc socket to a routable address, not
+                // loopback: a 127.0.0.1-bound socket cannot reach a public peer.
+                let dh = std::env::var("LISTEN_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+                swarm.listen_on(format!("/ip4/{dh}/udp/0/webrtc-direct").parse()?)?;
             }
             swarm.dial(addr)?;
         }
