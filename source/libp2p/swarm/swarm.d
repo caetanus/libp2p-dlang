@@ -15,7 +15,7 @@
  */
 module libp2p.swarm.swarm;
 
-import core.time : Duration, seconds;
+import core.time : msecs, Duration, seconds;
 import std.algorithm.mutation : move;
 import std.algorithm.searching : canFind, find;
 import std.range : empty, front;
@@ -54,6 +54,8 @@ struct SwarmConfig
 	Duration idleTimeout = Duration.zero;
 	Duration dialTimeout = 10.seconds;
 	Duration handshakeTimeout = 10.seconds;
+	size_t maxConcurrentDials = 8; /// addresses of one peer dialed at once (happy eyeballs)
+	Duration dialStagger = 100.msecs; /// pause between launching two of them
 	/// The most inbound substreams one connection will serve at once. A peer that
 	/// keeps opening streams would otherwise pile up an unbounded number of handler
 	/// fibers; at the ceiling the connection stops accepting, and the muxer resets
@@ -93,6 +95,12 @@ interface CapableTransport
 	/// (a server-reflexive webrtc-direct address), or Multiaddr.init if none.
 	/// Gathered lazily; may block briefly the first time.
 	Multiaddr reflexiveAddr();
+	/// Begin gathering the reflexive address in the BACKGROUND (idempotent), so a
+	/// DCUtR offer reads a warm srflx instead of blocking on STUN — and so it exists
+	/// before the first punch. The relay service calls it when a relayed connection
+	/// forms (a punch is imminent); a transport with none may no-op. Must never
+	/// throw or block — it runs in the connection-admission (notifiee) path.
+	void startReflexive() nothrow;
 	/// Punch a direct connection to `remote` at its reflexive address `peerSrflx`,
 	/// reusing the mapping reflexiveAddr() gathered. Both peers call this at once
 	/// (DCUtR), with `asDialer` splitting the one asymmetric role a hole punch
@@ -123,6 +131,26 @@ final class DialFailure : Exception
 	this(string msg, Throwable cause = null, string file = __FILE__, size_t line = __LINE__)
 	{
 		super(msg, file, line, cause);
+	}
+}
+
+/// The shared state of one happy-eyeballs dial (see Swarm.dialAny): heap-owned,
+/// so the dial tasks and the caller never share a stack frame.
+private final class DialRace
+{
+	import vibe.core.sync : LocalManualEvent, createManualEvent;
+	import vibe.core.task : Task;
+
+	Connection winner;
+	Exception last;
+	size_t finished;
+	Task[] tasks;
+	bool done; /// the caller has left; late results are disposed of, not reported
+	LocalManualEvent changed;
+
+	this()
+	{
+		changed = createManualEvent();
 	}
 }
 
@@ -201,6 +229,20 @@ final class Swarm
 				out_ ~= a;
 		}
 		return out_;
+	}
+
+	/// Warm every capable transport's reflexive-address cache ahead of a punch, so
+	/// the next DCUtR offer carries a public srflx without blocking on STUN. Best
+	/// effort and nothrow: one transport's failure never stops the others or the
+	/// caller (this runs in the notifiee path, right before an auto-punch spawns).
+	void startReflexive() nothrow
+	{
+		foreach (t; capable)
+			try
+				t.startReflexive();
+			catch (Exception)
+			{
+			}
 	}
 
 	void addCapableTransport(CapableTransport t)
@@ -304,17 +346,136 @@ final class Swarm
 			return c;
 		enforce(!closed, "swarm: closed");
 		enforce(addrs.length > 0, "swarm: no addresses for " ~ peer.toString);
-		Exception last;
-		foreach (addr; expand(addrs))
+		return dialAny(expand(addrs), peer);
+	}
+
+	/// Connect to `peer` over a NEW path even though we may already hold a
+	/// connection to it: a peer found on the LAN while its WAN connection still
+	/// lives gets a second connection, and both stay in the pool (roaming: the
+	/// application prefers one for new streams and migrates). Only an existing
+	/// connection to one of these exact addresses is reused.
+	Connection connectFresh(PeerId peer, const(Multiaddr)[] addrs)
+	{
+		enforce(!closed, "swarm: closed");
+		enforce(addrs.length > 0, "swarm: no addresses for " ~ peer.toString);
+		auto targets = expand(addrs);
+		foreach (c; pool)
+			if (c.remotePeer == peer && !c.isClosed && targets.canFind!(a => sameEndpoint(a, c.remoteAddr)))
+				return c;
+		return dialAny(targets, peer);
+	}
+
+	/// The connection new streams to a peer go on, when it has several: set by the
+	/// application (a phone prefers Wi-Fi over a metered link). Given the live
+	/// connections to the peer, returns the one to use. Null: direct over relayed,
+	/// then the oldest.
+	Connection delegate(Connection[]) nothrow preferConnection;
+
+	// The same host+transport+port, ignoring a trailing /p2p/<id>.
+	private static bool sameEndpoint(const Multiaddr a, const Multiaddr b)
+	{
+		auto x = a.components, y = b.components;
+		if (x.length && x[$ - 1].name == "p2p")
+			x = x[0 .. $ - 1];
+		if (y.length && y[$ - 1].name == "p2p")
+			y = y[0 .. $ - 1];
+		if (x.length != y.length)
+			return false;
+		foreach (i; 0 .. x.length)
+			if (x[i].name != y[i].name || x[i].value != y[i].value)
+				return false;
+		return true;
+	}
+
+	/// Dial `addrs` the happy-eyeballs way: up to `cfg.maxConcurrentDials` at once,
+	/// each launched `cfg.dialStagger` after the previous, the first connection to
+	/// come up wins and the rest are interrupted. A peer's address list is full of
+	/// dead ends for whoever is dialing it (its LAN address from another network,
+	/// its public address behind a NAT, a circuit whose relay it left) and each
+	/// dead end costs a whole dial timeout; in sequence that was a minute before
+	/// the one live address got its turn.
+	private Connection dialAny(Multiaddr[] addrs, PeerId peer)
+	{
+		import vibe.core.task : Task;
+
+		auto race = new DialRace;
+		size_t next;
+		try
 		{
-			try
-				return dialOne(addr, nullable(peer));
-			catch (InterruptException e)
-				throw e; // the dialer is being cancelled, not this address failing
-			catch (Exception e)
-				last = e;
+			while (race.winner is null)
+			{
+				immutable inFlight = race.tasks.length - race.finished;
+				if (next < addrs.length && inFlight < cfg.maxConcurrentDials)
+				{
+					launchDial(race, addrs[next++], peer);
+					if (race.winner is null && next < addrs.length && cfg.dialStagger > Duration.zero)
+					{
+						auto ec = race.changed.emitCount;
+						race.changed.wait(cfg.dialStagger, ec); // a fast win or failure cuts the stagger short
+					}
+					continue;
+				}
+				if (race.finished == race.tasks.length && next >= addrs.length)
+					break; // everything tried, nothing won
+				auto ec = race.changed.emitCount;
+				race.changed.wait(ec);
+			}
 		}
-		throw new DialFailure("dial " ~ peer.toString ~ " failed: " ~ (last is null ? "no address worked" : last.msg), last);
+		finally
+		{
+			// The race is decided (or abandoned): the dials still running are told
+			// to stop, and whatever they do from here on — a late connection, a late
+			// failure — they do against `race`, never against this frame. A late
+			// connection is closed by the task itself (see launchDial).
+			race.done = true;
+			auto me = Task.getThis();
+			foreach (t; race.tasks)
+				if (t != me && t.running)
+					t.interrupt();
+		}
+		if (race.winner is null)
+			throw new DialFailure("dial " ~ peer.toString ~ " failed: "
+				~ (race.last is null ? "no address worked" : race.last.msg), race.last);
+		return race.winner;
+	}
+
+	// One dial of the race, on its own task. Everything it touches lives in `race`
+	// (a GC object shared with the other dials and with dialAny), so a task that
+	// outlives dialAny — the stagger, the interrupt, a connection that came up
+	// just as the race was decided — still has valid state to report into, and
+	// once the race is done it reports nothing: it only disposes of what it made.
+	private void launchDial(DialRace race, Multiaddr addr, PeerId peer)
+	{
+		import vibe.core.core : runTask;
+
+		race.tasks ~= runTask((DialRace r, Multiaddr a, PeerId p) nothrow {
+			Connection c;
+			Exception failure;
+			try
+				c = dialOne(a, nullable(p));
+			catch (InterruptException)
+			{
+			}
+			catch (Exception e)
+				failure = e;
+			if (c !is null && (r.done || r.winner !is null))
+			{
+				c.close(); // the race is over (or another dial won): one connection is enough
+				c = null;
+			}
+			if (r.done)
+				return; // nobody is waiting on this race any more
+			if (c !is null)
+				r.winner = c;
+			else if (failure !is null)
+				r.last = failure;
+			r.finished++;
+			try
+				r.changed.emit();
+			catch (Exception)
+			{
+			}
+		}, race, addr, peer);
 	}
 
 	/// Dial an address whose peer we do not know yet.
@@ -417,7 +578,7 @@ final class Swarm
 			raw.close();
 
 		Upgraded up = withTimeout(cfg.handshakeTimeout, "handshake with " ~ addr.toString,
-			() => upgrade(raw, Endpoint.dialer, upgradeCfg, expected));
+			() => upgrade(raw, Endpoint.dialer, upgradeCfg, expected, reusePort != 0));
 		scope (failure)
 			up.muxer.close();
 
@@ -559,6 +720,10 @@ final class Swarm
 
 	private Connection admitInbound(RawConn raw)
 	{
+		// Read the addresses up front: after the handshake the peer may already be
+		// gone, and a closed socket has no addresses to report.
+		auto local = raw.localAddr;
+		auto remote = raw.remoteAddr;
 		scope (failure)
 			raw.close();
 
@@ -568,7 +733,7 @@ final class Swarm
 		if (gater !is null && !gater.allowInbound(raw.remoteAddr))
 			throw new Exception("swarm: gater refused " ~ raw.remoteAddr.toString);
 
-		Upgraded up = withTimeout(cfg.handshakeTimeout, "handshake with " ~ raw.remoteAddr.toString,
+		Upgraded up = withTimeout(cfg.handshakeTimeout, "handshake with " ~ remote.toString,
 			() => upgrade(raw, Endpoint.listener, upgradeCfg));
 		scope (failure)
 			up.muxer.close();
@@ -577,7 +742,7 @@ final class Swarm
 			throw new Exception("swarm: gater refused " ~ up.remotePeer.toString);
 
 		auto established = limiter.established(Endpoint.listener, up.remotePeer);
-		return admit(up, Endpoint.listener, raw.localAddr, raw.remoteAddr, established);
+		return admit(up, Endpoint.listener, local, remote, established);
 	}
 
 	/// A raw connection established some other way (a relayed stream, say),
@@ -616,8 +781,13 @@ final class Swarm
 		auto c = new Connection(this, up.muxer, role, up.remotePeer, up.remoteKey, local, remote, established);
 		pool ~= c;
 		c.start();
+		// A throwing notifiee must not abort admission nor keep the others from
+		// running (matches forget()'s disconnected() dispatch).
 		foreach (n; notifiees.dup)
-			n.connected(c);
+			try
+				n.connected(c);
+			catch (Exception e)
+				logDiagnostic("libp2p: notifiee failed on connect: %s", e.msg);
 		return c;
 	}
 
@@ -635,12 +805,25 @@ final class Swarm
 		}
 	}
 
+	// The connection new streams to `peer` go on. A direct one wins over a relayed
+	// one (a /p2p-circuit remote address): after a hole punch both are in the pool,
+	// the relayed one first, and a relay circuit carries only a small byte budget
+	// meant for the punch itself — data on it dies mid-transfer.
 	private Connection find(PeerId peer)
 	{
+		Connection[] live;
 		foreach (c; pool)
 			if (c.remotePeer == peer && !c.isClosed)
+				live ~= c;
+		if (live.length == 0)
+			return null;
+		if (live.length > 1 && preferConnection !is null)
+			if (auto chosen = preferConnection(live))
+				return chosen;
+		foreach (c; live)
+			if (!c.remoteAddr.components.canFind!(x => x.name == "p2p-circuit"))
 				return c;
-		return null;
+		return live[0];
 	}
 
 	private Transport transportFor(Multiaddr addr)

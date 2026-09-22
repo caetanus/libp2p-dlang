@@ -390,7 +390,7 @@ unittest
 @("dcutr: auto-DCUtR upgrades a relayed connection with no explicit punch")
 unittest
 {
-	bool direct;
+	bool direct, viaDirect;
 	onLoop({
 		auto relay = makeNode();
 		scope (exit)
@@ -411,7 +411,75 @@ unittest
 		a.relay.connectVia(relay.host.id, b.host.id);
 		direct = waitUntil(() => a.host.swarm.connectionsTo(b.host.id)
 				.canFind!(c => !c.remoteAddr.toString.canFind("/p2p-circuit")));
+		// Both connections are pooled now, the relayed one first; a new stream must
+		// still take the direct one — the circuit's byte budget is for the punch only.
+		viaDirect = !a.host.swarm.connection(b.host.id).remoteAddr.toString.canFind("/p2p-circuit");
 		waitUntil(() => b.relay.punchCount == 0);
 	});
 	direct.should.equal(true);
+	viaDirect.should.equal(true);
+}
+
+// The rendezvous API: the relay is where A and B meet, not the pipe. A gets the
+// direct connection back and the relayed one is gone from its pool, so every
+// stream it opens from here on is off the circuit's byte budget.
+@("dcutr: connectDirect hands back the punched connection and drops the relayed one")
+unittest
+{
+	bool viaDirect, relayedGone, pinged;
+	onLoop({
+		auto relay = makeNode();
+		scope (exit)
+			relay.close();
+		auto a = makeNode();
+		scope (exit)
+			a.close();
+		auto b = makeNode();
+		scope (exit)
+			b.close();
+		new Ping(a.host);
+		new Ping(b.host);
+		a.relay.setObservedAddrs([a.host.addrs[0].encode]);
+		b.relay.setObservedAddrs([b.host.addrs[0].encode]);
+		a.host.peerstore.addAddrs(relay.host.id, relay.host.addrs);
+		b.host.peerstore.addAddrs(relay.host.id, relay.host.addrs);
+		b.relay.reserve(relay.host.id);
+
+		auto c = a.relay.connectDirect(relay.host.id, b.host.id);
+		viaDirect = !c.remoteAddr.toString.canFind("/p2p-circuit");
+		relayedGone = waitUntil(() => !a.host.swarm.connectionsTo(b.host.id)
+				.canFind!(x => x.remoteAddr.toString.canFind("/p2p-circuit")));
+		auto s = c.newStream(pingProtocol);
+		scope (exit)
+			s.close();
+		pinged = ping(s) > Duration.zero;
+		waitUntil(() => b.relay.punchCount == 0);
+	});
+	viaDirect.should.equal(true);
+	relayedGone.should.equal(true);
+	pinged.should.equal(true);
+}
+
+// A NAT'd node's DCUtR offer: identify tells it the IP the world sees it from
+// (with the port of that outbound connection); the punch must aim at its listen
+// port on that IP. The relay service pairs them itself, so an application need
+// not — the phone that only called connect() got this wrong for a night.
+@("dcutr: the offer pairs the observed public IP with our TCP listen port")
+unittest
+{
+	string[] offered;
+	onLoop({
+		auto n = makeNode();
+		scope (exit)
+			n.close();
+		// what identify would have recorded: seen from 203.0.113.9, ephemeral port
+		n.host.addObservedAddrSource(() => [Multiaddr.parse("/ip4/203.0.113.9/tcp/51234")]);
+		foreach (a; n.relay.dcutrAddrs())
+			offered ~= a.toString;
+	});
+	import std.algorithm : any, canFind, startsWith, endsWith;
+	// the loopback listener is not offered (nobody can reach it there), the synthesized one is
+	offered.any!(a => a.startsWith("/ip4/127.0.0.1/tcp/")).should.equal(false);
+	offered.any!(a => a.startsWith("/ip4/203.0.113.9/tcp/") && !a.endsWith("/51234")).should.equal(true);
+	offered.canFind("/ip4/203.0.113.9/tcp/51234").should.equal(false);
 }

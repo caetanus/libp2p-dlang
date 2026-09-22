@@ -61,6 +61,13 @@ private void ensureCryptoInit()
     }
 }
 
+private __gshared bool quicTrace = false;
+shared static this()
+{
+    import core.stdc.stdlib : getenv;
+    quicTrace = getenv("LIBP2P_QUIC_TRACE") !is null;
+}
+
 final class QuicConnection : Muxer
 {
     private
@@ -76,6 +83,7 @@ final class QuicConnection : Muxer
         ubyte[128] _remoteSa;
         ngtcp2_callbacks _cb;
         ngtcp2_settings _settings;
+        size_t _rrNext; // round-robin cursor over the streams with data
         ngtcp2_transport_params _params;
         QuicStream[long] _streams; // by stream id
         QuicStream[] _acceptQueue; // inbound streams awaiting acceptStream
@@ -102,6 +110,7 @@ final class QuicConnection : Muxer
         cb.stream_open = &streamOpenCb;
         cb.recv_stream_data = &recvStreamDataCb;
         cb.stream_close = &streamCloseCb;
+        cb.acked_stream_data_offset = &ackedStreamDataCb;
     }
 
     private void setPath(scope const(ubyte)[] local, scope const(ubyte)[] remote)
@@ -134,6 +143,16 @@ final class QuicConnection : Muxer
         wireStreamCallbacks(self._cb);
         ngtcp2_settings_default(&self._settings);
         self._settings.handshake_timeout = 90_000_000_000; // 90s: keep retransmitting Initials across punch skew
+        // Flow-control windows auto-tune up to these (ngtcp2 grows them with the
+        // measured bandwidth-delay product); without them the 1 MiB / 256 KiB
+        // initial windows cap a long-RTT link at a few MB/s.
+        self._settings.max_window = 8 * 1024 * 1024;
+        self._settings.max_stream_window = 6 * 1024 * 1024;
+        // BBR, not cubic: a cellular uplink has a deep queue and no loss, so cubic
+        // fills it and sits at seconds of RTT (bufferbloat) — a keepalive on another
+        // stream then dies behind the bulk. BBR keeps bytes in flight near the
+        // bandwidth-delay product and the queue, and the RTT, stay small.
+        self._settings.cc_algo = NGTCP2_CC_ALGO_BBR;
         ngtcp2_transport_params_default(&self._params);
         setStreamLimits(self._params);
         auto dcid = randomCid();
@@ -164,6 +183,16 @@ final class QuicConnection : Muxer
         wireStreamCallbacks(self._cb);
         ngtcp2_settings_default(&self._settings);
         self._settings.handshake_timeout = 90_000_000_000; // 90s: keep retransmitting Initials across punch skew
+        // Flow-control windows auto-tune up to these (ngtcp2 grows them with the
+        // measured bandwidth-delay product); without them the 1 MiB / 256 KiB
+        // initial windows cap a long-RTT link at a few MB/s.
+        self._settings.max_window = 8 * 1024 * 1024;
+        self._settings.max_stream_window = 6 * 1024 * 1024;
+        // BBR, not cubic: a cellular uplink has a deep queue and no loss, so cubic
+        // fills it and sits at seconds of RTT (bufferbloat) — a keepalive on another
+        // stream then dies behind the bulk. BBR keeps bytes in flight near the
+        // bandwidth-delay product and the queue, and the RTT, stay small.
+        self._settings.cc_algo = NGTCP2_CC_ALGO_BBR;
         ngtcp2_transport_params_default(&self._params);
         setStreamLimits(self._params);
         self._params.original_dcid = hd.dcid; // MANDATORY, else the TP check fails
@@ -281,6 +310,27 @@ final class QuicConnection : Muxer
         }
     }
 
+    /// Congestion/RTT snapshot from ngtcp2 (cwnd, ssthresh, bytes in flight, srtt in µs).
+    struct Stats { ulong cwnd, ssthresh, inflight; ulong srttUs; ulong pktSent, pktLost; }
+    Stats stats() nothrow
+    {
+        Stats st;
+        if (_conn is null)
+            return st;
+        ngtcp2_conn_info ci;
+        try
+            ngtcp2_conn_get_conn_info(_conn, &ci);
+        catch (Exception)
+            return st;
+        st.cwnd = ci.cwnd;
+        st.ssthresh = ci.ssthresh;
+        st.inflight = ci.bytes_in_flight;
+        st.srttUs = ci.smoothed_rtt / 1000;
+        st.pktSent = ci.pkt_sent;
+        st.pktLost = ci.pkt_lost;
+        return st;
+    }
+
     bool isClosed() nothrow
     {
         return _closed;
@@ -303,16 +353,32 @@ final class QuicConnection : Muxer
             return;
         ubyte[2048] buf;
         ngtcp2_pkt_info pi;
+        // Pacing: ngtcp2 tells us how many bytes may leave in one burst (the send
+        // quantum, sized from cwnd and the pacing rate); past it we stop, stamp
+        // the transmit time, and let the expiry timer bring us back. Without this
+        // a whole cwnd went out in one burst and the receiver's 212 KB socket
+        // buffer dropped the tail — every drop a cubic collapse, 1 MB/s at 220 ms.
+        size_t budget = ngtcp2_conn_get_send_quantum(_conn);
+        if (budget == 0)
+            budget = 1200; // never starve a pending ACK/handshake packet
+        size_t burst;
+        // Streams take turns, one packet each: a bulk stream must not starve a
+        // control stream's 100-byte frame behind megabytes of its own backlog.
+        QuicStream[] ready;
+        foreach (s; _streams)
+            if (s._outbuf.length || s._finPending)
+                ready ~= s;
+        size_t turn;
         foreach (_; 0 .. 256)
         {
             QuicStream chosen;
-            foreach (s; _streams)
+            foreach (k; 0 .. ready.length)
             {
-                if (s._blocked)
-                    continue;
-                if (s._outbuf.length == 0 && !s._finPending)
+                auto s = ready[(_rrNext + turn + k) % ready.length];
+                if (s._blocked || (s._outbuf.length == 0 && !s._finPending))
                     continue;
                 chosen = s;
+                turn += k + 1;
                 break;
             }
 
@@ -345,25 +411,55 @@ final class QuicConnection : Muxer
                     chosen._blocked = true; // flow-controlled this round; skip it
                 continue;
             }
+            if (n < 0 && chosen !is null && (n == NGTCP2_ERR_STREAM_SHUT_WR
+                    || n == NGTCP2_ERR_STREAM_NOT_FOUND))
+            {
+                // This stream is gone as far as ngtcp2 is concerned (the peer reset
+                // it, or its FIN already went) while we still held bytes or a FIN
+                // for it. Throwing here aborted the WHOLE round — and every later
+                // round, since the stream stayed first in line: the connection's
+                // output froze with the other streams' data behind it. Retire the
+                // stream and carry on with the rest.
+                if (quicTrace)
+                {
+                    import core.stdc.stdio : fprintf, stderr;
+                    fprintf(stderr, "QUICTRACE stream %lld retired on write: %s\n",
+                        cast(long) chosen._id, ngtcpErr(cast(int) n).ptr);
+                }
+                chosen._outbuf = null;
+                chosen._finPending = false;
+                chosen._closed = true;
+                chosen._writeEvent.emit();
+                chosen._dataEvent.emit();
+                _streams.remove(chosen._id);
+                continue;
+            }
             enforce(n >= 0, "writev_stream failed: " ~ ngtcpErr(cast(int) n));
 
             // written >= 0 means ngtcp2 consumed that many of the offered bytes
             // (including an empty-FIN, where written == 0).
             if (chosen !is null && written >= 0)
             {
+                if (written > 0)
+                    chosen._retain ~= chosen._outbuf[0 .. cast(size_t) written]; // alive until acked
                 chosen._outbuf = chosen._outbuf[cast(size_t) written .. $];
-                if (chosen._outbuf.length == 0)
-                {
-                    if (chosen._finPending)
-                        chosen._finPending = false; // FIN went with the last bytes
-                    chosen._writeEvent.emit();
-                }
+                if (chosen._outbuf.length == 0 && chosen._finPending)
+                    chosen._finPending = false; // FIN went with the last bytes
+                if (written > 0 || chosen._outbuf.length == 0)
+                    chosen._writeEvent.emit(); // a writer parked above the watermark may go on
             }
 
             if (n == 0)
                 break; // nothing more to send right now
             sink(buf[0 .. cast(size_t) n]);
+            burst += cast(size_t) n;
+            if (burst >= budget)
+                break; // the quantum is spent; the pacing timer resumes us
         }
+        if (burst)
+            ngtcp2_conn_update_pkt_tx_time(_conn, nowNanos());
+        if (ready.length)
+            _rrNext = (_rrNext + turn) % ready.length; // next round starts after the last served
         foreach (s; _streams)
             s._blocked = false;
     }
@@ -391,6 +487,25 @@ final class QuicConnection : Muxer
         if (fin)
             s._remoteFin = true;
         s._dataEvent.emit();
+    }
+
+    // ngtcp2 keeps POINTERS into the stream data we hand writev_stream — it does not
+    // copy — and reads them again to retransmit a lost packet. So every chunk we
+    // hand it stays referenced here until this callback says the peer has it;
+    // slicing it off _outbuf alone let the GC free it under ngtcp2 (SIGSEGV in
+    // memcpy inside writev_stream, only on lossy links: retransmission).
+    private void onAckedStreamData(long id, ulong offset, ulong datalen)
+    {
+        auto p = id in _streams;
+        if (p is null)
+            return;
+        auto s = *p;
+        immutable acked = offset + datalen;
+        while (s._retain.length && s._retainBase + s._retain[0].length <= acked)
+        {
+            s._retainBase += s._retain[0].length;
+            s._retain = s._retain[1 .. $];
+        }
     }
 
     private void onStreamClose(long id)
@@ -484,6 +599,17 @@ extern (C) private int recvStreamDataCb(ngtcp2_conn* conn, uint flags, long stre
     return 0;
 }
 
+extern (C) private int ackedStreamDataCb(ngtcp2_conn* conn, long streamId, ulong offset,
+    ulong datalen, void* userData, void* streamUserData)
+{
+    auto self = cast(QuicConnection) userData;
+    try
+        self.onAckedStreamData(streamId, offset, datalen);
+    catch (Exception)
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    return 0;
+}
+
 extern (C) private int streamCloseCb(ngtcp2_conn* conn, uint flags, long streamId,
     ulong appErrorCode, void* userData, void* streamUserData)
 {
@@ -513,6 +639,9 @@ final class QuicStream : Stream
         bool _localReset; // we reset it
         bool _closed; // stream fully closed (or conn gone)
         bool _blocked; // flow-controlled this collectOutgoing round
+        ubyte[][] _retain; // handed to ngtcp2, not yet acked by the peer (see onAckedStreamData)
+        ulong _retainBase; // stream offset where _retain[0] starts
+        enum size_t highWater = 2 * 1024 * 1024; // write() blocks above this much queued
         LocalManualEvent _dataEvent; // inbound data / read-side state change
         LocalManualEvent _writeEvent; // outbound drained / write-side state change
     }
@@ -559,14 +688,20 @@ final class QuicStream : Stream
             return;
         _outbuf ~= data.dup; // outlives caller's buffer across fiber yields
         _conn.wantWrite();
-        while (_outbuf.length > 0)
+        // Return as soon as the queue is below the high watermark, NOT when it is
+        // empty: waiting for the drain made every write a stop-and-wait of one
+        // chunk per RTT (64 KiB writes at 220 ms = 0.7 MB/s, whatever the link).
+        // With a deep enough queue ngtcp2 keeps the congestion window full and the
+        // sender is bound by flow control and cwnd, as it should be. close() still
+        // sends the FIN only after the whole queue has gone out.
+        while (_outbuf.length > highWater)
         {
             if (_localReset)
                 throw new StreamReset("quic: stream reset");
             if (_closed || _conn._closed)
                 throw new ConnClosed("quic: connection closed");
             auto ec = _writeEvent.emitCount;
-            if (_outbuf.length == 0)
+            if (_outbuf.length <= highWater)
                 break;
             _writeEvent.wait(ec);
         }

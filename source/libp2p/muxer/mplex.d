@@ -224,6 +224,12 @@ final class Mplex : Muxer
 			end(e);
 		catch (Exception e)
 			end(asConnEnding(e, "mplex"));
+		catch (Error e)
+		{
+			import libp2p.util.fibers : reportTaskError;
+			reportTaskError("mplex session reader", e);
+			end(new ConnClosed("mplex: internal error in the session reader: " ~ e.msg));
+		}
 		transport.close();
 	}
 

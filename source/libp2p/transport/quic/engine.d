@@ -55,10 +55,10 @@ void setStreamLimits(ref ngtcp2_transport_params p) nothrow @nogc
 {
     p.initial_max_streams_bidi = 128;
     p.initial_max_streams_uni = 128;
-    p.initial_max_stream_data_bidi_local = 256 * 1024;
-    p.initial_max_stream_data_bidi_remote = 256 * 1024;
-    p.initial_max_stream_data_uni = 256 * 1024;
-    p.initial_max_data = 1024 * 1024;
+    p.initial_max_stream_data_bidi_local = 1024 * 1024;
+    p.initial_max_stream_data_bidi_remote = 1024 * 1024;
+    p.initial_max_stream_data_uni = 1024 * 1024;
+    p.initial_max_data = 4 * 1024 * 1024;
 }
 
 /// The client callbacks table: ngtcp2_crypto's TLS helpers + our D rand/cid.

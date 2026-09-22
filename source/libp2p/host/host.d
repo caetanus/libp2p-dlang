@@ -4,6 +4,7 @@
  */
 module libp2p.host.host;
 
+import std.algorithm.searching : canFind;
 import std.exception : enforce;
 
 import libp2p.core.peer_id : PeerId;
@@ -64,6 +65,35 @@ final class Host
 		return swarm.reflexiveAddrs();
 	}
 
+	/// Warm the reflexive-address cache ahead of a hole punch (DCUtR), so the
+	/// offer carries a public srflx instead of blocking on STUN when read. Nothrow
+	/// and non-blocking: safe to call from the connection-admission path.
+	void warmReflexiveAddrs() nothrow
+	{
+		swarm.startReflexive();
+	}
+
+	private Multiaddr[] delegate()[] observedSources;
+
+	/// Register a source of addresses peers have observed us at (identify does).
+	void addObservedAddrSource(Multiaddr[] delegate() source)
+	{
+		observedSources ~= source;
+	}
+
+	/// Where peers have seen us from outside: the IP (and the port of whatever
+	/// connection they saw) our NAT gave us. Raw material for a hole punch — see
+	/// Relay's DCUtR addresses, which pair these IPs with our listen ports.
+	Multiaddr[] observedAddrs()
+	{
+		Multiaddr[] out_;
+		foreach (src; observedSources)
+			foreach (a; src())
+				if (!out_.canFind(a))
+					out_ ~= a;
+		return out_;
+	}
+
 	/// Punch a direct connection to `peer` at a reflexive address, for DCUtR.
 	/// `asDialer` splits the securing handshake's roles across the two peers.
 	Connection punch(const Multiaddr addr, PeerId peer, bool asDialer)
@@ -77,6 +107,14 @@ final class Host
 	}
 
 	/// A connection to `peer`, over `addrs` or over what the peerstore knows.
+	/// A new connection to `peer` over `addrs` even if one exists elsewhere (see
+	/// Swarm.connectFresh): the roaming path.
+	Connection connectFresh(PeerId peer, const(Multiaddr)[] addrs)
+	{
+		peerstore.addAddrs(peer, addrs);
+		return swarm.connectFresh(peer, addrs);
+	}
+
 	Connection connect(PeerId peer, const(Multiaddr)[] addrs = null)
 	{
 		if (addrs.length > 0)

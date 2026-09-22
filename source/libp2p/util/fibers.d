@@ -44,6 +44,14 @@ final class FiberGroup
 			catch (Exception e)
 				if (onFailure !is null)
 					onFailure(e);
+			catch (Error e)
+			{
+				// An Error out of a library task must not unwind the host's event
+				// loop; report it loudly and hand the owner an ordinary failure.
+				reportTaskError("fiber-group task", e);
+				if (onFailure !is null)
+					onFailure(new Exception("libp2p: internal error in a task: " ~ e.msg));
+			}
 		});
 		// The body may already have finished (it runs until its first yield).
 		if (t.running)
@@ -81,5 +89,27 @@ final class FiberGroup
 			}
 		if (tasks.length == 0 && onEmpty !is null)
 			onEmpty();
+	}
+}
+
+/// Print an Error that escaped a library task — what, where, and its trace — on
+/// stderr, unconditionally: this is the one line that tells which task died when
+/// a platform's traces are empty. Never throws.
+void reportTaskError(string where, Error e) nothrow
+{
+	import core.stdc.stdio : fprintf, stderr;
+
+	try
+	{
+		string info;
+		if (e.info !is null)
+			foreach (line; e.info)
+				info ~= "\n    " ~ line;
+		fprintf(stderr, "libp2p: FATAL Error in %.*s: %.*s (%.*s:%zu)%.*s\n", cast(int) where.length, where.ptr,
+			cast(int) e.msg.length, e.msg.ptr, cast(int) e.file.length, e.file.ptr, e.line,
+			cast(int) info.length, info.ptr);
+	}
+	catch (Exception)
+	{
 	}
 }

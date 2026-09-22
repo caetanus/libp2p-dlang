@@ -53,3 +53,33 @@ unittest
 		got.should.equal(msg);
 	}
 }
+
+// A TCP hole punch leaves two dialers on one connection. Both propose the
+// simultaneous-open extension; exactly one ends up the initiator, and the
+// protocol they agree on is the same on both sides.
+@("simultaneous open: two dialers split the initiator role and agree")
+unittest
+{
+	SimOpenResult a, b;
+	runPair(
+		(Stream s) { a = negotiateSimOpen(s, ["/noise"]); },
+		(Stream s) { b = negotiateSimOpen(s, ["/noise"]); });
+	a.protocol.should.equal("/noise");
+	b.protocol.should.equal("/noise");
+	(a.initiator != b.initiator).should.equal(true);
+}
+
+// Against a plain listener the extension is declined with `na` and the dialer
+// simply goes on as the initiator — a punch that was accepted by a listener.
+@("simultaneous open: a plain listener declines it and the dialer initiates")
+unittest
+{
+	SimOpenResult a;
+	string served;
+	runPair(
+		(Stream s) { a = negotiateSimOpen(s, ["/noise"]); },
+		(Stream s) { served = negotiateListener(s, ["/noise"]); });
+	a.initiator.should.equal(true);
+	a.protocol.should.equal("/noise");
+	served.should.equal("/noise");
+}

@@ -44,8 +44,13 @@ struct Upgraded
 	string muxerProtocol;
 }
 
+/// `simultaneousOpen`: this dial may have met the peer's dial head-on (a TCP
+/// hole punch), leaving no listener; the multistream simultaneous-open
+/// extension then decides which side takes the initiator role for the
+/// handshakes. The endpoint `role` stays what the caller did (dial), only
+/// the handshake roles follow the tie-break.
 Upgraded upgrade(Stream raw, Endpoint role, UpgradeConfig cfg,
-	Nullable!PeerId expected = Nullable!PeerId.init)
+	Nullable!PeerId expected = Nullable!PeerId.init, bool simultaneousOpen = false)
 {
 	enforce(cfg.security.length > 0, "upgrade: no security transport configured");
 	enforce(cfg.muxers.length > 0, "upgrade: no muxer configured");
@@ -54,25 +59,35 @@ Upgraded upgrade(Stream raw, Endpoint role, UpgradeConfig cfg,
 
 	// Security.
 	SecureConn sec;
-	if (role == Endpoint.dialer)
+	bool initiator = role == Endpoint.dialer;
+	if (role == Endpoint.dialer && simultaneousOpen)
 	{
-		up.securityProtocol = negotiateDialer(raw, ids(cfg.security));
-		sec = pick(cfg.security, up.securityProtocol).secureOutbound(raw, expected);
+		auto r = negotiateSimOpen(raw, ids(cfg.security));
+		up.securityProtocol = r.protocol;
+		initiator = r.initiator;
 	}
+	else if (role == Endpoint.dialer)
+		up.securityProtocol = negotiateDialer(raw, ids(cfg.security));
+	else
+		up.securityProtocol = negotiateListener(raw, ids(cfg.security));
+	if (initiator)
+		sec = pick(cfg.security, up.securityProtocol).secureOutbound(raw, expected);
 	else
 	{
-		up.securityProtocol = negotiateListener(raw, ids(cfg.security));
 		sec = pick(cfg.security, up.securityProtocol).secureInbound(raw);
+		// Lost the tie-break: the inbound handshake could not pin the peer, so check now.
+		enforce(expected.isNull || sec.remotePeer == expected.get,
+			"upgrade: peer authenticated as " ~ sec.remotePeer.toString ~ ", not the one dialed");
 	}
 	up.remotePeer = sec.remotePeer;
 	up.remoteKey = sec.remoteKey;
 
 	// Muxer, over the secured stream.
-	if (role == Endpoint.dialer)
+	if (initiator)
 		up.muxerProtocol = negotiateDialer(sec, ids(cfg.muxers));
 	else
 		up.muxerProtocol = negotiateListener(sec, ids(cfg.muxers));
-	up.muxer = pick(cfg.muxers, up.muxerProtocol).create(sec, role == Endpoint.dialer);
+	up.muxer = pick(cfg.muxers, up.muxerProtocol).create(sec, initiator);
 	return up;
 }
 

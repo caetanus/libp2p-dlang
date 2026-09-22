@@ -384,3 +384,115 @@ unittest
 	streamEnded.should.equal(true);
 	stillConnected.should.equal(true);
 }
+
+// A peer's address list is mostly dead ends for whoever dials it (its LAN
+// address from elsewhere, a public address behind a NAT, a circuit whose relay
+// it left). Dialed in sequence each dead end cost a whole dial timeout before
+// the live address got its turn; dialed happy-eyeballs style the live one wins
+// while the dead ones are still waiting, and those are then interrupted.
+@("swarm: connect dials addresses in parallel, a live one wins over dead ones fast")
+unittest
+{
+	string echoed;
+	long elapsedMs;
+	onLoop({
+		auto listener = makeSwarm();
+		scope (exit)
+			listener.close();
+		listener.setStreamHandler(echoProtocol, toDelegate(&echoHandler));
+		listener.listen(Multiaddr.parse(loopback));
+		SwarmConfig cfg;
+		cfg.dialTimeout = 5.seconds; // a blackholed address takes this long to fail
+		auto dialer = makeSwarm(cfg);
+		scope (exit)
+			dialer.close();
+		// A blackhole (unroutable, the SYN just vanishes), a refused port, then the
+		// real listener — in that order, the worst case for a sequential dialer.
+		Multiaddr[] addrs = [
+			Multiaddr.parse("/ip4/10.255.255.1/tcp/9"),
+			Multiaddr.parse("/ip4/127.0.0.1/tcp/1"),
+		] ~ listener.listenAddrs;
+		immutable t0 = MonoTime.currTime;
+		auto c = dialer.connect(listener.localPeer, addrs);
+		elapsedMs = (MonoTime.currTime - t0).total!"msecs";
+		echoed = echoOnce(c, "eyeballs");
+	});
+	echoed.should.equal("eyeballs");
+	// Two dead addresses ahead of the live one, 100 ms stagger each: well under a
+	// single dial timeout, let alone two.
+	(elapsedMs < 2000).should.equal(true);
+}
+
+// The crash this guards against: a peer that connects and drops every couple of
+// seconds while we keep redialing its addresses — a dead one first, so a dial
+// task is always still pending (then interrupted) when the live one wins — and
+// a late dial task then reported into a dialAny frame that was already gone.
+@("swarm: repeated connect/drop churn with dead addresses ahead never crashes")
+unittest
+{
+	size_t connected;
+	onLoop({
+		auto listener = makeSwarm();
+		scope (exit)
+			listener.close();
+		listener.setStreamHandler(echoProtocol, toDelegate(&echoHandler));
+		listener.listen(Multiaddr.parse(loopback));
+		SwarmConfig cfg;
+		cfg.dialTimeout = 3.seconds;
+		cfg.dialStagger = 10.msecs;
+		auto dialer = makeSwarm(cfg);
+		scope (exit)
+			dialer.close();
+		Multiaddr[] addrs = [
+			Multiaddr.parse("/ip4/10.255.255.2/tcp/9"), // blackhole: still dialing when the live one wins
+			Multiaddr.parse("/ip4/127.0.0.1/tcp/1"), // refused
+		] ~ listener.listenAddrs;
+		foreach (i; 0 .. 25)
+		{
+			auto c = dialer.connect(listener.localPeer, addrs);
+			connected++;
+			// The peer drops us right away, from its side; we redial at once.
+			foreach (lc; listener.connections)
+				lc.close();
+			sleep(20.msecs);
+			c.close();
+		}
+		// Let the interrupted blackhole dials from every round finish unwinding
+		// while this frame — and the dialAny frames — are long gone.
+		sleep(200.msecs);
+	});
+	connected.should.equal(25);
+}
+
+// Roaming: a peer reachable at two addresses (its WAN mapping and, later, its LAN
+// one) is TWO connections, both kept — connect() reuses what it has, connectFresh()
+// opens the other path and only reuses a connection to that same endpoint.
+@("swarm: connectFresh opens a second connection to a peer over a new path")
+unittest
+{
+	size_t after1, after2, after3;
+	bool sameOnRepeat;
+	onLoop({
+		auto listener = makeSwarm();
+		scope (exit)
+			listener.close();
+		listener.listen(Multiaddr.parse(loopback));
+		listener.listen(Multiaddr.parse(loopback)); // a second listener = a second path
+		auto dialer = makeSwarm();
+		scope (exit)
+			dialer.close();
+		auto addrs = listener.listenAddrs;
+		auto c1 = dialer.connect(listener.localPeer, [addrs[0]]);
+		after1 = dialer.connectionsTo(listener.localPeer).length;
+		auto c2 = dialer.connectFresh(listener.localPeer, [addrs[1]]);
+		after2 = dialer.connectionsTo(listener.localPeer).length;
+		sameOnRepeat = dialer.connectFresh(listener.localPeer, [addrs[1]]) is c2;
+		after3 = dialer.connectionsTo(listener.localPeer).length;
+		c1.close();
+		c2.close();
+	});
+	after1.should.equal(1);
+	after2.should.equal(2);
+	sameOnRepeat.should.equal(true);
+	after3.should.equal(2);
+}

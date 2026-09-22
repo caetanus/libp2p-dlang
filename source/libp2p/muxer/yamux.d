@@ -30,6 +30,7 @@ import vibe.core.task : Task, InterruptException;
 
 import libp2p.core.ending;
 import libp2p.core.stream;
+import libp2p.util.fibers : reportTaskError;
 import libp2p.muxer.muxer;
 import libp2p.core.upgrade : MuxerFactory;
 import libp2p.util.timeout : withTimeout;
@@ -212,6 +213,16 @@ final class YamuxConn : Muxer
 			// The transport ending under a session is the connection ending.
 			end(asConnEnding(e, "yamux"), goAwayInternalError);
 		}
+		catch (Error e)
+		{
+			// An Error out of a read (an out-of-memory from a bad length, an
+			// assertion in the transport) would unwind this fiber and take the
+			// whole event loop — every connection, the application — with it.
+			// It is still this one connection's fault: end it, keep the process.
+			reportTaskError("yamux session reader", e);
+			end(new ConnClosed("yamux: internal error in the session reader: " ~ e.msg),
+				goAwayInternalError);
+		}
 		transport.close();
 	}
 
@@ -221,6 +232,13 @@ final class YamuxConn : Muxer
 			throw new YamuxProtocolError("yamux: unknown protocol version");
 		immutable type = h[1];
 		immutable ushort flags = cast(ushort)((h[2] << 8) | h[3]);
+		version (Libp2pReadTrace)
+		{
+			import core.stdc.stdio : fprintf, stderr;
+			fprintf(stderr, "READTRACE yamux frame type=%u flags=%u id=%u length=%u\n", type, flags,
+				(cast(uint) h[4] << 24) | (cast(uint) h[5] << 16) | (cast(uint) h[6] << 8) | h[7],
+				(cast(uint) h[8] << 24) | (cast(uint) h[9] << 16) | (cast(uint) h[10] << 8) | h[11]);
+		}
 		immutable uint id = (cast(uint) h[4] << 24) | (cast(uint) h[5] << 16) | (cast(uint) h[6] << 8) | h[7];
 		immutable uint length = (cast(uint) h[8] << 24) | (cast(uint) h[9] << 16) | (cast(uint) h[10] << 8) | h[11];
 
@@ -419,6 +437,12 @@ private final class YamuxStream : Stream
 			seen = changed.wait(seen);
 		}
 		immutable n = min(buf.length, recvBuf.length);
+		version (Libp2pReadTrace)
+		{
+			import core.stdc.stdio : fprintf, stderr;
+			fprintf(stderr, "READTRACE yamux stream %u read: want=%zu have=%zu -> %zu recvWindow=%u consumed=%u\n",
+				id, buf.length, recvBuf.length, n, recvWindow, consumed);
+		}
 		buf[0 .. n] = recvBuf[0 .. n];
 		recvBuf = recvBuf[n .. $];
 		credit(cast(uint) n);

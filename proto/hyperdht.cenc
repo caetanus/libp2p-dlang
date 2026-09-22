@@ -1,0 +1,59 @@
+// hyperdht wire schemas in compact-encoding (holepunchto/hyperdht b4da95c,
+// dht-rpc 2eca6d7). Generated into libp2p.wire.hyperdht by tools/cencgen.
+//
+// Grammar: `message` bodies are ordered items. `flags;` is a leading varint whose
+// bits gate `optional` fields / bare `flag`s (bit given as @N, assigned explicitly —
+// dht-rpc's bits are not in field order). `nonzero` = presence is value != 0 (no
+// has-flag). `trailing` = present iff bytes remain (no bit). `byte 0xNN` is a literal
+// type byte. `array T` = varint count + elements. A message type nests inline.
+
+enum HsCommand { PEER_HANDSHAKE = 0; PEER_HOLEPUNCH = 1; FIND_PEER = 2; LOOKUP = 3; ANNOUNCE = 4; UNANNOUNCE = 5; MUTABLE_PUT = 6; MUTABLE_GET = 7; IMMUTABLE_PUT = 8; IMMUTABLE_GET = 9; }
+enum RpcCommand { PING = 0; PING_NAT = 1; FIND_NODE = 2; DOWN_HINT = 3; DELAYED_PING = 4; }
+
+// lib/messages.js: a peer record — ed25519 key + relay addresses.
+message PeerRecord {
+    fixed32   publicKey;
+    ipv4array relayAddresses;
+}
+
+// lib/messages.js announce: flags-gated, bump is present only when non-zero.
+message Announce {
+    flags;
+    optional PeerRecord peer      @1;
+    optional fixed32    refresh   @2;
+    optional fixed64    signature @4;
+    optional uint       bump      @8 nonzero;
+}
+
+// LOOKUP reply value: count + peer records, then an optional trailing bump.
+message LookupReply {
+    array PeerRecord peers;
+    trailing uint    bump;
+}
+
+// dht-rpc lib/io.js request datagram: [0x03][flags][tid][to]...
+message Request {
+    byte 0x03;
+    flags;
+    uint16 tid;
+    ipv4   to;
+    optional fixed32 id       @1;
+    optional fixed32 token    @2;
+    flag             internal @4;
+    uint             command;
+    optional fixed32 target   @8;
+    optional buffer  value    @16;
+}
+
+// dht-rpc reply datagram: [0x13][flags][tid][to]...
+message Reply {
+    byte 0x13;
+    flags;
+    uint16 tid;
+    ipv4   to;
+    optional fixed32   id          @1;
+    optional fixed32   token       @2;
+    optional ipv4array closerNodes @4;
+    optional uint      error       @8 nonzero;
+    optional buffer    value       @16;
+}

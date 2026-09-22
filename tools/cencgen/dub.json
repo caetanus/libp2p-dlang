@@ -1,0 +1,7 @@
+{
+	"name": "cencgen",
+	"description": "compact-encoding schema (.cenc) -> D codec generator, a Pegged PEG grammar; the hyperdht counterpart of tools/protogen",
+	"targetType": "executable",
+	"targetPath": "bin",
+	"dependencies": { "pegged": "~>0.4" }
+}

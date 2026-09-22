@@ -26,11 +26,81 @@ string negotiateDialer(Stream s, const(string)[] protocols)
 {
 	enforce(protocols.length > 0, "multistream: nothing to propose");
 	s.write(frame(multistreamHeader) ~ frame(protocols[0]));
+	expectHeader(s);
+	return propose(s, protocols, true);
+}
+
+/// Answer proposals until one is in `supported`; return it.
+string negotiateListener(Stream s, const(string)[] supported)
+{
+	writeMessage(s, multistreamHeader);
+	expectHeader(s);
+	return serve(s, supported);
+}
+
+/// The simultaneous-open extension (connections/simopen.md): the id both peers
+/// of a TCP hole punch propose first, since each of them dialed and neither
+/// is the listener the security handshake needs.
+enum simOpenProtocol = "/libp2p/simultaneous-connect";
+
+struct SimOpenResult
+{
+	string protocol;
+	bool initiator; /// we drive the negotiation and the handshake
+}
+
+/// Negotiate as a dialer that may be facing another dialer (a TCP simultaneous
+/// open). Propose the extension first: a listener declines it with `na` and
+/// we go on as the plain dialer. Another dialer echoes it; then both send a
+/// random 64-bit nonce as `select:<n>` and the higher one becomes the
+/// initiator (it proposes, the other serves), so a single side runs each
+/// handshake role. Equal nonces fail the connection, as the spec says.
+SimOpenResult negotiateSimOpen(Stream s, const(string)[] protocols)
+{
+	import std.conv : to;
+	import std.random : uniform;
+	import std.string : startsWith;
+
+	enforce(protocols.length > 0, "multistream: nothing to propose");
+	s.write(frame(multistreamHeader) ~ frame(simOpenProtocol));
+	expectHeader(s);
+	immutable answer = readMessage(s);
+	if (answer == naToken)
+		return SimOpenResult(propose(s, protocols, false), true);
+	enforce(answer == simOpenProtocol, "multistream: unexpected answer '" ~ answer ~ "'");
+
+	immutable ours = uniform!ulong();
+	writeMessage(s, "select:" ~ ours.to!string);
+	// The peer may have pipelined proposals before it saw ours; skip to its nonce.
+	string msg;
+	do
+		msg = readMessage(s);
+	while (!msg.startsWith("select:"));
+	immutable theirs = msg["select:".length .. $].to!ulong;
+	enforce(ours != theirs, "multistream: simultaneous open picked the same nonce");
+	if (ours > theirs)
+	{
+		writeMessage(s, "initiator");
+		enforce(readMessage(s) == "responder", "multistream: peer did not take the responder role");
+		return SimOpenResult(propose(s, protocols, false), true);
+	}
+	writeMessage(s, "responder");
+	enforce(readMessage(s) == "initiator", "multistream: peer did not take the initiator role");
+	return SimOpenResult(serve(s, protocols), false);
+}
+
+private void expectHeader(Stream s)
+{
 	immutable header = readMessage(s);
 	enforce(header == multistreamHeader, "multistream: peer did not send the header, but '" ~ header ~ "'");
+}
+
+// The dialer loop: one proposal at a time, the first already on the wire or not.
+private string propose(Stream s, const(string)[] protocols, bool firstSent)
+{
 	foreach (i, proto; protocols)
 	{
-		if (i > 0)
+		if (i > 0 || !firstSent)
 			writeMessage(s, proto);
 		immutable answer = readMessage(s);
 		if (answer == proto)
@@ -40,12 +110,9 @@ string negotiateDialer(Stream s, const(string)[] protocols)
 	throw new Exception("multistream: no protocol in common");
 }
 
-/// Answer proposals until one is in `supported`; return it.
-string negotiateListener(Stream s, const(string)[] supported)
+// The listener loop: decline until a proposal is supported.
+private string serve(Stream s, const(string)[] supported)
 {
-	writeMessage(s, multistreamHeader);
-	immutable header = readMessage(s);
-	enforce(header == multistreamHeader, "multistream: peer did not send the header, but '" ~ header ~ "'");
 	while (true)
 	{
 		immutable proposal = readMessage(s);

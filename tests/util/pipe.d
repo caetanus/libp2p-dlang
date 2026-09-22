@@ -135,3 +135,41 @@ void runPair(void delegate(Stream) a, void delegate(Stream) b)
 			throw first;
 	});
 }
+
+/// A stream that hands out reads a few bytes at a time — 1, 2, 3, … up to `maxChunk`,
+/// then 1 again — whatever the underlying stream has. Every header and length
+/// field of the protocols above it therefore straddles a read boundary at some
+/// point, which is what a real TCP segmentation does and a memory pipe never does.
+final class TrickleStream : Stream
+{
+	private Stream inner;
+	private size_t maxChunk, next = 1;
+
+	this(Stream inner, size_t maxChunk = 7)
+	{
+		this.inner = inner;
+		this.maxChunk = maxChunk;
+	}
+
+	size_t read(ubyte[] buf)
+	{
+		immutable want = min(buf.length, next);
+		next = next >= maxChunk ? 1 : next + 1;
+		return inner.read(buf[0 .. want]);
+	}
+
+	void write(const(ubyte)[] d)
+	{
+		inner.write(d);
+	}
+
+	void close() nothrow
+	{
+		inner.close();
+	}
+
+	void reset() nothrow
+	{
+		inner.reset();
+	}
+}

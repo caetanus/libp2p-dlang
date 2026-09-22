@@ -137,6 +137,11 @@ private ubyte[] readFrame(Stream s)
 {
 	ubyte[2] len;
 	s.readExact(len[]);
+	version (Libp2pReadTrace)
+	{
+		import core.stdc.stdio : fprintf, stderr;
+		fprintf(stderr, "READTRACE noise frame len=%u\n", cast(uint)((len[0] << 8) | len[1]));
+	}
 	auto body_ = new ubyte[(len[0] << 8) | len[1]];
 	s.readExact(body_);
 	return body_;

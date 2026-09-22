@@ -664,3 +664,64 @@ unittest
 	msg.should.equal("yamux: stream closed by peer");
 }
 
+
+// A 1.3 MB length-prefixed message through noise + yamux while every read of the
+// transport returns 1..7 bytes: each noise length, yamux header and varint
+// straddles a read boundary somewhere along the way. Reported from an Android
+// client: an OutOfMemoryError (a ~size_t.max allocation) 20 ms into such a
+// message, which a size_t underflow on a partial read would produce.
+@("yamux: a 1.3 MB message survives reads that return a few bytes at a time")
+unittest
+{
+	import std.typecons : Nullable;
+	import libp2p.core.peer_id : PeerId;
+	import libp2p.crypto.keys : Keypair;
+	import libp2p.security.noise : NoiseTransport;
+	import tests.util.pipe : TrickleStream;
+
+	enum size = 1_334_630;
+	size_t gotA, gotB;
+	bool contentOk;
+	onLoop({
+		MemStream sa, sb;
+		memPair(sa, sb);
+		scope (exit)
+		{
+			sa.close();
+			sb.close();
+		}
+		auto ka = Keypair.generateEd25519, kb = Keypair.generateEd25519;
+		auto big = new ubyte[size];
+		foreach (i, ref x; big)
+			x = cast(ubyte)(i * 7 + (i >> 8));
+
+		auto ta = spawn({
+			auto sec = new NoiseTransport(ka).secureOutbound(new TrickleStream(sa), Nullable!PeerId.init);
+			auto m = new YamuxConn(sec, true);
+			scope (exit)
+				m.close();
+			auto st = m.open();
+			st.writeLengthPrefixed(big);
+			auto back = st.readLengthPrefixed(2 * size);
+			gotA = back.length;
+			contentOk = back == big;
+			st.close();
+		});
+		auto tb = spawn({
+			auto sec = new NoiseTransport(kb).secureInbound(new TrickleStream(sb));
+			auto m = new YamuxConn(sec, false);
+			scope (exit)
+				m.close();
+			auto st = m.accept();
+			auto msg = st.readLengthPrefixed(2 * size);
+			gotB = msg.length;
+			st.writeLengthPrefixed(msg); // echo it back the same way
+			st.close();
+		});
+		ta.join();
+		tb.join();
+	});
+	gotB.should.equal(size);
+	gotA.should.equal(size);
+	contentOk.should.equal(true);
+}

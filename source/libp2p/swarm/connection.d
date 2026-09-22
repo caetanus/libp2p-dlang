@@ -80,6 +80,13 @@ final class Connection
 
 	private Swarm swarm;
 	private Muxer muxer;
+
+	/// The muxer under this connection — for diagnostics (a transport may expose
+	/// congestion state through it); the stream API is the way to use it.
+	Muxer underlyingMuxer() nothrow
+	{
+		return muxer;
+	}
 	private Lease lease;
 
 	private FiberGroup own; // the inbound loop and the idle timer

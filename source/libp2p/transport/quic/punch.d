@@ -17,7 +17,7 @@ import core.time : Duration, msecs, seconds, MonoTime;
 
 import vibe.core.net : UDPConnection, NetworkAddress, listenUDP, resolveHost;
 import vibe.core.core : runTask, sleep;
-import vibe.core.sync : LocalManualEvent, createManualEvent;
+import vibe.core.sync : LocalManualEvent, createManualEvent, TaskMutex;
 
 import webrtc.stun.message : Message, XorMappedAddress, isStunMessage, bindingRequest,
     bindingSuccess, attrXorMappedAddress, TransactionId;
@@ -49,13 +49,20 @@ final class QuicPunchSocket
     // A waiter for the inbound (server-side) conn from a specific peer.
     private LocalManualEvent _acceptEvent;
     private QuicPump[string] _accepted; // peer addr -> its pump, once accepted
+    private bool[string] _expecting; // peers punchServer is actively waiting for
+    private TaskMutex _sendLock; // one UDP send in flight per socket (eventcore keeps a single write callback)
 
-    this(Keypair identity, string bindHost = "0.0.0.0")
+    /// Fires for an inbound connection that is NOT an expected punch — i.e. this
+    /// socket also serves as the plain QUIC listener when bound to the listen port.
+    void delegate(QuicConnection, NetworkAddress) nothrow onInbound;
+
+    this(Keypair identity, string bindHost = "0.0.0.0", ushort bindPort = 0)
     {
         _identity = identity;
-        _udp = listenUDP(0, bindHost);
+        _udp = listenUDP(bindPort, bindHost); // bindPort 0 = ephemeral (standalone punch/STUN)
         _stunEvent = createManualEvent();
         _acceptEvent = createManualEvent();
+        _sendLock = new TaskMutex;
         runTask(&readLoop);
     }
 
@@ -67,7 +74,11 @@ final class QuicPunchSocket
     // A send delegate bound to one peer (peer BY VALUE, per-pump).
     private void delegate(scope const(ubyte)[]) sender(NetworkAddress peer)
     {
-        return (scope const(ubyte)[] pkt) { auto to = peer; _udp.send(pkt, &to); };
+        return (scope const(ubyte)[] pkt) {
+            auto to = peer;
+            synchronized (_sendLock)
+                _udp.send(pkt, &to);
+        };
     }
 
     // ---- STUN: learn our server-reflexive mapping on this socket ----------------
@@ -117,7 +128,8 @@ final class QuicPunchSocket
             try
             {
                 auto to = serverAddr;
-                _udp.send(encoded, &to);
+                synchronized (_sendLock)
+                    _udp.send(encoded, &to);
             }
             catch (Exception)
             {
@@ -152,6 +164,22 @@ final class QuicPunchSocket
     /// role). Its opening Initial goes out at once; the read loop routes replies.
     QuicPump punchClient(NetworkAddress peer)
     {
+        // Open our NAT toward the peer NOW, before the QUIC/TLS setup below (tens
+        // to hundreds of ms on a slow device): DCUtR timed this moment so that our
+        // first packet leaves our NAT before the peer's first packet reaches it —
+        // a NAT that books unsolicited inbound flows (nf_nat with an accept
+        // policy) would otherwise map our later send to a fresh port. A 1-byte pad
+        // with the fixed bit clear is ignored by the peer's read loop.
+        try
+        {
+            ubyte[1] pad = [0];
+            auto to = peer;
+            synchronized (_sendLock)
+                _udp.send(pad[], &to);
+        }
+        catch (Exception)
+        {
+        }
         auto conn = QuicConnection.dial(_identity, addrBytes(_udp.localAddress), addrBytes(peer));
         auto pump = new QuicPump(conn, sender(peer));
         _pumps[peer.toString()] = pump;
@@ -165,6 +193,12 @@ final class QuicPunchSocket
     QuicPump punchServer(NetworkAddress peer, Duration budget)
     {
         immutable key = peer.toString();
+        // Mark this peer as an EXPECTED punch so the read loop routes its inbound
+        // handshake here (via _accepted) rather than firing onInbound and admitting
+        // it a second time as an ordinary listener connection.
+        _expecting[key] = true;
+        scope (exit)
+            _expecting.remove(key);
         // Keep the NAT mapping toward the peer fresh for the WHOLE window (not just a
         // burst at the start): the dialer may fire seconds later (discovery/clock
         // skew), and its Initial only gets in while our mapping is open.
@@ -174,7 +208,8 @@ final class QuicPunchSocket
             {
                 ubyte[1] p = [0]; // fixed bit clear: skipped by looksLikeQuic
                 auto to = peer;
-                _udp.send(p[], &to);
+                synchronized (_sendLock)
+                    _udp.send(p[], &to);
             }
             catch (Exception)
             {
@@ -237,12 +272,28 @@ final class QuicPunchSocket
                 _pumps[key] = pump;
                 pump.deliver(pkt);
                 auto peerAddr = from;
+                auto inboundConn = conn;
                 runTask(() nothrow {
                     try
                     {
                         pump.waitForHandshake();
-                        _accepted[peerAddr.toString()] = pump;
-                        _acceptEvent.emit();
+                        immutable k = peerAddr.toString();
+                        if (k in _expecting)
+                        {
+                            // An expected punch: hand it to the waiting punchServer.
+                            _accepted[k] = pump;
+                            _acceptEvent.emit();
+                        }
+                        else if (onInbound !is null)
+                            // A plain inbound (this socket is also the listener).
+                            onInbound(inboundConn, peerAddr);
+                        else
+                        {
+                            // No listener wired and nobody waiting: keep the old
+                            // behaviour so a bare punch socket still resolves.
+                            _accepted[k] = pump;
+                            _acceptEvent.emit();
+                        }
                     }
                     catch (Exception)
                     {
@@ -252,6 +303,12 @@ final class QuicPunchSocket
             catch (Exception)
             {
                 // A bad datagram must not kill the socket; drop it and read on.
+                continue;
+            }
+            catch (Error e)
+            {
+                import libp2p.util.fibers : reportTaskError;
+                reportTaskError("quic punch socket read loop", e);
                 continue;
             }
         }

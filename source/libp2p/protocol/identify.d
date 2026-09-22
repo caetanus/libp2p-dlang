@@ -106,6 +106,7 @@ final class IdentifyService : Notifiee
 		host.setStreamHandler(identifyProtocol, &serve);
 		host.setStreamHandler(identifyPushProtocol, &servePush);
 		host.addNotifiee(this);
+		host.addObservedAddrSource(&observedAddrs);
 	}
 
 	/// Tell `peer` that our description changed (new listen address, new
@@ -137,6 +138,11 @@ final class IdentifyService : Notifiee
 
 	/// Addresses peers have reported seeing us at: candidates for our own
 	/// external address.
+	private static bool isRelayed(Connection c)
+	{
+		return c.remoteAddr.components.canFind!(x => x.name == "p2p-circuit");
+	}
+
 	Multiaddr[] observedAddrs()
 	{
 		return observed.dup;
@@ -173,7 +179,10 @@ final class IdentifyService : Notifiee
 		foreach (a; host.addrs)
 			msg.listenAddrs ~= a.encode;
 		msg.protocols = host.protocols;
-		msg.observedAddr = c.remoteAddr.encode;
+		// Over a relay circuit the address we see is the relay's, not the peer's:
+		// reporting it as "observed" would tell the peer it is reachable there.
+		if (!isRelayed(c))
+			msg.observedAddr = c.remoteAddr.encode;
 		msg.protocolVersion = host.config.protocolVersion;
 		msg.agentVersion = host.config.agentVersion;
 		return msg;
@@ -232,7 +241,9 @@ final class IdentifyService : Notifiee
 		host.peerstore.addAddrs(info.peer, info.listenAddrs);
 		host.peerstore.setProtocols(info.peer, info.protocols);
 		host.peerstore.setAgent(info.peer, info.agentVersion);
-		if (!info.observedAddr.isNull && !observed.canFind(info.observedAddr.get))
+		// Likewise inbound: an address a peer observed for us over a circuit is
+		// the relay's public address, never ours to advertise.
+		if (!info.observedAddr.isNull && !isRelayed(c) && !observed.canFind(info.observedAddr.get))
 			observed ~= info.observedAddr.get;
 
 		if (onIdentified !is null)

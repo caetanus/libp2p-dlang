@@ -28,9 +28,9 @@ import std.exception : enforce;
 import std.typecons : Nullable, nullable;
 
 import vibe.core.core : sleep;
-import vibe.core.log : logDebug;
+import vibe.core.log : logDebug, logInfo;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
-import vibe.core.task : InterruptException;
+import vibe.core.task : InterruptException, Task;
 
 import libp2p.core.ending : Ending;
 import libp2p.core.peer_id : PeerId;
@@ -143,13 +143,101 @@ final class Relay : Notifiee, Transport
 		return out_;
 	}
 
-	// Addresses to offer in a DCUtR exchange: our dialable addresses plus any
-	// reflexive webrtc-direct address, so a two-NAT peer has a candidate to punch to.
+	// Addresses to offer in a DCUtR exchange: our dialable addresses, any
+	// reflexive (STUN) address a capable transport gathered, and — for the raw
+	// transports — our observed public IP paired with each listen port, the
+	// address a TCP simultaneous open must aim at. Explicit setObservedAddrs
+	// replaces all of it.
 	private ubyte[][] punchAddrs()
 	{
-		auto out_ = advertised();
-		foreach (a; host.reflexiveAddrs())
+		ubyte[][] out_;
+		foreach (a; dcutrAddrs())
 			out_ ~= a.encode;
+		return out_;
+	}
+
+	/// The addresses this node offers a peer to punch to (what punchAddrs encodes).
+	///
+	/// The libp2p-standard punch candidate is identify's Observed-Address + reuseport:
+	/// a peer never needs to know its own IP — whoever it connected to already saw its
+	/// public source IP:port and reported it via identify's `observedAddr`. So the
+	/// PRIMARY candidate is that observed public IP paired with each of our listen
+	/// ports (a port-preserving / cone NAT maps the listener to the same external
+	/// port — the go-libp2p reuseport recipe). Behind a VPN the observed IP is the
+	/// tunnel exit's PUBLIC address (what the relay saw), which is exactly the punch
+	/// target — never the local 100.84.x tunnel IP, and no STUN round-trip. The STUN
+	/// server-reflexive address is a last-resort FALLBACK, offered only when identify
+	/// gave us no public address at all (so Android with the VPN down never depends on
+	/// STUN). Explicit setObservedAddrs replaces all of it.
+	Multiaddr[] dcutrAddrs()
+	{
+		Multiaddr[] out_;
+		void add(Multiaddr a)
+		{
+			if (!out_.canFind(a))
+				out_ ~= a;
+		}
+		if (observed.length > 0)
+		{
+			foreach (raw; observed)
+				add(Multiaddr.decode(raw));
+			return out_; // an explicit override is exactly what we offer
+		}
+
+		bool haveDirectPublic = false;
+		auto observedSeen = host.observedAddrs();
+		// PRIMARY (libp2p standard): the public IP a peer OBSERVED us at, paired with
+		// each of our listen ports. The port identify saw is the ephemeral source of
+		// that outbound connection, not our listener's, so we keep the listener's port
+		// and full transport suffix — for EVERY transport (/tcp/P, /udp/P/quic-v1,
+		// /udp/P/webrtc-direct/certhash/…, /udp/P/quic-v1/webtransport/…), not just TCP.
+		foreach (seen; observedSeen)
+		{
+			auto sc = seen.components;
+			if (sc.length == 0 || (sc[0].name != "ip4" && sc[0].name != "ip6"))
+				continue;
+			if (sc.canFind!(c => c.name == "p2p-circuit"))
+				continue;
+			if (!isRoutable(seen))
+				continue; // a VPN tunnel / private observation is not punchable
+			immutable ipText = "/" ~ sc[0].name ~ "/" ~ sc[0].text;
+			foreach (l; host.addrs)
+			{
+				auto lc = l.components;
+				if (lc.length < 2 || lc[0].name != sc[0].name)
+					continue; // observed IP's family must match this listener's
+				if (lc[1].name != "tcp" && lc[1].name != "udp")
+					continue; // need a real port to reuse
+				string rest;
+				foreach (c; lc[1 .. $])
+					rest ~= "/" ~ c.name ~ (c.protocol.size != 0 ? "/" ~ c.text : "");
+				try
+				{
+					add(Multiaddr.parse(ipText ~ rest));
+					haveDirectPublic = true;
+				}
+				catch (Exception)
+				{
+				}
+			}
+		}
+		// Also offer any directly-routable listen address (a genuinely public
+		// listener, the no-NAT case). 0.0.0.0 / loopback / VPN-tunnel listeners are
+		// real but not reachable there, so isRoutable drops them.
+		foreach (a; host.addrs)
+			if (isRoutable(a))
+			{
+				add(a);
+				haveDirectPublic = true;
+			}
+		// FALLBACK ONLY: the STUN server-reflexive address, used solely when identify
+		// and our listeners gave us no public address at all. This keeps the
+		// proactive-gather machinery as a safety net rather than the primary path (and
+		// off the critical path on Android with the VPN down).
+		if (!haveDirectPublic)
+			foreach (a; host.reflexiveAddrs())
+				if (isRoutable(a))
+					add(a);
 		return out_;
 	}
 
@@ -187,26 +275,32 @@ final class Relay : Notifiee, Transport
 		// The side that dialed through the relay is the DCUtR initiator; the side
 		// that accepted answers in serveDcutr. A direct connection (including the
 		// one a punch just made) is not relayed, so it never re-triggers this.
-		if (!autoHolePunch || c.role != Endpoint.dialer)
-			return;
 		if (!c.remoteAddr.components.canFind!(x => x.name == "p2p-circuit"))
 			return;
-		auto peer = c.remotePeer;
-		if (peer in autoPunching)
-			return; // already upgrading this peer
-		autoPunching[peer] = true;
-		fibers.spawn({
-			scope (exit)
-				autoPunching.remove(peer);
-			try
-				holePunch(peer);
-			catch (InterruptException)
-			{
-			} // shutting down
-			catch (Exception e)
-				logDebug("libp2p: auto-DCUtR to %s did not complete: %s",
-					peer.toString, e.msg); // the relayed link stays as the fallback
-		});
+		// Spawn the auto-punch FIRST, so nothing after it can keep it from firing.
+		if (autoHolePunch && c.role == Endpoint.dialer && c.remotePeer !in autoPunching)
+		{
+			auto peer = c.remotePeer;
+			autoPunching[peer] = true;
+			fibers.spawn({
+				scope (exit)
+					autoPunching.remove(peer);
+				try
+					holePunch(peer);
+				catch (InterruptException)
+				{
+				} // shutting down
+				catch (Exception e)
+					logDebug("libp2p: auto-DCUtR to %s did not complete: %s",
+						peer.toString, e.msg); // the relayed link stays as the fallback
+			});
+		}
+		// Then, strictly additive: nudge our server-reflexive address warm so a
+		// DCUtR offer carries a public candidate (behind a VPN the tunnel IP is
+		// filtered out). warmReflexiveAddrs() is nothrow and non-blocking, and the
+		// srflx is already warming since listen(), so this can never abort or delay
+		// the punch above — even with STUN unreachable (VPN down / no internet).
+		host.warmReflexiveAddrs();
 	}
 
 	/// A reservation asks to be reachable through this link; when the link
@@ -445,6 +539,58 @@ final class Relay : Notifiee, Transport
 		return host.swarm.admitOutbound(raw, nullable(dst));
 	}
 
+	/// The rendezvous end to end: meet `dst` through `relay`, hole-punch, and hand
+	/// back the DIRECT connection. The relay is only where the two met — the
+	/// relayed connection is closed once the direct one is up (or the punch
+	/// fails), so nothing opened later can ride the circuit's small byte budget
+	/// by accident. Throws when no direct path formed: direct or nothing.
+	Connection connectDirect(PeerId relay, PeerId dst)
+	{
+		connectVia(relay, dst);
+		return ensureDirect(dst);
+	}
+
+	/// The direct connection to `peer`, punching one if all we have is relayed.
+	/// Returns an existing direct connection as is; otherwise runs DCUtR (or waits
+	/// for the auto-DCUtR already in flight), closes the relayed connection(s) and
+	/// returns the direct one. Throws if none formed — and the relayed connection is
+	/// closed then too: the relay was the meeting point, not the pipe.
+	Connection ensureDirect(PeerId peer)
+	{
+		if (auto c = directConnection(peer))
+			return c;
+		scope (exit)
+			foreach (c; host.swarm.connectionsTo(peer))
+				if (isRelayed(c))
+					c.close();
+		if (peer in autoPunching)
+		{
+			// connected() is already punching this peer; let that finish.
+			immutable deadline = MonoTime.currTime + host.swarm.config.dialTimeout
+				+ host.swarm.config.handshakeTimeout;
+			while (peer in autoPunching && MonoTime.currTime < deadline)
+				sleep(20.msecs);
+		}
+		else
+			holePunch(peer);
+		if (auto c = directConnection(peer))
+			return c;
+		throw new Exception("dcutr: no direct connection to " ~ peer.toString);
+	}
+
+	private Connection directConnection(PeerId peer)
+	{
+		foreach (c; host.swarm.connectionsTo(peer))
+			if (!isRelayed(c) && !c.isClosed)
+				return c;
+		return null;
+	}
+
+	private static bool isRelayed(Connection c)
+	{
+		return c.remoteAddr.components.canFind!(x => x.name == "p2p-circuit");
+	}
+
 	private RawConn openCircuit(PeerId relay, PeerId dst)
 	{
 		auto c = host.connect(relay);
@@ -459,6 +605,15 @@ final class Relay : Notifiee, Transport
 		auto reply = HopMessage.decode(s.readLengthPrefixed(maxRelayMessage));
 		enforce(reply.type == HopMessage.Type.STATUS && reply.hasStatus, "relay: malformed reply");
 		enforce(reply.status == Status.OK, "relay: circuit refused: " ~ statusName(reply.status));
+		// A limited-relay-v2 voucher caps the circuit: once `data` bytes have crossed
+		// (or `duration` elapses) the relay tears the circuit down. Public relays hand
+		// out tiny budgets (~128 KiB) meant only to bootstrap a direct upgrade, so a
+		// data transfer over one dies mid-file — log the budget to make that visible.
+		if (reply.hasLimit)
+			logInfo("libp2p: circuit to %s via %s is LIMITED: %s bytes / %s s",
+				dst.toString, relay.toString, reply.limit.data, reply.limit.duration);
+		else
+			logInfo("libp2p: circuit to %s via %s advertised no limit", dst.toString, relay.toString);
 		auto remote = c.remoteAddr ~ Multiaddr.parse("/p2p/" ~ relay.toBase58 ~ "/p2p-circuit/p2p/" ~ dst.toBase58);
 		return new StreamRawConn(s, c.localAddr, remote);
 	}
@@ -553,18 +708,127 @@ final class Relay : Notifiee, Transport
 	PeerId holePunch(PeerId peer)
 	{
 		auto res = holePunchExchange(peer);
+		logInfo("libp2p: dcutr with %s: rtt %s, their addrs [%s], ours [%s]", peer.toString, res.rtt,
+			addrList(res.peerAddrs), addrList(punchAddrs()));
 		sleep(res.rtt / 2);
 		Exception last;
-		foreach (raw; res.peerAddrs)
-		{
-			try
-				return dialOrPunch(raw, peer, true).remotePeer; // initiator: the DTLS client
-			catch (InterruptException e)
-				throw e; // the hole punch was cancelled, not this address failing
-			catch (Exception e)
-				last = e;
-		}
+		if (auto c = punchAll(res.peerAddrs, peer, true, last)) // initiator: the DTLS client
+			return c.remotePeer;
+		// Our connect can lose to the peer's: when its SYN reaches our listener first
+		// (same LAN, no NAT in between) the kernel accepts it there, and our own dial
+		// from that port then fails on the taken 4-tuple. The direct connection is
+		// still forming — inbound, through the ordinary accept path — so wait for it.
+		if (auto c = awaitDirect(peer, host.swarm.config.handshakeTimeout))
+			return c.remotePeer;
 		throw new Exception("dcutr: no direct address of " ~ peer.toString ~ " answered", last);
+	}
+
+	/// Punch every candidate at once — reflexive (STUN) addresses first, since
+	/// they are the ones a NAT'd peer can actually be reached at — and keep the
+	/// first connection that comes up; the rest are interrupted. Both sides do
+	/// this, so their sends overlap on every candidate pair: punched one at a
+	/// time with 15 s timeouts, the only real candidate came up 20 s after the
+	/// peer had already stopped punching. `last` receives a failure to blame.
+	private Connection punchAll(const(ubyte[][]) raws, PeerId peer, bool asDialer, out Exception last)
+	{
+		import vibe.core.core : runTask;
+		import vibe.core.task : Task;
+
+		auto ordered = orderCandidates(raws);
+		auto race = new PunchRace;
+		race.changed = createManualEvent();
+		foreach (raw; ordered)
+			race.tasks ~= runTask((PunchRace r, ubyte[] a, PeerId p, bool dialer) nothrow {
+				Connection c;
+				Exception failure;
+				try
+					c = dialOrPunch(a, p, dialer);
+				catch (InterruptException)
+				{
+				}
+				catch (Exception e)
+					failure = e;
+				if (c !is null && (r.done || r.winner !is null))
+				{
+					c.close(); // one direct connection is enough
+					c = null;
+				}
+				if (r.done)
+					return;
+				if (c !is null)
+					r.winner = c;
+				else if (failure !is null)
+				{
+					r.last = failure;
+					try
+						logInfo("libp2p: dcutr punch%s of %s failed: %s", dialer ? "" : "-back",
+							addrList([a]), causeChain(failure));
+					catch (Exception)
+					{
+					}
+				}
+				r.finished++;
+				try
+					r.changed.emit();
+				catch (Exception)
+				{
+				}
+			}, race, raw.dup, peer, asDialer);
+		try
+		{
+			while (race.winner is null && race.finished < race.tasks.length)
+			{
+				auto ec = race.changed.emitCount;
+				race.changed.wait(ec);
+			}
+		}
+		finally
+		{
+			race.done = true;
+			auto me = Task.getThis();
+			foreach (t; race.tasks)
+				if (t != me && t.running)
+					t.interrupt();
+		}
+		last = race.last;
+		return race.winner;
+	}
+
+	// Reflexive/punchable addresses (quic-v1, webrtc-direct) first, then the rest.
+	// What the peer offers is its call (on one LAN, or in a test, that is loopback);
+	// only our own offer is filtered, in dcutrAddrs.
+	private static ubyte[][] orderCandidates(const(ubyte[][]) raws)
+	{
+		ubyte[][] first, rest;
+		foreach (raw; raws)
+		{
+			Multiaddr a;
+			try
+				a = Multiaddr.decode(raw);
+			catch (Exception)
+				continue;
+			if (a.components.canFind!(c => c.name == "quic-v1" || c.name == "webrtc-direct"))
+				first ~= raw.dup;
+			else
+				rest ~= raw.dup;
+		}
+		return first ~ rest;
+	}
+
+	/// A pooled, non-relayed connection to `peer`, waiting up to `budget` for one
+	/// to be admitted.
+	private Connection awaitDirect(PeerId peer, Duration budget)
+	{
+		immutable deadline = MonoTime.currTime + budget;
+		while (true)
+		{
+			foreach (c; host.swarm.connectionsTo(peer))
+				if (!c.remoteAddr.components.canFind!(x => x.name == "p2p-circuit"))
+					return c;
+			if (MonoTime.currTime >= deadline)
+				return null;
+			sleep(20.msecs);
+		}
 	}
 
 	/// The other side: answer with our addresses, then dial theirs at once.
@@ -574,25 +838,122 @@ final class Relay : Notifiee, Transport
 			s.close();
 		auto theirs = respondHolePunch(s, punchAddrs());
 		auto peer = c.remotePeer;
+		logInfo("libp2p: dcutr from %s: their addrs [%s], ours [%s]", peer.toString, addrList(theirs),
+			addrList(punchAddrs()));
 		punches++;
 		fibers.spawn({
 			scope (exit)
 				punches--;
-			foreach (raw; theirs)
-			{
-				try
-				{
-					dialOrPunch(raw, peer, false); // responder: the DTLS server
-					return;
-				}
-				catch (InterruptException e)
-					throw e; // the punch fiber is being stopped, not this address failing
-				catch (Exception)
-				{
-				} // the next address may work; if none does, the relayed connection stays
-			}
+			Exception last;
+			punchAll(theirs, peer, false, last); // responder: the DTLS server; if none lands, the relayed connection stays
 		});
 	}
+}
+
+/// Shared state of one concurrent punch (see Relay.punchAll): heap-owned so a
+/// late punch task never touches a frame that is gone.
+private final class PunchRace
+{
+	Connection winner;
+	Exception last;
+	size_t finished;
+	Task[] tasks;
+	bool done;
+	LocalManualEvent changed;
+}
+
+/// An address a peer could conceivably reach us at: not unspecified, not
+/// loopback, not link-local. A listener on 0.0.0.0 is real, its address is not.
+private bool isRoutable(const Multiaddr a)
+{
+	import std.string : startsWith;
+
+	auto c = a.components;
+	if (c.length == 0)
+		return false;
+	if (c[0].name == "ip4")
+	{
+		immutable ip = c[0].text;
+		if (ip == "0.0.0.0" || ip.startsWith("127.") || ip.startsWith("169.254."))
+			return false;
+		// RFC1918 private ranges: 10/8, 172.16/12, 192.168/16.
+		if (ip.startsWith("10.") || ip.startsWith("192.168."))
+			return false;
+		if (ip.startsWith("172."))
+		{
+			immutable o2 = ip4Octet(ip, 1);
+			if (o2 >= 16 && o2 <= 31)
+				return false;
+		}
+		// CGNAT / RFC 6598: 100.64.0.0/10 — only 100.64.x–100.127.x (100.0–63 and
+		// 100.128+ are public). The WireGuard tunnel range that leaked into the
+		// punch list; a naive startsWith("100.") would wrongly reject public IPs.
+		if (ip.startsWith("100."))
+		{
+			immutable o2 = ip4Octet(ip, 1);
+			if (o2 >= 64 && o2 <= 127)
+				return false;
+		}
+		return true;
+	}
+	if (c[0].name == "ip6")
+	{
+		import std.uni : toLower;
+
+		immutable ip = c[0].text;
+		if (ip == "::" || ip == "::1" || ip.startsWith("fe80:"))
+			return false;
+		// ULA fc00::/7 — first hextet begins fc.. or fd.. (not publicly routed).
+		immutable lo = ip.length >= 2 ? ip[0 .. 2].toLower : ip;
+		if (lo == "fc" || lo == "fd")
+			return false;
+		return true;
+	}
+	return true; // dns, circuit, …: let the dial decide
+}
+
+// The n-th (0-based) dotted-decimal octet of an ip4 text, or -1 if malformed.
+private int ip4Octet(string ip, size_t n) nothrow
+{
+	import std.array : split;
+	import std.conv : to;
+
+	try
+	{
+		auto parts = ip.split('.');
+		if (n >= parts.length)
+			return -1;
+		return parts[n].to!int;
+	}
+	catch (Exception)
+		return -1;
+}
+
+// Multiaddrs for a log line; an undecodable one shows as its byte count.
+private string addrList(const(ubyte[][]) raws)
+{
+	import std.conv : to;
+
+	string out_;
+	foreach (i, raw; raws)
+	{
+		if (i)
+			out_ ~= ", ";
+		try
+			out_ ~= Multiaddr.decode(raw).toString;
+		catch (Exception)
+			out_ ~= "<" ~ raw.length.to!string ~ " bytes>";
+	}
+	return out_;
+}
+
+// An exception and everything it was thrown because of, innermost last.
+private string causeChain(Throwable e)
+{
+	string out_;
+	for (Throwable t = e; t !is null; t = t.next)
+		out_ ~= (out_.length ? " <- " : "") ~ t.msg;
+	return out_;
 }
 
 private string statusName(Status s)

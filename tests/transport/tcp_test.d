@@ -158,3 +158,18 @@ unittest
 	got.length.should.equal(300);
 	got[299].should.equal(cast(ubyte) 43);
 }
+
+// A socket that already went away has no address family; asking vibe for its
+// port then ASSERTS — an Error out of a fiber, which took a whole application
+// down when an inbound connection reset before it was admitted. It must be the
+// ordinary "connection closed" instead.
+@("tcp: an address of a vanished socket is a closed-connection error, not an assert")
+unittest
+{
+	import vibe.core.net : NetworkAddress;
+	import libp2p.transport.tcp : toMultiaddr;
+	import libp2p.core.ending : ConnClosed;
+
+	NetworkAddress none; // family unset, as a closed socket reports it
+	({ toMultiaddr(none); }).should.throwException!ConnClosed;
+}

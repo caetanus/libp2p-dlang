@@ -8,11 +8,21 @@ module libp2p.transport.quic.udp;
 
 version (Libp2pQuic):
 
-import core.time : Duration;
+import core.time : Duration, seconds;
+import vibe.core.core : sleep;
+
+private bool quicTraceOn() nothrow @trusted
+{
+    import core.stdc.stdlib : getenv;
+    static int cached = -1;
+    if (cached < 0)
+        cached = getenv("LIBP2P_QUIC_TRACE") !is null ? 1 : 0;
+    return cached == 1;
+}
 
 import vibe.core.net : UDPConnection, NetworkAddress, listenUDP;
 import vibe.core.core : runTask, createTimer, Timer;
-import vibe.core.sync : LocalManualEvent, createManualEvent;
+import vibe.core.sync : LocalManualEvent, createManualEvent, TaskMutex;
 
 import libp2p.crypto.keys : Keypair;
 import libp2p.transport.quic.connection : QuicConnection;
@@ -33,6 +43,7 @@ final class QuicPump
     private Timer _timer;
     private LocalManualEvent _handshakeEvent;
     private bool _closed;
+    private bool _flushing, _flushAgain; // one flusher at a time (see serviceOut)
 
     this(QuicConnection conn, void delegate(scope const(ubyte)[]) send)
     {
@@ -42,6 +53,28 @@ final class QuicPump
         _timer = createTimer(() @trusted nothrow { onTimer(); });
         // A stream write nudges us to flush immediately (same fiber, synchronous).
         _conn.onWantWrite = () @trusted nothrow { serviceOutNothrow(); };
+        // LIBP2P_QUIC_TRACE=1: ngtcp2's congestion/RTT/loss counters for this
+        // connection every 3 s on stderr — the numbers to read when a link is slow.
+        if (quicTraceOn())
+            runTask(() nothrow {
+                try
+                {
+                    import core.stdc.stdio : fprintf, stderr;
+                    while (!_closed)
+                    {
+                        sleep(3.seconds);
+                        if (_closed)
+                            break;
+                        auto st = _conn.stats();
+                        fprintf(stderr, "QUICTRACE cwnd=%llu ssthresh=%llu inflight=%llu srtt=%llums sent=%llu lost=%llu\n",
+                            cast(ulong) st.cwnd, cast(ulong) st.ssthresh, cast(ulong) st.inflight,
+                            cast(ulong)(st.srttUs / 1000), cast(ulong) st.pktSent, cast(ulong) st.pktLost);
+                    }
+                }
+                catch (Exception)
+                {
+                }
+            });
     }
 
     /// Send whatever is pending now (e.g. a client's opening Initial).
@@ -82,11 +115,31 @@ final class QuicPump
     }
 
     // Drain outbound packets, re-arm the loss/idle timer, signal handshake done.
+    // Exactly one fiber flushes at a time: a send can block on a full socket
+    // buffer (a bulk stream write), and while it waits the reader or the timer
+    // would re-enter here — into an ngtcp2 conn mid-write, and into a second
+    // concurrent UDP send, which eventcore does not survive. A late comer just
+    // asks the flusher to go round again.
     private void serviceOut()
     {
         if (_closed)
             return;
-        _conn.collectOutgoing((scope const(ubyte)[] pkt) { _send(pkt); });
+        if (_flushing)
+        {
+            _flushAgain = true;
+            return;
+        }
+        _flushing = true;
+        scope (exit)
+            _flushing = false;
+        do
+        {
+            _flushAgain = false;
+            _conn.collectOutgoing((scope const(ubyte)[] pkt) { _send(pkt); });
+        }
+        while (_flushAgain && !_closed);
+        if (_closed)
+            return;
         immutable due = _conn.timeout();
         if (due == Duration.max)
             _timer.stop();
@@ -126,11 +179,13 @@ final class QuicClient
     private QuicConnection _conn;
     private QuicPump _pump;
     private NetworkAddress _peer;
+    private TaskMutex _sendLock;
 
     this(Keypair identity, NetworkAddress peer, string bindHost = "127.0.0.1")
     {
         _peer = peer;
         _udp = listenUDP(0, bindHost); // ephemeral local
+        _sendLock = new TaskMutex;
         _conn = QuicConnection.dial(identity, addrBytes(_udp.localAddress), addrBytes(peer));
         _pump = new QuicPump(_conn, &send);
         runTask(&readLoop);
@@ -145,7 +200,8 @@ final class QuicClient
     private void send(scope const(ubyte)[] pkt)
     {
         auto to = _peer;
-        _udp.send(pkt, &to);
+        synchronized (_sendLock)
+            _udp.send(pkt, &to);
     }
 
     private void readLoop() nothrow
@@ -161,6 +217,12 @@ final class QuicClient
             }
             catch (Exception)
             {
+                break;
+            }
+            catch (Error e)
+            {
+                import libp2p.util.fibers : reportTaskError;
+                reportTaskError("quic udp read loop", e);
                 break;
             }
         }
@@ -190,10 +252,12 @@ final class QuicListener
     private UDPConnection _udp;
     private QuicPump[string] _pumps; // keyed by source address
     private Keypair _identity;
+    private TaskMutex _sendLock; // one send in flight on the shared socket
     void delegate(QuicConnection, NetworkAddress) nothrow onAccept;
 
     this(Keypair identity, ushort port, string bindHost = "127.0.0.1")
     {
+        _sendLock = new TaskMutex;
         _identity = identity;
         _udp = listenUDP(port, bindHost);
         runTask(&readLoop);
@@ -208,7 +272,11 @@ final class QuicListener
     // its own address (a loop-local would be shared across iterations).
     private void delegate(scope const(ubyte)[]) sender(NetworkAddress peer)
     {
-        return (scope const(ubyte)[] pkt) { auto to = peer; _udp.send(pkt, &to); };
+        return (scope const(ubyte)[] pkt) {
+            auto to = peer;
+            synchronized (_sendLock)
+                _udp.send(pkt, &to);
+        };
     }
 
     private void readLoop() nothrow
@@ -247,6 +315,12 @@ final class QuicListener
             }
             catch (Exception)
             {
+                break;
+            }
+            catch (Error e)
+            {
+                import libp2p.util.fibers : reportTaskError;
+                reportTaskError("quic udp read loop", e);
                 break;
             }
         }

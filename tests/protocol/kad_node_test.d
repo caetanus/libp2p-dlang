@@ -152,7 +152,7 @@ unittest
 		scope (exit)
 			a.close();
 		a.kad.addAddress(b.id, b.addr);
-		announced = a.kad.startProviding(provKey) >= 1;
+		announced = a.kad.startProviding(provKey, null, /*allowPrivate: a loopback DHT*/ true) >= 1;
 
 		// ADD_PROVIDER is fire-and-forget; give B's server a beat to store it.
 		sleep(50.msecs);
@@ -264,4 +264,68 @@ unittest
 	});
 	tableSize.should.be.greaterThan(0UL);
 	allDiscovered.should.equal(true); // every peer R knew, A now knows too
+}
+
+// A provider record goes to the public DHT: LAN, loopback and unspecified
+// addresses must not be in it, however they got into the list.
+@("kad: provider records carry only publicly routable addresses")
+unittest
+{
+	import libp2p.protocol.kad.kad : isPubliclyRoutable;
+
+	isPubliclyRoutable(Multiaddr.parse("/ip4/192.168.0.60/tcp/4001")).should.equal(false);
+	isPubliclyRoutable(Multiaddr.parse("/ip4/10.0.0.5/udp/1/quic-v1")).should.equal(false);
+	isPubliclyRoutable(Multiaddr.parse("/ip4/172.20.1.1/tcp/1")).should.equal(false);
+	isPubliclyRoutable(Multiaddr.parse("/ip4/172.32.1.1/tcp/1")).should.equal(true);
+	isPubliclyRoutable(Multiaddr.parse("/ip4/100.78.1.1/tcp/1")).should.equal(false);
+	isPubliclyRoutable(Multiaddr.parse("/ip4/0.0.0.0/tcp/1")).should.equal(false);
+	isPubliclyRoutable(Multiaddr.parse("/ip4/127.0.0.1/tcp/1")).should.equal(false);
+	isPubliclyRoutable(Multiaddr.parse("/ip4/181.233.106.5/udp/46935/quic-v1")).should.equal(true);
+	isPubliclyRoutable(Multiaddr.parse("/ip4/62.238.38.245/tcp/4001/p2p/12D3KooWKnBCjFscTLLqFZArCZw3TBTxhXDt7UcoLwRZz6e3aHqh/p2p-circuit")).should.equal(true);
+	isPubliclyRoutable(Multiaddr.parse("/ip6/fe80::1/tcp/1")).should.equal(false);
+}
+
+// The whole entrance from a key, inside the lib: A announces under the key the
+// two sides derive from their secret, G (which only knows the bootstrap B) meets
+// A by that key alone — no PeerId, no address in G's hands — and gets a direct,
+// authenticated connection back.
+@("rendezvous: meetUnder reaches the peer that announced under the shared key")
+unittest
+{
+	import libp2p.discovery.rendezvous : rendezvousKeyFor, announceUnder, meetUnder;
+	import libp2p.protocol.relay.service : Relay;
+	import core.time : seconds;
+
+	PeerId met, expected;
+	string via;
+	onLoop({
+		auto b = makeNode();
+		scope (exit)
+			b.close();
+		auto a = makeNode();
+		scope (exit)
+			a.close();
+		auto g = makeNode();
+		scope (exit)
+			g.close();
+		auto ra = new Relay(a.host), rg = new Relay(g.host);
+		scope (exit)
+		{
+			ra.close();
+			rg.close();
+		}
+		a.kad.addAddress(b.id, b.addr);
+		g.kad.addAddress(b.id, b.addr);
+		a.kad.bootstrap();
+		g.kad.bootstrap();
+		auto key = rendezvousKeyFor("pw", cast(const(ubyte)[]) "the pairing token");
+		(announceUnder(a.kad, key, a.host.addrs, /*loopback DHT*/ true) >= 1).should.equal(true);
+		expected = a.id;
+		auto c = meetUnder(g.host, g.kad, rg, key, 10.seconds);
+		met = c.remotePeer;
+		via = c.remoteAddr.toString;
+	});
+	(met == expected).should.equal(true);
+	via.should.contain("/ip4/127.0.0.1/tcp/");
+	rendezvousKeyFor("pw", cast(const(ubyte)[]) "x").length.should.equal(36);
 }

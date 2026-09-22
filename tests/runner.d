@@ -16,6 +16,8 @@ int main(string[] args)
 
 	return args.runTests!(
 		"tests.harness_test",
+		"tests.wire.cenc_test",
+		"tests.wire.hyperdht_test",
 		"tests.core.ending_test",
 		"tests.util.select_test",
 		"tests.multiformats.varint_test",
@@ -25,7 +27,7 @@ int main(string[] args)
 		"tests.multiformats.multiaddr_test",
 		"tests.crypto.keys_test",
 		"tests.crypto.keytypes_test",
-		"tests.core.peer_id_test",
+		"tests.core.peer_id_test", "tests.core.upgrade_test",
 		"tests.transport.tcp_test",
 		"tests.transport.ws_test",
 		"tests.multistream.select_test",

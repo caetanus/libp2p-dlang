@@ -28,7 +28,7 @@ import std.random : uniform;
 import std.socket : AddressFamily;
 import std.typecons : Nullable, nullable;
 
-import vibe.core.core : sleep;
+import vibe.core.core : runTask, sleep;
 import vibe.core.log : logDebug;
 import vibe.core.net;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
@@ -130,6 +130,9 @@ final class WebRtcTransport : CapableTransport
 	private UDPConnection punchSock; /// held open so a hole punch reuses the mapping
 	private Multiaddr punchAddr; /// our gathered srflx webrtc-direct address
 	private bool punchGathered;
+	private bool punchWarming; /// a background srflx-warming loop is running
+	private MonoTime punchGatheredAt;
+	private enum srflxMaxAge = 25.seconds;
 	private UdpMux punchMux; /// the single persistent mux on punchSock every punch shares
 
 	this(Keypair identity, WebRtcConfig cfg = WebRtcConfig.init)
@@ -185,12 +188,18 @@ final class WebRtcTransport : CapableTransport
 		import std.conv : to;
 		import core.time : msecs;
 
-		if (punchGathered)
+		// A NAT forgets an idle UDP mapping in 30-120 s: a gathered address is only
+		// good while its mapping lives, so re-gather a stale one (on the SAME socket,
+		// so the mapping is refreshed rather than replaced). Once a punch has put
+		// the mux on the socket the socket cannot be read here any more; the punch
+		// traffic itself keeps that mapping alive.
+		if (punchGathered && (punchMux !is null || MonoTime.currTime - punchGatheredAt < srflxMaxAge))
 			return punchAddr;
 		punchGathered = true;
 		try
 		{
-			punchSock = listenUDP(0, "0.0.0.0");
+			if (punchSock == UDPConnection.init)
+				punchSock = listenUDP(0, "0.0.0.0");
 			immutable port = punchSock.localAddress.port;
 			immutable local = TransportAddr("0.0.0.0", port);
 			auto pwd = randomUfrag() ~ randomUfrag() ~ randomUfrag();
@@ -228,6 +237,7 @@ final class WebRtcTransport : CapableTransport
 					punchAddr = Multiaddr.parse("/ip4/" ~ srflx.front.address ~ "/udp/"
 							~ srflx.front.port.to!string ~ "/webrtc-direct/certhash/"
 							~ multibaseEncode(fingerprint().toMultihash.encode));
+					punchGatheredAt = MonoTime.currTime;
 					return punchAddr;
 				}
 
@@ -247,6 +257,32 @@ final class WebRtcTransport : CapableTransport
 		{
 		}
 		return punchAddr; // Multiaddr.init if nothing answered
+	}
+
+	/// Begin warming our reflexive webrtc-direct address in the BACKGROUND so a
+	/// DCUtR offer reads a cached srflx instead of blocking on STUN. Idempotent,
+	/// non-blocking and nothrow — it must never abort or stall the notifiee /
+	/// connection path that nudges it; an unreachable STUN round (VPN down) is
+	/// swallowed and retried on the next cadence.
+	void startReflexive() nothrow
+	{
+		if (punchWarming)
+			return;
+		punchWarming = true;
+		try
+			runTask(() nothrow {
+				try
+					for (;;)
+					{
+						reflexiveAddr();
+						sleep(20.seconds);
+					}
+				catch (Exception)
+				{
+				}
+			});
+		catch (Exception)
+			punchWarming = false; // spawning failed; let a later call try again
 	}
 
 	// --- dialing ---------------------------------------------------------------------------

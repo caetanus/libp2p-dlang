@@ -16,7 +16,8 @@ import std.format : format;
 import std.range : empty, front;
 import std.socket : AddressFamily;
 import std.typecons : Nullable;
-import core.time : seconds;
+import core.time : MonoTime, msecs, seconds;
+import vibe.core.core : runTask, sleep;
 
 import vibe.core.net : NetworkAddress, resolveHost;
 
@@ -57,9 +58,12 @@ final class QuicTransport : CapableTransport
         try
         {
             auto c = Multiaddr(addr.bytes.dup).components;
+            // A /webtransport address rides QUIC but speaks HTTP/3 + certhashes — not
+            // ours to dial as plain quic-v1.
             return c.canFind!(x => x.name == "quic-v1")
                 && c.canFind!(x => x.name == "udp")
-                && c.canFind!(x => x.name == "ip4" || x.name == "ip6");
+                && c.canFind!(x => x.name == "ip4" || x.name == "ip6")
+                && !c.canFind!(x => x.name == "webtransport");
         }
         catch (Exception)
             return false;
@@ -108,16 +112,24 @@ final class QuicTransport : CapableTransport
         auto bind = toUdpAddress(c);
         auto ipText = c.find!(x => x.name == "ip4" || x.name == "ip6").front.text;
 
-        auto listener = new QuicListener(_identity, bind.port, ipText);
-        _listeners ~= listener;
-        listener.onAccept = (QuicConnection conn, NetworkAddress from) nothrow {
+        // ONE UDP socket does listen + hole-punch + STUN (the go-libp2p / quic-go
+        // single-PacketConn model): every path shares one NAT mapping, so the address
+        // we advertise (observed IP paired with THIS listen port) is exactly the
+        // mapping our punch egresses from. A separate ephemeral punch socket would
+        // fire from a different source port than the one the peer was told to aim at,
+        // and the two simultaneous-open packets would never meet. `listen()` runs at
+        // startup before any dial/punch, so it is the one that binds the shared socket.
+        if (_punchSock is null)
+            _punchSock = new QuicPunchSocket(_identity, ipText, bind.port);
+        auto sock = _punchSock;
+        sock.onInbound = (QuicConnection conn, NetworkAddress from) nothrow {
             try
             {
                 UpgradedConn up;
                 up.muxer = conn;
-                up.remotePeer = conn.remotePeerId(); // onAccept fires post-handshake
+                up.remotePeer = conn.remotePeerId(); // fires post-handshake
                 up.remotePeer.tryPublicKey(up.remoteKey);
-                up.localAddr = toQuicMultiaddr(listener.localAddress);
+                up.localAddr = toQuicMultiaddr(sock.localAddress);
                 up.remoteAddr = toQuicMultiaddr(from);
                 onInbound(up);
             }
@@ -125,7 +137,8 @@ final class QuicTransport : CapableTransport
             {
             }
         };
-        return toQuicMultiaddr(listener.localAddress);
+        startReflexive(); // warm our srflx on THIS socket from node start
+        return toQuicMultiaddr(sock.localAddress);
     }
 
     /// Our server-reflexive /quic-v1 address, gathered once via STUN on a socket
@@ -133,21 +146,82 @@ final class QuicTransport : CapableTransport
     /// if no STUN server answered.
     Multiaddr reflexiveAddr()
     {
-        if (_gathered)
-            return _reflexive;
-        _gathered = true;
+        // The gather is fully async (startReflexive's background task); we never run
+        // STUN inline here. Once warmed — the common case, since listen() starts the
+        // gather at boot — _gathered is set and we return the cache at once. A cold
+        // or direct caller (a diagnostic, the first punch before warming lands) gets
+        // a brief COOPERATIVE wait for the first round; it is bounded, so unreachable
+        // STUN (VPN down, no internet) returns empty instead of hanging, and it yields
+        // to the event loop rather than blocking the thread.
+        startReflexive();
+        for (int i = 0; i < 30 && !_gathered; i++)
+            try
+                sleep(100.msecs);
+            catch (Exception)
+                break; // no event loop to yield to: hand back whatever we have
+        return _reflexive;
+    }
+
+    /// Begin gathering our server-reflexive address in the BACKGROUND, refreshing
+    /// it on a keepalive cadence — so a DCUtR offer reads a warm cache instead of
+    /// blocking on STUN, and so the address exists BEFORE the first punch, not only
+    /// during one (the punch socket is otherwise created lazily by a punch itself).
+    /// Idempotent, non-blocking and nothrow: called eagerly on listen() and again
+    /// when a relayed connection forms (a punch is imminent), it must never abort or
+    /// stall those paths. A failed/unreachable STUN round (e.g. VPN down, no
+    /// internet on Android) is swallowed and simply retried. A NAT forgets an idle
+    /// UDP mapping in 30-120 s (a CGNAT sooner), so the same-socket STUN round every
+    /// 20 s both refreshes the mapping and keeps the cached address current.
+    void startReflexive() nothrow
+    {
+        if (_keepalive)
+            return;
+        _keepalive = true;
+        try
+            runTask(() nothrow {
+                try
+                    for (;;)
+                    {
+                        if (!_gathered || MonoTime.currTime - _gatheredAt >= srflxMaxAge)
+                            gather();
+                        sleep(20.seconds);
+                    }
+                catch (Exception)
+                {
+                }
+            });
+        catch (Exception)
+            _keepalive = false; // spawning failed; let a later call try again
+    }
+
+    private enum srflxMaxAge = 25.seconds;
+    private MonoTime _gatheredAt;
+    private bool _keepalive;
+    private bool _gathering;
+
+    // One STUN round on the punch socket; a failed round keeps the last answer.
+    private void gather() nothrow
+    {
+        if (_gathering)
+            return; // one STUN transaction on the shared punch socket at a time
+        _gathering = true;
+        scope (exit)
+            _gathering = false;
         try
         {
             if (_punchSock is null)
                 _punchSock = new QuicPunchSocket(_identity);
             auto srflx = _punchSock.gatherReflexive(_cfg.stunServers, 2.seconds);
             if (!srflx.isNull)
+            {
                 _reflexive = toQuicMultiaddr(srflx.get);
+                _gathered = true;
+                _gatheredAt = MonoTime.currTime;
+            }
         }
         catch (Exception)
         {
         }
-        return _reflexive;
     }
 
     /// Punch a direct QUIC connection to `remote` at its reflexive address, reusing

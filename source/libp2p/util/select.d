@@ -64,6 +64,12 @@ size_t select(void delegate()[] alternatives...)
 				return; // a loser being told to stop; not a finish
 			catch (Exception e)
 				err = e;
+			catch (Error e)
+			{
+				import libp2p.util.fibers : reportTaskError;
+				reportTaskError("select alternative", e);
+				err = new Exception("libp2p: internal error: " ~ e.msg);
+			}
 			if (winner == size_t.max)
 			{
 				winner = idx;
@@ -111,6 +117,12 @@ void waitAll(void delegate()[] alternatives...)
 			}
 			catch (Exception e)
 				errs[idx] = e;
+			catch (Error e)
+			{
+				import libp2p.util.fibers : reportTaskError;
+				reportTaskError("waitAll branch", e);
+				errs[idx] = new Exception("libp2p: internal error: " ~ e.msg);
+			}
 		}, i, alt);
 	}
 

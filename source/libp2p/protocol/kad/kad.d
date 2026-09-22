@@ -16,7 +16,10 @@ module libp2p.protocol.kad.kad;
 
 import core.time : Duration, MonoTime, seconds, hours, minutes, msecs;
 import std.algorithm.searching : canFind;
+import std.algorithm.iteration : filter;
+import std.array : array;
 import std.exception : enforce;
+import std.typecons : Nullable, nullable;
 
 import vibe.core.core : sleep;
 import vibe.core.log : logDebug;
@@ -37,8 +40,65 @@ public import libp2p.protocol.kad.store;
 import libp2p.protocol.kad.jobs;
 import libp2p.protocol.kad.message : KadMessage, KadPeer, MessageType, ConnectionType;
 private alias WireRecord = imported!"libp2p.protocol.kad.message".Record;
+import libp2p.protocol.kad.key : Key, Distance;
 import libp2p.protocol.kad.query;
 import libp2p.protocol.kad.table;
+
+/// Reachable from another network: not unspecified, loopback, link-local or
+/// RFC 1918 / ULA private. A /dns* or /p2p-circuit address is taken as public.
+bool isPubliclyRoutable(const Multiaddr a)
+{
+	import std.string : startsWith, split;
+	import std.conv : to;
+
+	auto c = a.components;
+	if (c.length == 0)
+		return false;
+	if (c[0].name == "ip4")
+	{
+		immutable ip = c[0].text;
+		if (ip == "0.0.0.0" || ip.startsWith("127.") || ip.startsWith("169.254.") || ip.startsWith("10."))
+			return false;
+		if (ip.startsWith("192.168."))
+			return false;
+		if (ip.startsWith("172."))
+		{
+			auto parts = ip.split(".");
+			if (parts.length > 1)
+				try
+				{
+					immutable second = parts[1].to!int;
+					if (second >= 16 && second <= 31)
+						return false;
+				}
+				catch (Exception)
+				{
+				}
+		}
+		if (ip.startsWith("100."))
+		{
+			auto parts = ip.split(".");
+			if (parts.length > 1)
+				try
+				{
+					immutable second = parts[1].to!int;
+					if (second >= 64 && second <= 127)
+						return false; // CGNAT shared space (RFC 6598): not ours to advertise
+				}
+				catch (Exception)
+				{
+				}
+		}
+		return true;
+	}
+	if (c[0].name == "ip6")
+	{
+		import std.string : toLower;
+		immutable ip = c[0].text.toLower;
+		return !(ip == "::" || ip == "::1" || ip.startsWith("fe80:") || ip.startsWith("fc") || ip.startsWith("fd"));
+	}
+	return true;
+}
 
 /// A peer and where to reach it.
 struct PeerInfo
@@ -49,7 +109,7 @@ struct PeerInfo
 
 struct KademliaConfig
 {
-	size_t parallelism = 3; /// α
+	size_t parallelism = 10; /// α — go-libp2p's default; 3 made a public lookup crawl
 	size_t replicationFactor = kValue; /// k
 	Duration queryTimeout = 60.seconds;
 	Duration requestTimeout = 10.seconds;
@@ -57,6 +117,10 @@ struct KademliaConfig
 	Duration recordTtl = 36.hours;
 	Duration providerTtl = 48.hours;
 	MemoryStoreConfig store;
+	/// Client mode: query the DHT (lookups, providers, records) but never serve it —
+	/// no stream handler, so peers cannot put us in their tables or store on us. For
+	/// a phone or any node behind a NAT that only needs to find others.
+	bool clientMode = false;
 }
 
 final class Kademlia
@@ -77,7 +141,8 @@ final class Kademlia
 		fibers = new FiberGroup((Exception e) nothrow {
 			logDebug("libp2p: kad background work failed: %s", e.msg);
 		});
-		host.setStreamHandler(kadProtocolId, &serve);
+		if (!cfg.clientMode)
+			host.setStreamHandler(kadProtocolId, &serve);
 		notifier = new Notifier(this);
 		host.addNotifiee(notifier);
 	}
@@ -192,15 +257,42 @@ final class Kademlia
 	}
 
 	/// Announce that we provide `key`; returns how many peers took the announcement.
-	size_t startProviding(const(ubyte)[] key)
+	/// `addrs` is what the announcement tells others to dial — a node behind a NAT
+	/// passes its relay circuit addresses here (host.addrs, the default, are the
+	/// listen addresses: fine for a public node, useless for one nobody can reach).
+	/// A rendezvous is exactly this: provide a key both peers derive, the other side
+	/// asks getProviders for it and gets our id and these addresses back.
+	size_t startProviding(const(ubyte)[] key, Multiaddr[] addrs = null, bool allowPrivate = false)
 	{
+		auto ours = addrs.length ? addrs : host.addrs;
+		// A provider record lives on the public DHT: a LAN, loopback or unspecified
+		// address in it is noise to everyone else and a leak of our inside network.
+		// Circuits (relay's public address) and public addresses stay.
+		if (!allowPrivate)
+			ours = ours.filter!(a => isPubliclyRoutable(a)).array;
+		enforce(ours.length > 0, "kad: no publicly routable address to provide (pass allowPrivate for a LAN-only DHT)");
 		auto rk = RecordKey.from(key);
-		auto rec = ProviderRecord(rk, host.id, host.addrs);
+		auto rec = ProviderRecord(rk, host.id, ours);
 		rec.hasExpires = true;
 		rec.expires = MonoTime.currTime + cfg.providerTtl;
 		store.addProvider(rec);
 		auto closest = lookup(Key.fromBytes(key), (PeerId p) => findNode(p, key));
-		return writeTo(closest, (PeerId p) { sendAddProvider(p, key); });
+		return writeTo(closest, (PeerId p) { sendAddProvider(p, key, ours); });
+	}
+
+	/// Where the network says `peer` can be reached: the peerstore first, then a
+	/// closest-peers lookup for its id (a peer that serves the DHT turns up in the
+	/// tables with its addresses). Null if nobody knows it — a peer behind a NAT
+	/// that does not serve the DHT is found through a provider key instead.
+	Nullable!PeerInfo findPeer(PeerId peer)
+	{
+		auto known = host.peerstore.addrs(peer);
+		if (known.length)
+			return nullable(PeerInfo(peer, known));
+		foreach (pi; getClosestPeers(peer.bytes))
+			if (pi.peerId == peer && pi.addrs.length)
+				return nullable(pi);
+		return Nullable!PeerInfo.init;
 	}
 
 	void stopProviding(const(ubyte)[] key)
@@ -208,26 +300,44 @@ final class Kademlia
 		store.removeProvider(RecordKey.from(key), host.id);
 	}
 
-	/// Who provides `key`: the first answer with providers ends the search.
+	/// Who provides `key`. The lookup runs to the k closest peers — where the
+	/// latest announcement landed — not to the first answer: a peer far from the
+	/// key may still hold an earlier copy of the record with addresses the provider
+	/// has since left (a relay it no longer sits behind). When several peers name
+	/// the same provider, the addresses from the one closest to the key win.
 	PeerInfo[] getProviders(const(ubyte)[] key)
 	{
 		auto rk = RecordKey.from(key);
-		PeerInfo[] providers;
+		auto target = Key.fromBytes(key);
+		PeerInfo[PeerId] found;
+		Distance[PeerId] bestDist;
+		PeerId[] order;
 		foreach (p; store.providers(rk))
-			providers ~= PeerInfo(p.provider, p.addresses);
-		bool done;
-		cast(void) lookup(Key.fromBytes(key), (PeerId p) {
+		{
+			found[p.provider] = PeerInfo(p.provider, p.addresses); // our own copy: any network answer beats it
+			order ~= p.provider;
+		}
+		cast(void) lookup(target, (PeerId p) {
 			auto reply = request(p, message(MessageType.getProviders, key));
+			auto d = Key.fromPeer(p).distance(target);
 			foreach (kp; reply.providerPeers)
-				if (!providers.canFind!(x => x.peerId == kp.nodeId))
+			{
+				if (kp.nodeId !in found)
+					order ~= kp.nodeId;
+				auto known = kp.nodeId in bestDist;
+				if (known is null || d < *known)
 				{
-					providers ~= PeerInfo(kp.nodeId, kp.multiaddrs);
-					if (kp.multiaddrs.length > 0)
-						host.peerstore.addAddrs(kp.nodeId, kp.multiaddrs);
-					done = true;
+					found[kp.nodeId] = PeerInfo(kp.nodeId, kp.multiaddrs);
+					bestDist[kp.nodeId] = d;
 				}
+				if (kp.multiaddrs.length > 0)
+					host.peerstore.addAddrs(kp.nodeId, kp.multiaddrs);
+			}
 			return remember(p, reply);
-		}, () => done);
+		});
+		PeerInfo[] providers;
+		foreach (id; order)
+			providers ~= found[id];
 		return providers;
 	}
 
@@ -276,7 +386,7 @@ final class Kademlia
 					try
 					{
 						auto closest = lookup(Key.fromBytes(rec.key.bytes), (PeerId q) => findNode(q, rec.key.bytes));
-						writeTo(closest, (PeerId q) { sendAddProvider(q, rec.key.bytes); });
+						writeTo(closest, (PeerId q) { sendAddProvider(q, rec.key.bytes, rec.addresses); });
 					}
 					catch (InterruptException e)
 						throw e; // the owner is stopping us; not a failed record
@@ -341,13 +451,15 @@ final class Kademlia
 
 	private KadMessage request(PeerId peer, KadMessage msg)
 	{
-		auto c = host.connect(peer);
 		KadMessage reply;
-		// Open the stream INSIDE the deadline: a real DHT peer that accepts the
-		// connection but stalls the multistream negotiation (or never answers)
-		// would otherwise block here forever — and the query only checks its
-		// deadline between requests, so one stuck peer hangs the whole lookup.
+		// Dial AND open the stream inside the deadline: a public DHT peer advertises
+		// half a dozen addresses (v6, quic, webtransport, …), each unreachable one
+		// costing a full dial timeout in sequence — a lookup over such peers took
+		// minutes with the dial outside the budget. And a peer that accepts the
+		// connection but stalls the negotiation would otherwise block forever; the
+		// query only checks its deadline between requests.
 		withTimeout(cfg.requestTimeout, "kad request", {
+			auto c = host.connect(peer);
 			auto s = c.newStream(kadProtocolId);
 			scope (exit)
 				s.close();
@@ -367,13 +479,13 @@ final class Kademlia
 		enforce(reply.type == MessageType.putValue, "kad: the peer did not acknowledge the record");
 	}
 
-	private void sendAddProvider(PeerId peer, const(ubyte)[] key)
+	private void sendAddProvider(PeerId peer, const(ubyte)[] key, Multiaddr[] addrs)
 	{
 		auto msg = message(MessageType.addProvider, key);
-		msg.providerPeers = [KadPeer(host.id, host.addrs, ConnectionType.connected)];
-		auto c = host.connect(peer);
+		msg.providerPeers = [KadPeer(host.id, addrs, ConnectionType.connected)];
 		withTimeout(cfg.requestTimeout, "kad add provider", {
-			auto s = c.newStream(kadProtocolId); // inside the deadline (see request)
+			auto c = host.connect(peer); // dial inside the deadline too (see request)
+			auto s = c.newStream(kadProtocolId);
 			scope (exit)
 				s.close();
 			s.writeLengthPrefixed(msg.encode);

@@ -42,6 +42,16 @@ void readExact(Stream s, ubyte[] buf)
 	while (buf.length > 0)
 	{
 		immutable n = s.read(buf);
+		version (Libp2pReadTrace)
+		{
+			import core.stdc.stdio : fprintf, stderr;
+			if (n == 0 || n > buf.length)
+				fprintf(stderr, "READTRACE readExact ANOMALY: buf=%zu -> n=%zu\n", buf.length, n);
+		}
+		// A read returns 1..buf.length bytes or throws; anything else is a broken
+		// stream, and slicing by it would run off the end (a size_t underflow that
+		// then asks the GC for ~size_t.max bytes) or spin forever.
+		enforce(n > 0 && n <= buf.length, "stream: read returned an impossible count");
 		buf = buf[n .. $];
 	}
 }

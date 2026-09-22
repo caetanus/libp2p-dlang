@@ -13,3 +13,4 @@
 
 # rust interop peer build output
 /interop/rust-peer/target/
+tools/cencgen/bin/

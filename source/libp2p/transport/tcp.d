@@ -100,7 +100,16 @@ final class TcpConn : RawConn
 			immutable avail = conn.leastSize; // blocks; 0 means the peer is done
 			if (avail == 0)
 				throw new EndOfStream("tcp: peer closed the connection");
-			return conn.read(buf[0 .. min(buf.length, avail)], IOMode.once);
+			immutable want = min(buf.length, avail);
+			immutable n = conn.read(buf[0 .. want], IOMode.once);
+			version (Libp2pReadTrace)
+			{
+				import core.stdc.stdio : fprintf, stderr;
+				if (n == 0 || n > want)
+					fprintf(stderr, "READTRACE tcp read ANOMALY: buf=%zu avail=%zu want=%zu -> n=%zu\n",
+						buf.length, avail, want, n);
+			}
+			return n;
 		}
 		catch (Ending e)
 			throw e;
@@ -224,6 +233,11 @@ NetworkAddress toNetworkAddress(const Multiaddr addr)
 
 Multiaddr toMultiaddr(NetworkAddress na)
 {
+	// A socket that already went away reports no address family at all; vibe
+	// then ASSERTS in port() — an Error, which takes the whole process down from
+	// inside a fiber. Make it the ordinary "connection closed" the callers handle.
+	if (na.family != AddressFamily.INET && na.family != AddressFamily.INET6)
+		throw new ConnClosed("tcp: the connection has no address (already closed)");
 	immutable ip = na.toAddressString;
 	immutable proto = na.family == AddressFamily.INET6 ? "ip6" : "ip4";
 	return Multiaddr.parse(format("/%s/%s/tcp/%d", proto, ip, na.port));
