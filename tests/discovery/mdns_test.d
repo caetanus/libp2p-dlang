@@ -183,3 +183,27 @@ unittest
 	LanRendezvous.line(["id=x", "udx=4601"], "udx").should.equal("4601");
 	LanRendezvous.line(["id=x"], "udx").should.equal(null);
 }
+
+@("mdns rendezvous: a webrtc-direct listener is announced with its certhash and dialed back from it")
+unittest
+{
+	import libp2p.core.peer_id : PeerId;
+	import libp2p.host.host : Host;
+	import std.socket : InternetAddress;
+	import vibe.core.net : NetworkAddress;
+
+	auto h = Host.create();
+	immutable id = h.id.toBase58;
+	immutable hash = "uEiD5E0rkIhz1P9ldayh2A_zgw50UJme9JU1kNfDMyh6kRg";
+	auto from = NetworkAddress(new InternetAddress("192.168.0.60", 5353));
+	PeerId who;
+	auto addrs = MdnsRendezvous.addrsFrom(from, ["id=" ~ id, "tcp=43169", "webrtc=43170/" ~ hash],
+		PeerId.init, who);
+	string[] texts;
+	foreach (a; addrs)
+		texts ~= a.toString;
+	texts.should.contain("/ip4/192.168.0.60/udp/43170/webrtc-direct/certhash/" ~ hash ~ "/p2p/" ~ id);
+	texts.should.contain("/ip4/192.168.0.60/tcp/43169/p2p/" ~ id);
+	// malformed lines are skipped, never fatal
+	MdnsRendezvous.addrsFrom(from, ["id=" ~ id, "webrtc=43170", "webrtc=/x"], PeerId.init, who).length.should.equal(0);
+}

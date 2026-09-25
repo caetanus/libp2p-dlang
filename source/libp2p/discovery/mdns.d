@@ -1272,6 +1272,11 @@ struct MdnsRendezvousConfig
 	MdnsBeaconConfig beacon;
 	bool announce = true; /// answer queries with our id + ports (the desktop); false = browse only
 	size_t maxConcurrentDials = 4; /// LAN answers dialed at once; more wait for the next announce
+	/// A query goes out on every interface, so one peer answers once per path — some of
+	/// them dead (a down Docker bridge, a firewalled one). The first answer opens a short
+	/// window in which the others are gathered; then ONE dial races all of them (the swarm
+	/// staggers them), and the live path wins instead of waiting out each dead one in turn.
+	Duration gatherWindow = 300.msecs;
 }
 
 /// The libp2p flavor's lines on a LanRendezvous: announces `id=<PeerId>` and one
@@ -1285,6 +1290,7 @@ final class MdnsRendezvous
 	private LanRendezvous lan;
 	private MdnsRendezvousConfig cfg;
 	private bool[PeerId] dialing;
+	private Multiaddr[][PeerId] gathered; // answers collected in the window, per peer being dialed
 	private FiberGroup fibers; // the dials, owned: close() stops and joins them
 	private string[] delegate() source; // what we registered on the rendezvous, to take back
 	private bool closed;
@@ -1319,10 +1325,13 @@ final class MdnsRendezvous
 
 	/// What the announcer says: `id=<peer id>` and one `<transport>=<port>` per listen
 	/// address — `tcp=4001`, `quic=4001` (udp/quic-v1), `ws=4001` (tcp + ws). Ports
-	/// only: the address is where the answer comes from, whatever we listen on.
+	/// only: the address is where the answer comes from, whatever we listen on. A
+	/// webrtc-direct listener also needs its DTLS certificate hash to be dialed:
+	/// `webrtc=4002/<multibase certhash>` (about 50 characters, well inside a TXT string).
 	static string[] txtsFor(Host host)
 	{
 		import std.conv : to;
+		import std.string : indexOf;
 
 		string[] out_ = ["id=" ~ host.id.toBase58];
 		foreach (a; host.addrs)
@@ -1332,6 +1341,22 @@ final class MdnsRendezvous
 				continue;
 			immutable port = (cast(uint) c[1].value[0] << 8) | c[1].value[1];
 			string kind;
+			if (c[1].name == "udp" && c.canFind!(x => x.name == "webrtc-direct"))
+			{
+				// the certhash component's multibase text, as it prints in the multiaddr
+				immutable text = a.toString;
+				immutable at = text.indexOf("/certhash/");
+				if (at < 0)
+					continue;
+				auto hash = text[at + "/certhash/".length .. $];
+				immutable slash = hash.indexOf('/');
+				if (slash >= 0)
+					hash = hash[0 .. slash];
+				immutable w = "webrtc=" ~ port.to!string ~ "/" ~ hash;
+				if (!out_.canFind(w))
+					out_ ~= w;
+				continue;
+			}
 			if (c[1].name == "udp" && c.canFind!(x => x.name == "quic-v1"))
 				kind = "quic";
 			else if (c[1].name == "tcp" && c.canFind!(x => x.name == "ws"))
@@ -1374,6 +1399,15 @@ final class MdnsRendezvous
 				tail = "/tcp/" ~ t[4 .. $];
 			else if (t.startsWith("ws="))
 				tail = "/tcp/" ~ t[3 .. $] ~ "/ws";
+			else if (t.startsWith("webrtc="))
+			{
+				import std.string : indexOf;
+				immutable v = t[7 .. $];
+				immutable slash = v.indexOf('/');
+				if (slash <= 0 || slash + 1 >= v.length)
+					continue;
+				tail = "/udp/" ~ v[0 .. slash] ~ "/webrtc-direct/certhash/" ~ v[slash + 1 .. $];
+			}
 			else
 				continue;
 			try
@@ -1394,21 +1428,71 @@ final class MdnsRendezvous
 		catch (Exception)
 		{
 		}
-		if (closed || addrs.length == 0 || who in dialing)
+		if (closed || addrs.length == 0)
 			return;
+		if (who in dialing)
+		{
+			// another path of a peer being dialed: it joins the window's dial, or — once that
+			// race has started — the next one, if the race fails
+			if (auto g = who in gathered)
+				foreach (a; addrs)
+					if (!(*g).canFind(a))
+						*g ~= a;
+			return;
+		}
 		immutable dialCap = cfg.maxConcurrentDials < 1 ? 1 : cfg.maxConcurrentDials; // 0 would block all discovery
 		if (dialing.length >= dialCap)
 			return; // bounded fan-out: a flood of answers is not a flood of dials; it re-offers itself
 		dialing[who] = true;
+		gathered[who] = addrs;
 		try
 			fibers.spawn({
 				scope (exit)
+				{
 					dialing.remove(who);
+					gathered.remove(who);
+				}
 				// A new path to a peer we may already talk to elsewhere (WAN): open it
 				// too — the application decides which connection carries what.
 				try
 				{
-					auto c = host.connectFresh(who, addrs);
+					if (cfg.gatherWindow > Duration.zero)
+						sleep(cfg.gatherWindow);
+					Multiaddr[] tried;
+					Connection c;
+					// Race what was gathered. Answers that arrive while it runs are kept, and if
+					// it fails, the new ones get a race of their own straight away (a live path
+					// answering late must not wait for the next query round). Bounded rounds.
+					foreach (round; 0 .. 4)
+					{
+						Multiaddr[] next;
+						foreach (a; gathered[who])
+							if (!tried.canFind(a))
+								next ~= a;
+						if (next.length == 0)
+							break;
+						tried ~= next;
+						try
+						{
+							c = host.connectFresh(who, next);
+							break;
+						}
+						catch (InterruptException e)
+							throw e;
+						catch (Exception e)
+						{
+							bool more;
+							foreach (a; gathered[who])
+								if (!tried.canFind(a))
+									more = true;
+							if (!more)
+								throw e;
+							logInfo("libp2p: mdns rendezvous: %s: %s — trying the paths that answered meanwhile",
+								who.toString, e.msg);
+						}
+					}
+					if (c is null)
+						return;
 					logInfo("libp2p: mdns rendezvous: %s reached on the LAN via %s", who.toString, c.remoteAddr.toString);
 					if (onConnected !is null)
 						onConnected(who, c);
