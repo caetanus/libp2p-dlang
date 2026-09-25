@@ -130,7 +130,10 @@ int main(string[] args)
                     writeln("holding the connection idle for ", hold, " s"); stdout.flush();
                     sleep(hold.seconds);
                 }
-                result = 0;
+                // `result` stays 1 until every stream is acked (set at the very end): a run cut
+                // short — an exception, or SIGTERM/SIGINT stopping the event loop mid-burn —
+                // must not exit 0.
+                bool failed, ctrlFailed;
                 Stream cs;
                 bool ctrlRun = ctrl;
                 ulong ctrlPings, ctrlMaxMs, ctrlSumMs;
@@ -151,7 +154,11 @@ int main(string[] args)
                                 immutable ms = (MonoTime.currTime - tp).total!"msecs";
                                 ctrlPings++; ctrlSumMs += ms; if (ms > ctrlMaxMs) ctrlMaxMs = ms;
                             }
-                        catch (Exception) {}
+                        catch (Exception)
+                        {
+                            if (ctrlRun)
+                                ctrlFailed = true;   // died mid-burn, not the shutdown below
+                        }
                     });
                 }
                 foreach (i; 0 .. streams)
@@ -180,20 +187,26 @@ int main(string[] args)
                     else
                     {
                         writeln("BURN FAIL stream ", i + 1, ": no ack");
-                        result = 1;
+                        failed = true;
                     }
                     stdout.flush();
                 }
                 running = false;
                 ctrlRun = false;
                 if (ctrl)
-                    writeln("CTRL: ", ctrlPings, " pings on the control stream during the burn, mean ", ctrlPings ? ctrlSumMs / ctrlPings : 0, " ms, max ", ctrlMaxMs, " ms");
+                    writeln("CTRL: ", ctrlPings, " pings on the control stream during the burn, mean ", ctrlPings ? ctrlSumMs / ctrlPings : 0, " ms, max ", ctrlMaxMs, " ms",
+                        ctrlFailed ? " — FAILED (the control stream died mid-burn)" : "");
                 stdout.flush();
+                result = failed || ctrlFailed ? 1 : 0;
                 client.close();
             }
         }
         catch (Exception e)
         {
+            // Any exception (a closed connection, open() after an idle close) is a failed run.
+            // `result` only becomes 0 after every stream is acked, so this is belt-and-braces
+            // for an exception thrown after that point (a failed flush/close of a passed run).
+            result = 1;
             try stderr.writeln("quic-burn error: ", e.msg); catch (Exception) {}
         }
         try exitEventLoop(); catch (Exception) {}
