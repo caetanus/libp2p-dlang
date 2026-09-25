@@ -20,7 +20,7 @@ import vibe.core.core : sleep, runTask;
 import vibe.core.log : logDebug, logInfo;
 import vibe.core.net;
 import std.socket : AddressFamily;
-import vibe.core.task : InterruptException;
+import vibe.core.task : InterruptException, Task;
 
 import libp2p.core.peer_id : PeerId;
 import libp2p.host.host;
@@ -546,6 +546,7 @@ final class MdnsBeacon
 	private UDPConnection sock;
 	private NetworkAddress target;
 	private UDPConnection[string] egress; // per interface (by ip): multicast leaves through it
+	private Task[string] egressReader;    // the reader of each egress socket (unicast answers)
 	private bool[string] joined; // "index@ip" -> group joined on the receive socket (an index reused for a new address rejoins)
 	private MonoTime[string] recentlyFound; // "host|txts" -> when: one onFound per answer per 5 s
 	private enum size_t maxRecentlyFound = 512; // bounded: evicted by age, then by size
@@ -606,12 +607,25 @@ final class MdnsBeacon
 		try
 		{
 			sock.close();
-			foreach (e; egress)
+			// by ref: a UDPConnection copy holds its own reference, so closing a foreach COPY
+			// left the stored handle — and its socket — open until the GC ran (a beacon per
+			// rebuilt rendezvous lingered). Close the stored handles, then drop them.
+			foreach (ref e; egress)
 				e.close();
+			egress = null;
+			egressReader = null; // stopAll above already interrupted and joined them
 		}
 		catch (Exception)
 		{
 		}
+	}
+
+	// A reader for one egress socket, in its own frame: spawned from refreshInterfaces'
+	// loop, a closure there would share `e` with the next iteration.
+	private Task spawnReader(UDPConnection sock)
+	{
+		auto e = sock; // a local: a parameter with a destructor cannot be captured by a closure
+		return fibers.spawn({ receiveOn(e); });
 	}
 
 	/// Multi-homed: the receive socket joins the group on EVERY IPv4 interface, and
@@ -648,8 +662,24 @@ final class MdnsBeacon
 		foreach (ip; egress.keys)
 			if (ip !in live)
 			{
+				// Stop the reader FIRST: it holds its own copy of the UDPConnection (a copy is a
+				// reference), so closing the stored one alone neither wakes its recv nor frees
+				// the socket — the reader and socket lingered until the whole beacon closed.
+				if (auto r = ip in egressReader)
+				{
+					if (*r != Task.getThis())
+					{
+						try
+							r.interrupt();
+						catch (Exception)
+						{
+						}
+						r.joinUninterruptible();
+					}
+					egressReader.remove(ip);
+				}
 				try
-					egress[ip].close(); // its reader's recv throws and the fiber ends
+					egress[ip].close();
 				catch (Exception)
 				{
 				}
@@ -693,7 +723,7 @@ final class MdnsBeacon
 					egress[i.ip] = e;
 					// A unicast answer to a query we sent from this socket comes back HERE,
 					// not to the group socket — so this one is read too.
-					fibers.spawn({ receiveOn(e); });
+					egressReader[i.ip] = spawnReader(e);
 				}
 				catch (Exception e)
 					logDebug("libp2p: mdns beacon has no egress socket on %s: %s", i.name, e.msg);
