@@ -35,7 +35,9 @@ private Node makeNode(HostConfig cfg = HostConfig.init)
 {
 	auto h = Host.create(cfg);
 	h.listen(Multiaddr.parse("/ip4/127.0.0.1/tcp/0"));
-	return Node(h, new Relay(h));
+	auto r = new Relay(h);
+	r.allowLoopbackCandidates = true; // these punches happen on loopback
+	return Node(h, r);
 }
 
 private bool waitUntil(bool delegate() cond, Duration limit = 5.seconds)

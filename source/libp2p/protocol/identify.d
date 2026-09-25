@@ -12,7 +12,7 @@
  */
 module libp2p.protocol.identify;
 
-import core.time : Duration, seconds;
+import core.time : Duration, MonoTime, seconds, minutes;
 import std.algorithm.searching : canFind;
 import std.exception : enforce;
 import std.typecons : Nullable;
@@ -91,7 +91,20 @@ final class IdentifyService : Notifiee
 	private Host host;
 	private IdentifyConfig cfg;
 	private FiberGroup fibers;
-	private Multiaddr[] observed;
+	// What peers observed us at, kept PER CONNECTION: at most a few addresses per
+	// connection, a bounded number of connections, each observation aging out and
+	// all of a connection's gone when it closes. A peer pushing a new address in
+	// every identify-push can therefore neither grow this without bound nor
+	// leave anything behind once it is disconnected.
+	private static struct Observation
+	{
+		Multiaddr[] addrs;
+		MonoTime at;
+	}
+	private Observation[string] observedBy; // by connection
+	enum size_t maxObservedPerConn = 4;
+	enum size_t maxObservedConns = 64;
+	enum observationTtl = 30.minutes;
 
 	/// Called after a peer's identity was received, verified and stored.
 	void delegate(IdentifyInfo info) onIdentified;
@@ -145,7 +158,53 @@ final class IdentifyService : Notifiee
 
 	Multiaddr[] observedAddrs()
 	{
-		return observed.dup;
+		Multiaddr[] out_;
+		immutable now = MonoTime.currTime;
+		foreach (ob; observedBy)
+		{
+			if (now - ob.at > observationTtl)
+				continue;
+			foreach (a; ob.addrs)
+				if (!out_.canFind(a))
+					out_ ~= a;
+		}
+		return out_;
+	}
+
+	private static string connKey(Connection c)
+	{
+		import std.format : format;
+		return format("%x", cast(size_t) cast(void*) c);
+	}
+
+	private void observe(Connection c, Multiaddr a)
+	{
+		immutable key = connKey(c);
+		auto ob = key in observedBy;
+		if (ob is null)
+		{
+			if (observedBy.length >= maxObservedConns)
+			{
+				// Room for this connection: the connection observed longest ago goes.
+				string oldest;
+				MonoTime oldestAt;
+				foreach (k, o; observedBy)
+					if (oldest is null || o.at < oldestAt)
+					{
+						oldest = k;
+						oldestAt = o.at;
+					}
+				observedBy.remove(oldest);
+			}
+			observedBy[key] = Observation();
+			ob = key in observedBy;
+		}
+		ob.at = MonoTime.currTime;
+		if (ob.addrs.canFind(a))
+			return;
+		if (ob.addrs.length >= maxObservedPerConn)
+			ob.addrs = ob.addrs[1 .. $]; // the newest observation replaces the oldest
+		ob.addrs ~= a;
 	}
 
 	void connected(Connection c)
@@ -153,8 +212,9 @@ final class IdentifyService : Notifiee
 		fibers.spawn({ identify(c); });
 	}
 
-	void disconnected(Connection)
+	void disconnected(Connection c)
 	{
+		observedBy.remove(connKey(c)); // its observations go with it
 	}
 
 	void close() nothrow
@@ -243,8 +303,8 @@ final class IdentifyService : Notifiee
 		host.peerstore.setAgent(info.peer, info.agentVersion);
 		// Likewise inbound: an address a peer observed for us over a circuit is
 		// the relay's public address, never ours to advertise.
-		if (!info.observedAddr.isNull && !isRelayed(c) && !observed.canFind(info.observedAddr.get))
-			observed ~= info.observedAddr.get;
+		if (!info.observedAddr.isNull && !isRelayed(c))
+			observe(c, info.observedAddr.get);
 
 		if (onIdentified !is null)
 			onIdentified(info);

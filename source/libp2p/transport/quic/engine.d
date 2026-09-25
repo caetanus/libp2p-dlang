@@ -59,6 +59,10 @@ void setStreamLimits(ref ngtcp2_transport_params p) nothrow @nogc
     p.initial_max_stream_data_bidi_remote = 1024 * 1024;
     p.initial_max_stream_data_uni = 1024 * 1024;
     p.initial_max_data = 4 * 1024 * 1024;
+    // NO global idle timeout: a legitimate connection is allowed to sit quiet for
+    // as long as the application likes (the whole point is to keep the pipe open).
+    // Abandoned/unadmitted pumps are reclaimed by explicit ownership — every punch
+    // and accept path closes its pump on failure — not by timing out live ones.
 }
 
 /// The client callbacks table: ngtcp2_crypto's TLS helpers + our D rand/cid.

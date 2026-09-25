@@ -29,6 +29,7 @@ import std.socket : AddressFamily;
 import std.typecons : Nullable, nullable;
 
 import vibe.core.core : runTask, sleep;
+import vibe.core.task : Task, InterruptException;
 import vibe.core.log : logDebug;
 import vibe.core.net;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
@@ -131,6 +132,8 @@ final class WebRtcTransport : CapableTransport
 	private Multiaddr punchAddr; /// our gathered srflx webrtc-direct address
 	private bool punchGathered;
 	private bool punchWarming; /// a background srflx-warming loop is running
+	private Task warmTask; /// that loop, owned: close() stops and joins it
+	private bool closed;
 	private MonoTime punchGatheredAt;
 	private enum srflxMaxAge = 25.seconds;
 	private UdpMux punchMux; /// the single persistent mux on punchSock every punch shares
@@ -172,6 +175,8 @@ final class WebRtcTransport : CapableTransport
 				auto na = resolveHost(s[0 .. colon], AddressFamily.INET, true);
 				conn.addStunServer(TransportAddr(na.toAddressString, s[colon + 1 .. $].to!ushort));
 			}
+			catch (InterruptException e)
+				throw e; // cancellation must unwind, not read as a bad STUN entry
 			catch (Exception)
 			{
 			}
@@ -214,6 +219,8 @@ final class WebRtcTransport : CapableTransport
 					auto na = resolveHost(sv[0 .. colon], AddressFamily.INET, true);
 					agent.addStunServer(TransportAddr(na.toAddressString, sv[colon + 1 .. $].to!ushort));
 				}
+				catch (InterruptException e)
+					throw e; // cancellation must unwind, not read as a bad STUN entry
 				catch (Exception)
 				{
 				}
@@ -246,6 +253,8 @@ final class WebRtcTransport : CapableTransport
 				ubyte[] got;
 				try
 					got = punchSock.recv(100.msecs, buf[], &from);
+				catch (InterruptException e)
+					throw e; // cancellation must not look like a failed recv
 				catch (Exception)
 				{
 				}
@@ -253,6 +262,8 @@ final class WebRtcTransport : CapableTransport
 					agent.handleInbound(got, TransportAddr(from.toAddressString, from.port), local, i * 100);
 			}
 		}
+		catch (InterruptException e)
+			throw e; // a cancelled gather stays cancelled
 		catch (Exception)
 		{
 		}
@@ -266,17 +277,22 @@ final class WebRtcTransport : CapableTransport
 	/// swallowed and retried on the next cadence.
 	void startReflexive() nothrow
 	{
-		if (punchWarming)
+		if (punchWarming || closed)
 			return;
 		punchWarming = true;
 		try
-			runTask(() nothrow {
+			warmTask = runTask(() nothrow {
 				try
-					for (;;)
+					while (!closed)
 					{
 						reflexiveAddr();
+						if (closed)
+							break; // do not sleep 20 s while close() waits to join us
 						sleep(20.seconds);
 					}
+				catch (InterruptException)
+				{
+				} // close() stopping us
 				catch (Exception)
 				{
 				}
@@ -445,11 +461,27 @@ final class WebRtcTransport : CapableTransport
 
 	void close() nothrow
 	{
+		closed = true;
+		if (warmTask != Task.init && warmTask.running)
+		{
+			try
+				warmTask.interrupt();
+			catch (Exception)
+			{
+			}
+			warmTask.joinUninterruptible();
+		}
 		foreach (m; muxes)
 			m.close();
 		muxes = null;
 		if (punchMux !is null)
-			punchMux.close(); // the persistent punch mux isn't in muxes
+			punchMux.close(); // the persistent punch mux isn't in muxes (it closes punchSock)
+		else if (punchSock != UDPConnection.init)
+			try
+				punchSock.close(); // gathered on, never punched from: still a descriptor
+			catch (Exception)
+			{
+			}
 	}
 
 	/// The listener's half of a new connection: the peer proved its identity

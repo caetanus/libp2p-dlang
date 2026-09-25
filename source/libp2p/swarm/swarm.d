@@ -55,6 +55,10 @@ struct SwarmConfig
 	Duration dialTimeout = 10.seconds;
 	Duration handshakeTimeout = 10.seconds;
 	size_t maxConcurrentDials = 8; /// addresses of one peer dialed at once (happy eyeballs)
+	/// Dial TCP from our listen port (SO_REUSEPORT), as go-libp2p does, so the
+	/// address a peer observes us at IS our listener's NAT mapping. Off by default:
+	/// a redial of the same peer right after a close hits the TIME_WAIT tuple.
+	bool dialFromListenPort = false;
 	Duration dialStagger = 100.msecs; /// pause between launching two of them
 	/// The most inbound substreams one connection will serve at once. A peer that
 	/// keeps opening streams would otherwise pile up an unbounded number of handler
@@ -272,10 +276,15 @@ final class Swarm
 	/// listen port with address reuse, so the connect reuses the mapping the peer
 	/// was told to expect. Both peers call this at once (DCUtR); with no matching
 	/// listen port it falls back to a plain dial. `expected` pins the peer.
-	Connection dialPunch(Multiaddr addr, PeerId expected)
+	Connection dialPunch(Multiaddr addr, PeerId expected, bool asDialer = true)
 	{
 		enforce(!closed, "swarm: closed");
-		return dialOne(addr, nullable(expected), tcpListenPort(addr));
+		// Both peers connect() at once (a TCP simultaneous open), so both sockets
+		// come up "dialed"; DCUtR assigns who secures as initiator. The dialer role
+		// also proposes /libp2p/simultaneous-connect first (go-libp2p does; a peer
+		// answering `na` gets a plain dial), the listener role answers `na` to it.
+		return dialOne(addr, nullable(expected), tcpListenPort(addr),
+			asDialer ? Endpoint.dialer : Endpoint.listener, /*punch*/ true);
 	}
 
 	// The port of our own listener that matches `addr`'s transport (TCP today), or
@@ -400,12 +409,13 @@ final class Swarm
 
 		auto race = new DialRace;
 		size_t next;
+		immutable maxDials = cfg.maxConcurrentDials < 1 ? 1 : cfg.maxConcurrentDials; // 0 would wait forever
 		try
 		{
 			while (race.winner is null)
 			{
 				immutable inFlight = race.tasks.length - race.finished;
-				if (next < addrs.length && inFlight < cfg.maxConcurrentDials)
+				if (next < addrs.length && inFlight < maxDials)
 				{
 					launchDial(race, addrs[next++], peer);
 					if (race.winner is null && next < addrs.length && cfg.dialStagger > Duration.zero)
@@ -432,6 +442,12 @@ final class Swarm
 			foreach (t; race.tasks)
 				if (t != me && t.running)
 					t.interrupt();
+			// And joined: a loser unwinds its dial (bounded by the dial timeout) and
+			// closes whatever came up late before connect() returns — nothing of the
+			// race survives it, nor a swarm close() that follows.
+			foreach (t; race.tasks)
+				if (t != me && t.running)
+					t.joinUninterruptible();
 		}
 		if (race.winner is null)
 			throw new DialFailure("dial " ~ peer.toString ~ " failed: "
@@ -531,7 +547,8 @@ final class Swarm
 		return false;
 	}
 
-	private Connection dialOne(const Multiaddr target, Nullable!PeerId expected, ushort reusePort = 0)
+	private Connection dialOne(const Multiaddr target, Nullable!PeerId expected, ushort reusePort = 0,
+		Endpoint role = Endpoint.dialer, bool punch = false)
 	{
 		// An address may name its peer (`.../p2p/<id>`); transports dial the
 		// part before it, and the name becomes the peer we expect.
@@ -553,7 +570,7 @@ final class Swarm
 				addr = bare;
 			}
 		}
-		auto pending = limiter.pending(Endpoint.dialer);
+		auto pending = limiter.pending(role);
 		scope (exit)
 			pending.release(); // and by unwinding, whichever comes first
 
@@ -562,11 +579,13 @@ final class Swarm
 			{
 				auto up = withTimeout(cfg.dialTimeout + cfg.handshakeTimeout, "dial " ~ addr.toString,
 					() => t.dial(addr, expected));
-				return admitCapable(up, Endpoint.dialer);
+				return admitCapable(up, role);
 			}
 
 		// A punch (reusePort != 0) egresses from our listen port with address reuse
 		// when the transport supports it (TCP); otherwise a plain dial.
+		if (reusePort == 0 && cfg.dialFromListenPort)
+			reusePort = tcpListenPort(addr);
 		RawConn raw = withTimeout(cfg.dialTimeout, "dial " ~ addr.toString, () {
 			auto t = transportFor(addr);
 			if (reusePort != 0)
@@ -578,15 +597,15 @@ final class Swarm
 			raw.close();
 
 		Upgraded up = withTimeout(cfg.handshakeTimeout, "handshake with " ~ addr.toString,
-			() => upgrade(raw, Endpoint.dialer, upgradeCfg, expected, reusePort != 0));
+			() => upgrade(raw, role, upgradeCfg, expected, punch));
 		scope (failure)
 			up.muxer.close();
 
-		if (gater !is null && !gater.allowPeer(up.remotePeer, Endpoint.dialer))
+		if (gater !is null && !gater.allowPeer(up.remotePeer, role))
 			throw new Exception("swarm: gater refused " ~ up.remotePeer.toString);
 
-		auto established = limiter.established(Endpoint.dialer, up.remotePeer);
-		return admit(up, Endpoint.dialer, raw.localAddr, raw.remoteAddr, established);
+		auto established = limiter.established(role, up.remotePeer);
+		return admit(up, role, raw.localAddr, raw.remoteAddr, established);
 	}
 
 	// --- the pool ----------------------------------------------------------------------
@@ -786,6 +805,14 @@ final class Swarm
 		foreach (n; notifiees.dup)
 			try
 				n.connected(c);
+			catch (InterruptException e)
+			{
+				// The dial was cancelled while a notifiee had us parked: the connection
+				// is already pooled and started, so take it back down — the caller sees
+				// the cancellation, not a live connection it never got.
+				c.close();
+				throw e;
+			}
 			catch (Exception e)
 				logDiagnostic("libp2p: notifiee failed on connect: %s", e.msg);
 		return c;

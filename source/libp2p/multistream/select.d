@@ -10,6 +10,7 @@
 module libp2p.multistream.select;
 
 import std.exception : enforce;
+import core.time : Duration;
 
 import libp2p.core.stream;
 import libp2p.multiformats.varint;
@@ -86,6 +87,42 @@ SimOpenResult negotiateSimOpen(Stream s, const(string)[] protocols)
 	}
 	writeMessage(s, "responder");
 	enforce(readMessage(s) == "initiator", "multistream: peer did not take the initiator role");
+	return SimOpenResult(serve(s, protocols), false);
+}
+
+/// Negotiate as the LISTENER of a hole punch that may not have been a
+/// simultaneous open after all. DCUtR assigns us the listener role for the
+/// direct connection; on a real NAT both connects cross and the peer's dialer
+/// proposes to us. But with no NAT in between (one LAN, loopback) our connect
+/// may simply have been ACCEPTED by the peer's ordinary listener — two listeners
+/// would then wait on each other forever. A dialer pipelines its proposal right
+/// behind the header, so: header exchanged and nothing behind it within `grace`
+/// means the other side is a listener too, and we propose as the plain dialer.
+SimOpenResult negotiateListenerOrDial(Stream s, const(string)[] protocols, Duration grace)
+{
+	import libp2p.util.timeout : withTimeout, Timeout;
+	enforce(protocols.length > 0, "multistream: nothing to serve");
+	s.write(frame(multistreamHeader));
+	expectHeader(s);
+	string first;
+	try
+		first = withTimeout(grace, "multistream: first proposal", () => readMessage(s));
+	catch (Timeout)
+		return SimOpenResult(propose(s, protocols, false), true); // a listener accepted us: we drive
+	// A peer that is itself a punch dialer may open with the simultaneous-connect
+	// extension; we are the listener it hopes for, so decline it and serve.
+	if (first == simOpenProtocol)
+	{
+		writeMessage(s, naToken);
+		return SimOpenResult(serve(s, protocols), false);
+	}
+	foreach (p; protocols)
+		if (p == first)
+		{
+			writeMessage(s, p);
+			return SimOpenResult(p, false);
+		}
+	writeMessage(s, naToken);
 	return SimOpenResult(serve(s, protocols), false);
 }
 

@@ -20,6 +20,7 @@ import libp2p.core.ending : EndOfStream;
 import libp2p.core.stream : Stream;
 import libp2p.crypto.keys : Keypair;
 import libp2p.transport.quic.udp : QuicListener, QuicClient;
+import libp2p.transport.quic.punch : QuicPunchSocket;
 import libp2p.transport.quic.connection : QuicConnection;
 
 // Control stream: echo every 4-byte frame until the peer FINs. A separate function
@@ -44,8 +45,8 @@ private void serveControl(Stream s)
 
 int main(string[] args)
 {
-    string role = "server", peerStr; ushort port = 4700; uint mib = 64; uint streams = 1; bool stats, ctrl;
-    auto help = getopt(args, "role", &role, "port", &port, "peer", &peerStr, "mib", &mib, "streams", &streams, "stats", &stats, "ctrl", &ctrl);
+    string role = "server", peerStr; ushort port = 4700; uint mib = 64; uint streams = 1; bool stats, ctrl, prod;
+    auto help = getopt(args, "role", &role, "port", &port, "peer", &peerStr, "mib", &mib, "streams", &streams, "stats", &stats, "ctrl", &ctrl, "prod", &prod);
     if (help.helpWanted || (role == "client" && peerStr.indexOf(':') <= 0))
     {
         writeln("quic-burn --role server [--port P] | --role client --peer ip:port [--mib N]");
@@ -58,9 +59,14 @@ int main(string[] args)
             auto id = Keypair.generateEd25519();
             if (role == "server")
             {
-                auto listener = new QuicListener(id, port, "0.0.0.0");
-                writeln("quic-burn server on :", listener.localAddress.port); stdout.flush();
-                listener.onAccept = (QuicConnection conn, NetworkAddress from) nothrow {
+                // --prod: serve on QuicPunchSocket, the socket the production QuicTransport uses.
+                QuicListener listener;
+                QuicPunchSocket psock;
+                if (prod) psock = new QuicPunchSocket(id, "0.0.0.0", port);
+                else listener = new QuicListener(id, port, "0.0.0.0");
+                writeln("quic-burn server on :", prod ? psock.localAddress.port : listener.localAddress.port, prod ? " (QuicPunchSocket)" : ""); stdout.flush();
+                void delegate(QuicConnection, NetworkAddress) nothrow onConn = delegate(QuicConnection conn, NetworkAddress from) nothrow {
+                    try { writeln("inbound conn from ", from.toString()); stdout.flush(); } catch (Exception) {}
                     runTask(() nothrow {
                         try
                         for (;;)
@@ -92,6 +98,7 @@ int main(string[] args)
                         catch (Exception e) { try writeln("server stream error: ", e.msg); catch (Exception) {} }
                     });
                 };
+                if (prod) psock.onInbound = onConn; else listener.onAccept = onConn;
                 foreach (_; 0 .. 3600) sleep(1.seconds);
             }
             else

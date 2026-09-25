@@ -11,6 +11,7 @@ module libp2p.transport.quic.transport;
 version (Libp2pQuic):
 
 import std.algorithm.searching : canFind, find;
+import std.conv : to;
 import std.exception : enforce;
 import std.format : format;
 import std.range : empty, front;
@@ -18,6 +19,7 @@ import std.socket : AddressFamily;
 import std.typecons : Nullable;
 import core.time : MonoTime, msecs, seconds;
 import vibe.core.core : runTask, sleep;
+import vibe.core.task : Task, InterruptException;
 
 import vibe.core.net : NetworkAddress, resolveHost;
 
@@ -42,6 +44,10 @@ final class QuicTransport : CapableTransport
     private Keypair _identity;
     private QuicConfig _cfg;
     private QuicListener[] _listeners;
+    private Task _keepaliveTask; // the srflx keepalive loop, owned: stopped by close()
+    private bool _closed;
+    private string _listenHost; // the endpoint _punchSock was bound for
+    private bool _listening; // _punchSock is a real listener, not a gather-only socket
     private QuicClient[] _clients;
     private QuicPunchSocket _punchSock; // shared srflx-gathering + punch socket
     private Multiaddr _reflexive;
@@ -120,7 +126,55 @@ final class QuicTransport : CapableTransport
         // and the two simultaneous-open packets would never meet. `listen()` runs at
         // startup before any dial/punch, so it is the one that binds the shared socket.
         if (_punchSock is null)
+        {
             _punchSock = new QuicPunchSocket(_identity, ipText, bind.port);
+            _listenHost = ipText;
+            _listening = true;
+        }
+        else if (!_listening && _punchSock.pumpCount() == 0)
+        {
+            // A gather-only ephemeral socket (startReflexive ran before any listen,
+            // and no punch put a live connection on it): replace it with a real
+            // listener on the requested endpoint. Its cached srflx belonged to the
+            // old mapping, so drop it and re-gather at once.
+            try
+                _punchSock.close();
+            catch (Exception)
+            {
+            }
+            _punchSock = new QuicPunchSocket(_identity, ipText, bind.port);
+            _listenHost = ipText;
+            _listening = true;
+            _gathered = false;
+            _reflexive = Multiaddr.init;
+            // startReflexive()'s loop is already running (a no-op here), so kick a
+            // one-shot gather for the NEW socket rather than wait out its 20 s sleep.
+            startReflexive();
+            gatherSoon();
+        }
+        else if (!_listening)
+        {
+            // The socket already carries live punched connections; we cannot rebind
+            // it without killing them. Adopt it as the listener ONLY when the request
+            // is compatible with where it is actually bound (an ephemeral/wildcard
+            // gather that a fixed listen can live with); otherwise refuse rather than
+            // silently listen on the wrong endpoint.
+            immutable boundPort = _punchSock.localAddress.port;
+            enforce(ipText == _listenHost && (bind.port == 0 || bind.port == boundPort),
+                "quic: a punch socket is already bound to /" ~ (ipText.canFind(':') ? "ip6" : "ip4")
+                ~ "/" ~ _listenHost ~ "/udp/" ~ boundPort.to!string
+                ~ " and carries live connections; cannot also listen on " ~ local.toString);
+            _listening = true;
+        }
+        else
+        {
+            // One socket, one endpoint: a second listen() on another address or
+            // port would silently alias this one (and steal its accept callback).
+            enforce(ipText == _listenHost && (bind.port == 0 || bind.port == _punchSock.localAddress.port),
+                "quic: already listening on /" ~ (ipText.canFind(':') ? "ip6" : "ip4") ~ "/" ~ _listenHost
+                ~ "/udp/" ~ _punchSock.localAddress.port.to!string
+                ~ "; one QUIC socket per transport (use another QuicTransport for a second endpoint)");
+        }
         auto sock = _punchSock;
         sock.onInbound = (QuicConnection conn, NetworkAddress from) nothrow {
             try
@@ -157,6 +211,8 @@ final class QuicTransport : CapableTransport
         for (int i = 0; i < 30 && !_gathered; i++)
             try
                 sleep(100.msecs);
+            catch (InterruptException e)
+                throw e; // cancellation stays cancellation; callers must distinguish it
             catch (Exception)
                 break; // no event loop to yield to: hand back whatever we have
         return _reflexive;
@@ -174,24 +230,41 @@ final class QuicTransport : CapableTransport
     /// 20 s both refreshes the mapping and keeps the cached address current.
     void startReflexive() nothrow
     {
-        if (_keepalive)
+        if (_keepalive || _closed)
             return;
         _keepalive = true;
         try
-            runTask(() nothrow {
+            _keepaliveTask = runTask(() nothrow {
                 try
-                    for (;;)
+                    while (!_closed)
                     {
                         if (!_gathered || MonoTime.currTime - _gatheredAt >= srflxMaxAge)
                             gather();
+                        if (_closed)
+                            break; // do not sleep 20 s while close() waits to join us
                         sleep(20.seconds);
                     }
+                catch (InterruptException)
+                {
+                } // close() stopping us
                 catch (Exception)
                 {
                 }
             });
         catch (Exception)
             _keepalive = false; // spawning failed; let a later call try again
+    }
+
+    // Fire a single background gather right now (after replacing the punch socket):
+    // the keepalive loop may be mid-sleep, so this fills the reflexive cache for the
+    // new mapping without waiting out its cadence.
+    private void gatherSoon() nothrow
+    {
+        try
+            runTask(() nothrow { gather(); });
+        catch (Exception)
+        {
+        }
     }
 
     private enum srflxMaxAge = 25.seconds;
@@ -211,6 +284,8 @@ final class QuicTransport : CapableTransport
         {
             if (_punchSock is null)
                 _punchSock = new QuicPunchSocket(_identity);
+            if (_listenHost is null)
+                _listenHost = "0.0.0.0"; // gather/punch bind the IPv4 wildcard; record it so a later compatible listen can adopt
             auto srflx = _punchSock.gatherReflexive(_cfg.stunServers, 2.seconds);
             if (!srflx.isNull)
             {
@@ -233,10 +308,29 @@ final class QuicTransport : CapableTransport
     {
         if (_punchSock is null)
             _punchSock = new QuicPunchSocket(_identity);
+            if (_listenHost is null)
+                _listenHost = "0.0.0.0"; // gather/punch bind the IPv4 wildcard; record it so a later compatible listen can adopt
         auto ma = Multiaddr(peerSrflx.bytes.dup);
         auto peer = toUdpAddress(ma.components);
 
         auto pump = asDialer ? _punchSock.punchClient(peer) : _punchSock.punchServer(peer, 60.seconds);
+        // From here the pump is demuxed on the shared socket; if the wait is
+        // interrupted, the handshake fails, or the peer authenticates as the wrong
+        // id, close it so it is not left rooted in the socket's _pumps forever.
+        bool adopted;
+        // A scope(exit) may not contain a catch, so the close-and-swallow lives in a
+        // nested function the guard just calls.
+        void closePumpQuietly()
+        {
+            try
+                pump.close();
+            catch (Exception)
+            {
+            }
+        }
+        scope (exit)
+            if (!adopted)
+                closePumpQuietly();
         pump.waitForHandshake();
         auto conn = pump.connection;
         auto rp = conn.remotePeerId();
@@ -249,11 +343,24 @@ final class QuicTransport : CapableTransport
         rp.tryPublicKey(up.remoteKey);
         up.localAddr = toQuicMultiaddr(_punchSock.localAddress);
         up.remoteAddr = ma;
+        adopted = true; // handed off; the pump lives with the connection now
         return up;
     }
 
     void close() nothrow
     {
+        _closed = true;
+        // The keepalive loop goes first: nothing of a closed transport keeps
+        // waking up to gather on a closed socket.
+        if (_keepaliveTask != Task.init && _keepaliveTask.running)
+        {
+            try
+                _keepaliveTask.interrupt();
+            catch (Exception)
+            {
+            }
+            _keepaliveTask.joinUninterruptible();
+        }
         foreach (l; _listeners)
             try
                 l.close();

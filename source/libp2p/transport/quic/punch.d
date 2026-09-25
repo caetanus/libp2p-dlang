@@ -18,6 +18,7 @@ import core.time : Duration, msecs, seconds, MonoTime;
 import vibe.core.net : UDPConnection, NetworkAddress, listenUDP, resolveHost;
 import vibe.core.core : runTask, sleep;
 import vibe.core.sync : LocalManualEvent, createManualEvent, TaskMutex;
+import vibe.core.task : InterruptException;
 
 import webrtc.stun.message : Message, XorMappedAddress, isStunMessage, bindingRequest,
     bindingSuccess, attrXorMappedAddress, TransactionId;
@@ -39,6 +40,12 @@ final class QuicPunchSocket
     private Keypair _identity;
     private QuicPump[string] _pumps; // by source address
     private bool _closed;
+    /// Inbound handshakes in progress at once; an Initial past this is dropped.
+    /// One Initial from a fresh source tuple costs a connection, TLS state, a
+    /// timer and a fiber until its handshake completes or times out — this bounds
+    /// what a flood of them can pin, and every failure frees its slot.
+    size_t maxPendingHandshakes = 64;
+    private size_t _pendingHandshakes;
 
     // STUN: one binding transaction outstanding at a time.
     private LocalManualEvent _stunEvent;
@@ -177,14 +184,46 @@ final class QuicPunchSocket
             synchronized (_sendLock)
                 _udp.send(pad[], &to);
         }
+        catch (InterruptException e)
+            throw e; // a cancelled punch must unwind, not spin its whole budget
         catch (Exception)
         {
         }
         auto conn = QuicConnection.dial(_identity, addrBytes(_udp.localAddress), addrBytes(peer));
         auto pump = new QuicPump(conn, sender(peer));
-        _pumps[peer.toString()] = pump;
+        track(peer.toString(), pump);
+        // kick() (the opening Initial send) can throw before the caller's own
+        // scope(failure) is armed; close the pump here so it is never left demuxed.
+        scope (failure)
+            try
+                pump.close();
+            catch (Exception)
+            {
+            }
         pump.kick(); // opening Initial toward the peer's mapping
         return pump;
+    }
+
+    // A pump is demuxed by its peer's source tuple until it closes (a connection
+    // close by the muxer above, an idle/handshake timeout): then it drops out of
+    // every map here, so nothing about a dead connection is kept.
+    private void track(string key, QuicPump pump)
+    {
+        _pumps[key] = pump;
+        pump.onClosed = () nothrow {
+            if (auto p = key in _pumps)
+                if (*p is pump)
+                    _pumps.remove(key);
+            if (auto p = key in _accepted)
+                if (*p is pump)
+                    _accepted.remove(key);
+        };
+    }
+
+    /// Connections currently demuxed on this socket (diagnostic / tests).
+    size_t pumpCount() const nothrow @safe
+    {
+        return _pumps.length;
     }
 
     /// The server side of a punch: open our NAT toward `peer` with a few pads so
@@ -199,6 +238,22 @@ final class QuicPunchSocket
         _expecting[key] = true;
         scope (exit)
             _expecting.remove(key);
+        // On interrupt/failure while waiting, an authenticated pump may already sit
+        // in _accepted (the read loop published it): close and drop it so a cancelled
+        // punch does not leave an unowned live connection demuxed forever.
+        bool handed;
+        scope (failure)
+            if (!handed)
+                if (auto pp = key in _accepted)
+                {
+                    auto dead = *pp;
+                    _accepted.remove(key);
+                    try
+                        dead.close();
+                    catch (Exception)
+                    {
+                    }
+                }
         // Keep the NAT mapping toward the peer fresh for the WHOLE window (not just a
         // burst at the start): the dialer may fire seconds later (discovery/clock
         // skew), and its Initial only gets in while our mapping is open.
@@ -211,6 +266,8 @@ final class QuicPunchSocket
                 synchronized (_sendLock)
                     _udp.send(p[], &to);
             }
+            catch (InterruptException e)
+                throw e; // a cancelled punch must unwind, not spin its whole budget
             catch (Exception)
             {
             }
@@ -222,7 +279,12 @@ final class QuicPunchSocket
         while (MonoTime.currTime < deadline)
         {
             if (auto p = key in _accepted)
-                return *p;
+            {
+                auto pump = *p;
+                _accepted.remove(key); // consumed: handed to the punch, not kept here
+                handed = true;
+                return pump;
+            }
             if (MonoTime.currTime - lastPad >= 1500.msecs)
             {
                 pad();
@@ -244,7 +306,14 @@ final class QuicPunchSocket
                 pkt = _udp.recv(buf[], &from);
             catch (Exception)
                 break; // socket closed
+            if (_closed)
+                break; // closing: _udp.localAddress may already be invalid below
 
+            // A datagram whose source address has no valid family (a closing socket
+            // can surface one) would throw in addrBytes(from) below and kill the
+            // read loop; drop it.
+            if (from.family != AddressFamily.INET && from.family != AddressFamily.INET6)
+                continue;
             try
             {
                 if (isStunMessage(pkt))
@@ -265,40 +334,97 @@ final class QuicPunchSocket
                     p.deliver(pkt);
                     continue;
                 }
-                // A new peer sending QUIC: we are the server of this punch.
-                auto conn = QuicConnection.accept(_identity, pkt,
-                    addrBytes(_udp.localAddress), addrBytes(from));
-                auto pump = new QuicPump(conn, sender(from));
-                _pumps[key] = pump;
-                pump.deliver(pkt);
+                // A new peer sending QUIC: we are the server of this punch. Only so
+                // many at a time: an unauthenticated Initial must not pin resources
+                // without bound (see maxPendingHandshakes).
+                // Charge the pending slot BEFORE constructing anything: an Initial
+                // that passes ngtcp2_accept but fails read_pkt (or whose pump throws
+                // on first delivery) must not leave an uncounted, timer-less pump
+                // rooted in the demux. Rotating source ports otherwise grows _pumps
+                // and native ngtcp2/TLS state past the cap.
+                if (_pendingHandshakes >= maxPendingHandshakes)
+                    continue;
+                _pendingHandshakes++;
+                QuicPump pump;
+                QuicConnection inboundConn;
+                try
+                {
+                    inboundConn = QuicConnection.accept(_identity, pkt,
+                        addrBytes(_udp.localAddress), addrBytes(from));
+                    pump = new QuicPump(inboundConn, sender(from));
+                    track(key, pump);
+                    pump.deliver(pkt); // may throw on a malformed Initial
+                }
+                catch (Exception)
+                {
+                    _pendingHandshakes--;
+                    if (pump !is null)
+                        try
+                            pump.close(); // track()'s onClosed drops it from _pumps
+                        catch (Exception)
+                        {
+                        }
+                    else if (inboundConn !is null)
+                        try
+                            inboundConn.close(); // accept() allocated ngtcp2/TLS; free it
+                        catch (Exception)
+                        {
+                        }
+                    continue;
+                }
                 auto peerAddr = from;
-                auto inboundConn = conn;
+                auto readyPump = pump;
+                auto readyConn = inboundConn;
+                try
                 runTask(() nothrow {
+                    bool slotReleased;
+                    void releaseSlot() nothrow
+                    {
+                        if (!slotReleased)
+                        {
+                            slotReleased = true;
+                            _pendingHandshakes--;
+                        }
+                    }
+                    scope (exit)
+                        releaseSlot();
                     try
                     {
-                        pump.waitForHandshake();
+                        readyPump.waitForHandshake(90.seconds); // bounded: reclaim a stalled inbound
+                        // Authenticate BEFORE we hand it off or free the slot: a peer
+                        // that completes a permissive TLS handshake but whose cert does
+                        // not bind a libp2p peer id is dropped here, not hoarded.
+                        cast(void) readyConn.remotePeerId();
                         immutable k = peerAddr.toString();
                         if (k in _expecting)
                         {
-                            // An expected punch: hand it to the waiting punchServer.
-                            _accepted[k] = pump;
+                            _accepted[k] = readyPump; // punchServer consumes + removes it
                             _acceptEvent.emit();
                         }
                         else if (onInbound !is null)
-                            // A plain inbound (this socket is also the listener).
-                            onInbound(inboundConn, peerAddr);
+                            onInbound(readyConn, peerAddr); // the swarm's limiter bounds it
                         else
-                        {
-                            // No listener wired and nobody waiting: keep the old
-                            // behaviour so a bare punch socket still resolves.
-                            _accepted[k] = pump;
-                            _acceptEvent.emit();
-                        }
+                            readyPump.close(); // nobody asked and nobody listens: don't hoard
                     }
                     catch (Exception)
                     {
+                        try
+                            readyPump.close(); // dead / unauthenticated: drop it
+                        catch (Exception)
+                        {
+                        }
                     }
                 });
+                catch (Exception)
+                {
+                    // the accept task never spawned: release the slot and drop the pump
+                    _pendingHandshakes--;
+                    try
+                        readyPump.close();
+                    catch (Exception)
+                    {
+                    }
+                }
             }
             catch (Exception)
             {

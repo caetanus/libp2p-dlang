@@ -302,34 +302,37 @@ final class Kademlia
 
 	/// Who provides `key`. The lookup runs to the k closest peers — where the
 	/// latest announcement landed — not to the first answer: a peer far from the
-	/// key may still hold an earlier copy of the record with addresses the provider
-	/// has since left (a relay it no longer sits behind). When several peers name
-	/// the same provider, the addresses from the one closest to the key win.
+	/// key may still hold an earlier copy of the record. When several peers name
+	/// the same provider, its addresses are the UNION of what they say (and of
+	/// our own copy): a responder's distance to the key says nothing about how
+	/// fresh or honest its record is, so no single answer may erase the others.
+	/// A dead address costs a dial that fails; a missing live one costs the meet.
 	PeerInfo[] getProviders(const(ubyte)[] key)
 	{
 		auto rk = RecordKey.from(key);
 		auto target = Key.fromBytes(key);
 		PeerInfo[PeerId] found;
-		Distance[PeerId] bestDist;
 		PeerId[] order;
-		foreach (p; store.providers(rk))
+		void merge(PeerId who, const(Multiaddr)[] addrs)
 		{
-			found[p.provider] = PeerInfo(p.provider, p.addresses); // our own copy: any network answer beats it
-			order ~= p.provider;
+			auto e = who in found;
+			if (e is null)
+			{
+				found[who] = PeerInfo(who, null);
+				order ~= who;
+				e = who in found;
+			}
+			foreach (a; addrs)
+				if (!e.addrs.canFind(a))
+					e.addrs ~= Multiaddr(a.bytes.dup);
 		}
+		foreach (p; store.providers(rk))
+			merge(p.provider, p.addresses);
 		cast(void) lookup(target, (PeerId p) {
 			auto reply = request(p, message(MessageType.getProviders, key));
-			auto d = Key.fromPeer(p).distance(target);
 			foreach (kp; reply.providerPeers)
 			{
-				if (kp.nodeId !in found)
-					order ~= kp.nodeId;
-				auto known = kp.nodeId in bestDist;
-				if (known is null || d < *known)
-				{
-					found[kp.nodeId] = PeerInfo(kp.nodeId, kp.multiaddrs);
-					bestDist[kp.nodeId] = d;
-				}
+				merge(kp.nodeId, kp.multiaddrs);
 				if (kp.multiaddrs.length > 0)
 					host.peerstore.addAddrs(kp.nodeId, kp.multiaddrs);
 			}

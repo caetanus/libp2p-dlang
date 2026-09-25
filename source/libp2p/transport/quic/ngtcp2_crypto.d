@@ -59,6 +59,21 @@ int ngtcp2_crypto_hp_mask_cb(ubyte* dest, const(ngtcp2_crypto_cipher)* hp,
     const(ngtcp2_crypto_cipher_ctx)* hp_ctx, const(ubyte)* sample);
 int ngtcp2_crypto_recv_retry_cb(ngtcp2_conn* conn, const(ngtcp2_pkt_hd)* hd,
     void* user_data);
+
+// Retry / address-validation token helpers (server side). generate_retry_token +
+// write_retry produce a Retry packet; verify_retry_token validates the echoed token
+// and recovers the original DCID. Keyed by a server-held secret.
+ngtcp2_ssize ngtcp2_crypto_generate_retry_token(ubyte* token, const(ubyte)* secret,
+    size_t secretlen, uint version_, const(ngtcp2_sockaddr)* remote_addr,
+    ngtcp2_socklen remote_addrlen, const(ngtcp2_cid)* retry_scid,
+    const(ngtcp2_cid)* odcid, ngtcp2_tstamp ts);
+int ngtcp2_crypto_verify_retry_token(ngtcp2_cid* odcid, const(ubyte)* token,
+    size_t tokenlen, const(ubyte)* secret, size_t secretlen, uint version_,
+    const(ngtcp2_sockaddr)* remote_addr, ngtcp2_socklen remote_addrlen,
+    const(ngtcp2_cid)* dcid, ngtcp2_duration timeout, ngtcp2_tstamp ts);
+ngtcp2_ssize ngtcp2_crypto_write_retry(ubyte* dest, size_t destlen, uint version_,
+    const(ngtcp2_cid)* dcid, const(ngtcp2_cid)* scid, const(ngtcp2_cid)* odcid,
+    const(ubyte)* token, size_t tokenlen);
 int ngtcp2_crypto_update_key_cb(ngtcp2_conn* conn, ubyte* rx_secret, ubyte* tx_secret,
     ngtcp2_crypto_aead_ctx* rx_aead_ctx, ubyte* rx_iv, ngtcp2_crypto_aead_ctx* tx_aead_ctx,
     ubyte* tx_iv, const(ubyte)* current_rx_secret, const(ubyte)* current_tx_secret,

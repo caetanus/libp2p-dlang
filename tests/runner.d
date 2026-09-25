@@ -30,6 +30,7 @@ int main(string[] args)
 		"tests.core.peer_id_test", "tests.core.upgrade_test",
 		"tests.transport.tcp_test",
 		"tests.transport.ws_test",
+		"tests.transport.quic_handshake_test",
 		"tests.multistream.select_test",
 		"tests.security.noise_test",
 		"tests.muxer.yamux_test",

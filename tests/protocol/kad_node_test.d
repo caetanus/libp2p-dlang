@@ -309,6 +309,8 @@ unittest
 		scope (exit)
 			g.close();
 		auto ra = new Relay(a.host), rg = new Relay(g.host);
+		ra.allowLoopbackCandidates = true; // the punch is over loopback here
+		rg.allowLoopbackCandidates = true;
 		scope (exit)
 		{
 			ra.close();

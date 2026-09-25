@@ -158,6 +158,15 @@
 					"path": "../d-webrtc-v3"
 				}
 			},
+			"versions": [
+				"Libp2pQuic"
+			],
+			"libs": [
+				"crypto",
+				"ngtcp2",
+				"ngtcp2_crypto_ossl",
+				"ssl"
+			],
 			"dflags": [
 				"-unittest"
 			]

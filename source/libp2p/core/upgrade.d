@@ -29,10 +29,18 @@ interface MuxerFactory
 	Muxer create(Stream secured, bool client);
 }
 
+import core.time : Duration, msecs;
+
 struct UpgradeConfig
 {
 	SecureTransport[] security;
 	MuxerFactory[] muxers;
+	/// The listener role of a hole punch waits this long for the peer's first
+	/// proposal after the header before concluding the peer is a listener too
+	/// (our connect was accepted, no NAT in between) and driving instead. A dialer
+	/// pipelines its proposal behind the header, so the wait is only ever paid in
+	/// that accepted case.
+	Duration punchListenerGrace = 750.msecs;
 }
 
 struct Upgraded
@@ -63,6 +71,14 @@ Upgraded upgrade(Stream raw, Endpoint role, UpgradeConfig cfg,
 	if (role == Endpoint.dialer && simultaneousOpen)
 	{
 		auto r = negotiateSimOpen(raw, ids(cfg.security));
+		up.securityProtocol = r.protocol;
+		initiator = r.initiator;
+	}
+	else if (role == Endpoint.listener && simultaneousOpen)
+	{
+		// The listener role of a punch: serve the peer's proposal — or, when the
+		// connect was plainly accepted by its listener (no NAT between us), drive.
+		auto r = negotiateListenerOrDial(raw, ids(cfg.security), cfg.punchListenerGrace);
 		up.securityProtocol = r.protocol;
 		initiator = r.initiator;
 	}

@@ -89,9 +89,18 @@ final class Relay : Notifiee, Transport
 	private size_t circuits;
 	private size_t[PeerId] circuitsBy;
 	private size_t punches;
-	/// When set, a relayed connection we dialed auto-triggers DCUtR to upgrade
-	/// it to a direct one (the responder side already answers automatically).
+	/// When set, a relayed connection we ACCEPTED (we hold the reservation; the
+	/// peer dialed us through the relay) auto-triggers DCUtR to upgrade it to a
+	/// direct one — the DCUtR spec's direction, what go/rust do. The other side
+	/// answers automatically.
 	bool autoHolePunch = true;
+	/// At most this many of a peer's DCUtR candidates are punched at once; the
+	/// rest of an oversized offer is ignored. Bounds the dial fan-out a peer can
+	/// make us do by listing hundreds of addresses.
+	size_t maxPunchCandidates = 8;
+	/// Whether loopback candidates a peer offers are punched. Off by default (a
+	/// peer must not make us connect to our own machine); on for loopback tests.
+	bool allowLoopbackCandidates = false;
 	private bool[PeerId] autoPunching; // initiator punches in flight, one per peer
 	private ubyte[][] observed;
 	private FiberGroup fibers;
@@ -200,6 +209,16 @@ final class Relay : Notifiee, Transport
 				continue;
 			if (!isRoutable(seen))
 				continue; // a VPN tunnel / private observation is not punchable
+			// The mapping exactly as observed, port included — but ONLY when our dials
+			// leave from our listen port (SwarmConfig.dialFromListenPort): the observed
+			// port is then a real mapping to reuse. Off (the default), it is the
+			// ephemeral source of the identify connection, so we synthesize from the
+			// listen ports below instead of offering a port nobody can be reached at.
+			if (host.swarm.config.dialFromListenPort)
+			{
+				add(seen);
+				haveDirectPublic = true;
+			}
 			immutable ipText = "/" ~ sc[0].name ~ "/" ~ sc[0].text;
 			foreach (l; host.addrs)
 			{
@@ -272,13 +291,14 @@ final class Relay : Notifiee, Transport
 
 	void connected(Connection c)
 	{
-		// The side that dialed through the relay is the DCUtR initiator; the side
-		// that accepted answers in serveDcutr. A direct connection (including the
-		// one a punch just made) is not relayed, so it never re-triggers this.
+		// DCUtR spec: the side that ACCEPTED the relayed connection (the listener,
+		// holding the reservation) initiates; the side that dialed through the
+		// relay answers in serveDcutr. A direct connection (including the one a
+		// punch just made) is not relayed, so it never re-triggers this.
 		if (!c.remoteAddr.components.canFind!(x => x.name == "p2p-circuit"))
 			return;
 		// Spawn the auto-punch FIRST, so nothing after it can keep it from firing.
-		if (autoHolePunch && c.role == Endpoint.dialer && c.remotePeer !in autoPunching)
+		if (autoHolePunch && c.role == Endpoint.listener && c.remotePeer !in autoPunching)
 		{
 			auto peer = c.remotePeer;
 			autoPunching[peer] = true;
@@ -699,8 +719,9 @@ final class Relay : Notifiee, Transport
 		if (!addr.components.canFind!(c => c.name == "p2p"))
 			addr = addr ~ Multiaddr.parse("/p2p/" ~ peer.toBase58);
 		// TCP (and other raw transports) punch by simultaneous-open: dial from our
-		// own listen port with address reuse so the peer's NAT mapping matches.
-		return punchable ? host.punch(addr, peer, asDialer) : host.swarm.dialPunch(addr, peer);
+		// own listen port with address reuse so the peer's NAT mapping matches; the
+		// security role is the one DCUtR assigned, never a coin toss.
+		return punchable ? host.punch(addr, peer, asDialer) : host.swarm.dialPunch(addr, peer, asDialer);
 	}
 
 	/// Swap addresses, wait half a round trip, reach `peer` directly. Returns the
@@ -712,7 +733,10 @@ final class Relay : Notifiee, Transport
 			addrList(res.peerAddrs), addrList(punchAddrs()));
 		sleep(res.rtt / 2);
 		Exception last;
-		if (auto c = punchAll(res.peerAddrs, peer, true, last)) // initiator: the DTLS client
+		// The initiator (us) is the SERVER of the direct connection (the DCUtR spec's
+		// role split: the receiver of the SYNC dials as client the moment it lands,
+		// half a round trip from now — the two meet in the middle).
+		if (auto c = punchAll(res.peerAddrs, peer, false, last))
 			return c.remotePeer;
 		// Our connect can lose to the peer's: when its SYN reaches our listener first
 		// (same LAN, no NAT in between) the kernel accepts it there, and our own dial
@@ -734,7 +758,12 @@ final class Relay : Notifiee, Transport
 		import vibe.core.core : runTask;
 		import vibe.core.task : Task;
 
-		auto ordered = orderCandidates(raws);
+		auto ordered = orderCandidates(acceptableCandidates(raws));
+		if (ordered.length == 0)
+		{
+			last = new Exception("dcutr: " ~ peer.toString ~ " offered no punchable address");
+			return null;
+		}
 		auto race = new PunchRace;
 		race.changed = createManualEvent();
 		foreach (raw; ordered)
@@ -789,9 +818,48 @@ final class Relay : Notifiee, Transport
 			foreach (t; race.tasks)
 				if (t != me && t.running)
 					t.interrupt();
+			// Own them to the end: a loser unwinds its dial (bounded by the dial
+			// timeout) and disposes of whatever it made before this returns, so no
+			// punch task outlives the punch — nor the Relay, nor the host.
+			foreach (t; race.tasks)
+				if (t != me && t.running)
+					t.joinUninterruptible();
 		}
 		last = race.last;
 		return race.winner;
+	}
+
+	// The candidates of a peer's offer we are willing to reach for: at most
+	// maxPunchCandidates, none unspecified / multicast / link-local, loopback only
+	// when allowed. The offer is peer-controlled data; this is our policy on it.
+	private ubyte[][] acceptableCandidates(const(ubyte[][]) raws)
+	{
+		ubyte[][] out_;
+		foreach (raw; raws)
+		{
+			if (out_.length >= maxPunchCandidates)
+				break;
+			Multiaddr a;
+			try
+				a = Multiaddr.decode(raw);
+			catch (Exception)
+				continue;
+			auto c = a.components;
+			if (c.length == 0)
+				continue;
+			// Only a literal IP is a punch candidate. A /dns*/… candidate (e.g.
+			// /dns4/localhost/…) would otherwise slip past the scope checks below and
+			// resolve to an internal host at dial time.
+			if (c[0].name != "ip4" && c[0].name != "ip6")
+				continue;
+			immutable ip = c[0].text;
+			if (isUnspecifiedIp(ip) || isMulticastIp(ip) || isLinkLocalIp(ip))
+				continue;
+			if (!allowLoopbackCandidates && isLoopbackIp(ip))
+				continue;
+			out_ ~= raw.dup;
+		}
+		return out_;
 	}
 
 	// Reflexive/punchable addresses (quic-v1, webrtc-direct) first, then the rest.
@@ -823,7 +891,7 @@ final class Relay : Notifiee, Transport
 		while (true)
 		{
 			foreach (c; host.swarm.connectionsTo(peer))
-				if (!c.remoteAddr.components.canFind!(x => x.name == "p2p-circuit"))
+				if (!c.isClosed && !c.remoteAddr.components.canFind!(x => x.name == "p2p-circuit"))
 					return c;
 			if (MonoTime.currTime >= deadline)
 				return null;
@@ -845,7 +913,10 @@ final class Relay : Notifiee, Transport
 			scope (exit)
 				punches--;
 			Exception last;
-			punchAll(theirs, peer, false, last); // responder: the DTLS server; if none lands, the relayed connection stays
+			// The receiver of the SYNC is the CLIENT of the direct connection and
+			// dials the moment the SYNC lands (the initiator became the server half a
+			// round trip after sending it). If none lands, the relayed connection stays.
+			punchAll(theirs, peer, true, last);
 		});
 	}
 }
@@ -860,6 +931,43 @@ private final class PunchRace
 	Task[] tasks;
 	bool done;
 	LocalManualEvent changed;
+}
+
+private bool isUnspecifiedIp(string ip)
+{
+	return ip == "0.0.0.0" || ip == "::";
+}
+
+private bool isLoopbackIp(string ip)
+{
+	import std.string : startsWith;
+	return ip.startsWith("127.") || ip == "::1";
+}
+
+private bool isLinkLocalIp(string ip)
+{
+	import std.string : startsWith, toLower;
+	auto l = ip.toLower;
+	return l.startsWith("169.254.") || l.startsWith("fe8") || l.startsWith("fe9")
+		|| l.startsWith("fea") || l.startsWith("feb");
+}
+
+private bool isMulticastIp(string ip)
+{
+	import std.string : startsWith, toLower, indexOf;
+	import std.conv : to;
+	if (ip.toLower.startsWith("ff"))
+		return true; // ff00::/8
+	auto dot = ip.indexOf('.');
+	if (dot <= 0)
+		return false;
+	try
+	{
+		immutable first = ip[0 .. dot].to!int;
+		return first >= 224 && first <= 239;
+	}
+	catch (Exception)
+		return false;
 }
 
 /// An address a peer could conceivably reach us at: not unspecified, not

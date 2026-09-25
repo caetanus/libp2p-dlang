@@ -52,7 +52,7 @@ private string ngtcpErr(int rv)
 
 // One-time init of libngtcp2_crypto_ossl (idempotent guard).
 private __gshared bool g_cryptoInit;
-private void ensureCryptoInit()
+package void ensureCryptoInit()
 {
     if (!g_cryptoInit)
     {
@@ -80,6 +80,7 @@ final class QuicConnection : Muxer
         QuicRole _role;
         ngtcp2_path _path;
         ubyte[128] _localSa; // sockaddr storage — ngtcp2 keeps the path pointers
+    private ubyte[] _retryToken; // Retry token storage (ngtcp2 keeps a pointer into settings)
         ubyte[128] _remoteSa;
         ngtcp2_callbacks _cb;
         ngtcp2_settings _settings;
@@ -96,6 +97,8 @@ final class QuicConnection : Muxer
 
     /// The driver (QuicPump) sets this so a stream's write can flush immediately.
     void delegate() nothrow onWantWrite;
+    /// Fires once, at close(), so the driver above can drop its references.
+    void delegate() nothrow onClosed;
 
     private this(QuicRole role, Keypair identity)
     {
@@ -130,6 +133,8 @@ final class QuicConnection : Muxer
     {
         ensureCryptoInit();
         auto self = new QuicConnection(QuicRole.client, identity);
+        scope (failure)
+            self.close(); // free any ngtcp2/OpenSSL state if construction throws
         self.setPath(local, remote);
         self._sslCtx = newClientContext(identity);
         self._ssl = SSL_new(self._sslCtx);
@@ -166,12 +171,16 @@ final class QuicConnection : Muxer
 
     /// A server connection built from the client's first Initial `packet`.
     static QuicConnection accept(Keypair identity, scope const(ubyte)[] packet,
-        scope const(ubyte)[] local, scope const(ubyte)[] remote)
+        scope const(ubyte)[] local, scope const(ubyte)[] remote,
+        scope const(ubyte)[] retryToken = null, const(ngtcp2_cid)* retryOdcid = null,
+        const(ngtcp2_cid)* retryScid = null)
     {
         ngtcp2_pkt_hd hd;
         enforce(ngtcp2_accept(&hd, packet.ptr, packet.length) == 0, "ngtcp2_accept failed");
         ensureCryptoInit();
         auto self = new QuicConnection(QuicRole.server, identity);
+        scope (failure)
+            self.close(); // free any ngtcp2/OpenSSL state if construction throws
         self.setPath(local, remote);
         self._sslCtx = newServerContext(identity);
         self._ssl = SSL_new(self._sslCtx);
@@ -195,8 +204,25 @@ final class QuicConnection : Muxer
         self._settings.cc_algo = NGTCP2_CC_ALGO_BBR;
         ngtcp2_transport_params_default(&self._params);
         setStreamLimits(self._params);
-        self._params.original_dcid = hd.dcid; // MANDATORY, else the TP check fails
-        self._params.original_dcid_present = 1;
+        if (retryToken.length && retryOdcid !is null && retryScid !is null)
+        {
+            // The client's address was validated by a Retry: original_dcid is the
+            // DCID from BEFORE the retry (recovered from the token), retry_scid is
+            // the SCID we put in the Retry, and the token is fed back so ngtcp2
+            // checks the client echoed both — the RFC 9000 §8.1.2 validation.
+            self._params.original_dcid = *retryOdcid;
+            self._params.original_dcid_present = 1;
+            self._params.retry_scid = *retryScid;
+            self._params.retry_scid_present = 1;
+            self._retryToken = retryToken.dup; // storage outlives ngtcp2_conn_server_new
+            self._settings.token = self._retryToken.ptr;
+            self._settings.tokenlen = self._retryToken.length;
+        }
+        else
+        {
+            self._params.original_dcid = hd.dcid; // no retry: DCID as sent
+            self._params.original_dcid_present = 1;
+        }
         auto scid = randomCid();
         enforce(ngtcp2_conn_server_new(&self._conn, &hd.scid, &scid, &self._path,
                 hd.version_, &self._cb, &self._settings, &self._params, null,
@@ -411,8 +437,25 @@ final class QuicConnection : Muxer
                     chosen._blocked = true; // flow-controlled this round; skip it
                 continue;
             }
-            if (n < 0 && chosen !is null && (n == NGTCP2_ERR_STREAM_SHUT_WR
-                    || n == NGTCP2_ERR_STREAM_NOT_FOUND))
+            if (n == NGTCP2_ERR_STREAM_SHUT_WR && chosen !is null)
+            {
+                // Our write side is shut (the peer sent STOP_SENDING, or our FIN
+                // already went) while we still held bytes or a FIN for it. Only the
+                // write side: the peer may well still be sending (a response after
+                // a STOP_SENDING of the request body) and the read side stays open
+                // until ngtcp2's stream_close says the whole stream is gone.
+                if (quicTrace)
+                {
+                    import core.stdc.stdio : fprintf, stderr;
+                    fprintf(stderr, "QUICTRACE stream %lld write side shut\n", cast(long) chosen._id);
+                }
+                chosen._outbuf = null;
+                chosen._finPending = false;
+                chosen._writeShut = true;
+                chosen._writeEvent.emit();
+                continue;
+            }
+            if (n == NGTCP2_ERR_STREAM_NOT_FOUND && chosen !is null)
             {
                 // This stream is gone as far as ngtcp2 is concerned (the peer reset
                 // it, or its FIN already went) while we still held bytes or a FIN
@@ -529,6 +572,9 @@ final class QuicConnection : Muxer
         if (_closed)
             return;
         _closed = true;
+        scope (exit)
+            if (onClosed !is null)
+                onClosed(); // the driver drops its references (demux entry, timer)
         try
         {
             _acceptEvent.emit();
@@ -638,6 +684,7 @@ final class QuicStream : Stream
         bool _remoteReset; // peer reset the stream
         bool _localReset; // we reset it
         bool _closed; // stream fully closed (or conn gone)
+        bool _writeShut; // our write side is shut (STOP_SENDING / FIN sent); reads go on
         bool _blocked; // flow-controlled this collectOutgoing round
         ubyte[][] _retain; // handed to ngtcp2, not yet acked by the peer (see onAckedStreamData)
         ulong _retainBase; // stream offset where _retain[0] starts
@@ -684,6 +731,8 @@ final class QuicStream : Stream
             throw new StreamReset("quic: stream reset");
         if (_closed || _conn._closed)
             throw new ConnClosed("quic: connection closed");
+        if (_writeShut)
+            throw new StreamReset("quic: the peer stopped reading this stream");
         if (data.length == 0)
             return;
         _outbuf ~= data.dup; // outlives caller's buffer across fiber yields
@@ -698,6 +747,8 @@ final class QuicStream : Stream
         {
             if (_localReset)
                 throw new StreamReset("quic: stream reset");
+            if (_writeShut)
+                throw new StreamReset("quic: the peer stopped reading this stream");
             if (_closed || _conn._closed)
                 throw new ConnClosed("quic: connection closed");
             auto ec = _writeEvent.emitCount;

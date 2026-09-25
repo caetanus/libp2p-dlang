@@ -49,34 +49,54 @@ size_t announceUnder(Kademlia kad, const(ubyte)[] key, Multiaddr[] addrs, bool a
 /// until `budget` is spent; throws when nobody could be reached in time.
 Connection meetUnder(Host host, Kademlia kad, Relay relay, const(ubyte)[] key, Duration budget = 60.seconds)
 {
+	import vibe.core.task : InterruptException;
+	import libp2p.util.timeout : withTimeout;
+
 	immutable deadline = MonoTime.currTime + budget;
+	// What is left of the budget: every blocking step below runs under it, so the
+	// call returns when the budget says, not when a DHT walk or a punch does.
+	Duration left()
+	{
+		auto l = deadline - MonoTime.currTime;
+		return l < 1.msecs ? 1.msecs : l; // never 0: withTimeout reads 0 as "no deadline"
+	}
+
 	Exception last;
 	auto wait = 500.msecs;
 	while (MonoTime.currTime < deadline)
 	{
 		PeerInfo[] providers;
 		try
-			providers = kad.getProviders(key);
+			providers = withTimeout(left(), "rendezvous lookup", () => kad.getProviders(key));
+		catch (InterruptException e)
+			throw e; // the caller gave up: not a failed lookup
 		catch (Exception e)
 			last = e;
 		foreach (pi; providers)
 		{
 			if (pi.peerId == host.id || pi.addrs.length == 0)
 				continue;
+			if (MonoTime.currTime >= deadline)
+				break;
 			try
 			{
-				host.connect(pi.peerId, pi.addrs);
-				auto c = relay.ensureDirect(pi.peerId);
+				withTimeout(left(), "rendezvous connect", { host.connect(pi.peerId, pi.addrs); });
+				auto c = withTimeout(left(), "rendezvous punch", () => relay.ensureDirect(pi.peerId));
 				logInfo("libp2p: rendezvous: met %s via %s", pi.peerId.toString, c.remoteAddr.toString);
 				return c;
 			}
+			catch (InterruptException e)
+				throw e;
 			catch (Exception e)
 			{
 				logInfo("libp2p: rendezvous: %s found but not reached: %s", pi.peerId.toString, e.msg);
 				last = e;
 			}
 		}
-		sleep(wait);
+		auto pause = wait < left() ? wait : left();
+		if (MonoTime.currTime + pause >= deadline)
+			break;
+		sleep(pause);
 		wait = wait * 2 > 8.seconds ? 8.seconds : wait * 2;
 	}
 	throw new Exception("rendezvous: nobody reachable under the key" ~ (last is null ? "" : ": " ~ last.msg), last);

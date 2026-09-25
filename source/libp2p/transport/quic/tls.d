@@ -23,6 +23,8 @@ SSL_CTX* newClientContext(Keypair identity)
 {
     auto ctx = SSL_CTX_new(TLS_method());
     enforce(ctx !is null, "SSL_CTX_new (client) failed");
+    scope (failure)
+        SSL_CTX_free(ctx); // installIdentityCert throws before we return ctx
     installIdentityCert(ctx, identity);
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, &acceptAnyCert);
     return ctx;
@@ -32,6 +34,8 @@ SSL_CTX* newServerContext(Keypair identity)
 {
     auto ctx = SSL_CTX_new(TLS_method());
     enforce(ctx !is null, "SSL_CTX_new (server) failed");
+    scope (failure)
+        SSL_CTX_free(ctx); // installIdentityCert throws before we return ctx
     installIdentityCert(ctx, identity);
     SSL_CTX_set_alpn_select_cb(ctx, &selectLibp2pAlpn, null);
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, &acceptAnyCert);

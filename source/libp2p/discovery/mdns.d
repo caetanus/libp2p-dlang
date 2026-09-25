@@ -14,6 +14,7 @@ import std.algorithm.searching : canFind, startsWith;
 import std.exception : enforce;
 import std.random : uniform;
 import std.string : split, join, toLower;
+import std.conv : to;
 
 import vibe.core.core : sleep, runTask;
 import vibe.core.log : logDebug, logInfo;
@@ -35,6 +36,7 @@ enum ushort typeA = 1;
 enum ushort typePtr = 12;
 enum ushort typeTxt = 16;
 enum ushort typeAaaa = 28;
+enum ushort typeSrv = 33;
 enum ushort classIn = 1;
 
 // --- the codec ------------------------------------------------------------------------
@@ -544,8 +546,10 @@ final class MdnsBeacon
 	private UDPConnection sock;
 	private NetworkAddress target;
 	private UDPConnection[string] egress; // per interface (by ip): multicast leaves through it
-	private bool[uint] joined; // interface index -> group joined on the receive socket
+	private bool[string] joined; // "index@ip" -> group joined on the receive socket (an index reused for a new address rejoins)
 	private MonoTime[string] recentlyFound; // "host|txts" -> when: one onFound per answer per 5 s
+	private enum size_t maxRecentlyFound = 512; // bounded: evicted by age, then by size
+	private string hostname; // our DNS-SD host name (<label>.local), for SRV/A
 	private bool heard; // an answer since the last reset: steady cadence allowed
 	private Duration wait; // current probe back-off
 	private string ifaceSet; // the interfaces we last saw, to notice a change
@@ -570,6 +574,7 @@ final class MdnsBeacon
 		target = resolveHost(cfg.group, AddressFamily.INET, false);
 		target.port = cfg.port;
 		instance = randomLabel() ~ "." ~ this.service;
+		hostname = instance.split(".")[0] ~ ".local"; // the SRV target; its A record is per interface
 		fibers = new FiberGroup((Exception e) nothrow { logDebug("libp2p: mdns beacon: %s", e.msg); });
 		if (cfg.group == mdnsGroup)
 		{
@@ -629,14 +634,40 @@ final class MdnsBeacon
 		immutable changed = ifaceSet.length && set != ifaceSet;
 		ifaceSet = set;
 		auto now = ipv4Interfaces();
+		// Reconcile, not just add: an interface (or an address) that went away takes
+		// its egress socket and reader with it, and its membership entry — so an
+		// index the kernel reuses for a new interface, or the same interface with a
+		// new address, is joined afresh instead of being taken for already joined.
+		bool[string] live;
+		bool[string] liveKeys;
 		foreach (i; now)
 		{
-			if (i.index !in joined)
+			live[i.ip] = true;
+			liveKeys[i.index.to!string ~ "@" ~ i.ip] = true;
+		}
+		foreach (ip; egress.keys)
+			if (ip !in live)
+			{
+				try
+					egress[ip].close(); // its reader's recv throws and the fiber ends
+				catch (Exception)
+				{
+				}
+				egress.remove(ip);
+				logInfo("libp2p: mdns beacon: %s is gone; egress closed", ip);
+			}
+		foreach (k; joined.keys)
+			if (k !in liveKeys)
+				joined.remove(k); // the kernel dropped the membership with the interface/address
+		foreach (i; now)
+		{
+			immutable key = i.index.to!string ~ "@" ~ i.ip;
+			if (key !in joined)
 			{
 				try
 				{
 					sock.addMembership(target, ifaceKey(i));
-					joined[i.index] = true;
+					joined[key] = true;
 					fresh = true;
 					logInfo("libp2p: mdns beacon: joined %s on %s (%s)", cfg.group, i.name, i.ip);
 				}
@@ -647,7 +678,18 @@ final class MdnsBeacon
 			{
 				try
 				{
-					auto e = listenUDP(0, i.ip);
+					// RFC 6762: multicast responses come from port 5353. Bind the egress
+					// there (address + port reuse, beside the group socket and beside
+					// another responder on this host); a bind refused falls back to an
+					// ephemeral port, which strict receivers may discard.
+					UDPConnection e;
+					if (cfg.bindPort == cfg.port)
+						try
+							e = listenUDP(cfg.port, i.ip, UDPListenOptions.reuseAddress | UDPListenOptions.reusePort);
+						catch (Exception)
+							e = listenUDP(0, i.ip);
+					else
+						e = listenUDP(0, i.ip); // tests: unicast sockets on ephemeral ports
 					egress[i.ip] = e;
 					// A unicast answer to a query we sent from this socket comes back HERE,
 					// not to the group socket — so this one is read too.
@@ -695,6 +737,75 @@ final class MdnsBeacon
 			sleep(2.seconds);
 			refreshInterfaces();
 		}
+	}
+
+	// The de-duplication cache stays small: entries older than the window go
+	// whenever it fills, and past a hard cap the oldest go too — a LAN flooding
+	// unique fake answers cannot grow it without bound.
+	private void rememberFound(string key, MonoTime now)
+	{
+		if (recentlyFound.length >= maxRecentlyFound)
+		{
+			foreach (k; recentlyFound.keys)
+				if (now - recentlyFound[k] >= 5.seconds)
+					recentlyFound.remove(k);
+			while (recentlyFound.length >= maxRecentlyFound)
+			{
+				string oldest;
+				MonoTime oldestAt;
+				foreach (k, t; recentlyFound)
+					if (oldest is null || t < oldestAt)
+					{
+						oldest = k;
+						oldestAt = t;
+					}
+				recentlyFound.remove(oldest);
+			}
+		}
+		recentlyFound[key] = now;
+	}
+
+	// The IP of one of our egress sockets, or null for the group socket.
+	private string egressIp(UDPConnection s)
+	{
+		foreach (ip, e; egress)
+			if (e == s)
+				return ip;
+		return null;
+	}
+
+	// A source an mDNS answer can legitimately come from: link-local, loopback or
+	// a private network (10/8, 172.16/12, 192.168/16, the 100.64/10 shared range
+	// a carrier or a VPN hands out). A public unicast source is not on our LAN.
+	static bool isLanScoped(ref NetworkAddress from)
+	{
+		import std.string : indexOf;
+		string ip;
+		try
+			ip = from.toAddressString;
+		catch (Exception)
+			return false;
+		if (ip.startsWith("::ffff:"))
+			ip = ip["::ffff:".length .. $];
+		if (ip.indexOf('.') < 0)
+		{
+			auto l = ip.toLower;
+			return l.startsWith("fe8") || l.startsWith("fe9") || l.startsWith("fea") || l.startsWith("feb")
+				|| l.startsWith("fd") || l.startsWith("fc") || l == "::1";
+		}
+		auto parts = ip.split(".");
+		if (parts.length != 4)
+			return false;
+		int a, b;
+		try
+		{
+			a = parts[0].to!int;
+			b = parts[1].to!int;
+		}
+		catch (Exception)
+			return false;
+		return a == 10 || a == 127 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168)
+			|| (a == 169 && b == 254) || (a == 100 && b >= 64 && b <= 127);
 	}
 
 	// Did this datagram come from one of our own egress sockets? A multicast we
@@ -745,21 +856,91 @@ final class MdnsBeacon
 	{
 		if (txts is null)
 			return;
-		multicast(encodeMessage(answerMessage()));
+		announceEach();
 	}
 
-	private DnsMessage answerMessage()
+	// One answer per interface, each carrying that interface's own A record (the
+	// address a DNS-SD browser resolves the SRV target to must be the one it can
+	// reach us at on THAT network); the group socket alone answers without one.
+	private void announceEach()
+	{
+		if (egress.length == 0)
+		{
+			sock.send(encodeMessage(answerMessage(null)), &target);
+			return;
+		}
+		foreach (ip, e; egress)
+			try
+				e.send(encodeMessage(answerMessage(ip)), &target);
+			catch (Exception)
+			{
+			}
+	}
+
+	// The port a DNS-SD SRV record names: the first transport line of the TXT
+	// (`quic=`, `tcp=`, `udx=`, `ws=`); 0 when none is announced.
+	private static ushort srvPort(const(string)[] lines)
+	{
+		foreach (prefix; ["quic=", "tcp=", "udx=", "ws="])
+			foreach (l; lines)
+				if (l.startsWith(prefix))
+					try
+						return l[prefix.length .. $].to!ushort;
+					catch (Exception)
+					{
+					}
+		return 0;
+	}
+
+	// A full DNS-SD answer (RFC 6763): PTR → instance, the instance's SRV (host +
+	// port) and TXT, and — when the answering interface is known — the host's A
+	// record. Cache-flush set on the records we own (RFC 6762 §10.2).
+	private DnsMessage answerMessage(string ifIp)
 	{
 		DnsMessage r;
 		r.flags = 0x8400;
 		r.answers ~= DnsRecord(service, typePtr, classIn, cfg.ttl, instance);
+		auto lines = txts();
+		immutable port = srvPort(lines);
+		if (port != 0)
+		{
+			DnsRecord srv;
+			srv.name = instance;
+			srv.rtype = typeSrv;
+			srv.rclass = classIn | 0x8000;
+			srv.ttl = cfg.ttl;
+			put16(srv.raw, 0); // priority
+			put16(srv.raw, 0); // weight
+			put16(srv.raw, port);
+			putName(srv.raw, hostname);
+			r.answers ~= srv;
+		}
 		DnsRecord txt;
 		txt.name = instance;
 		txt.rtype = typeTxt;
-		txt.rclass = classIn;
+		txt.rclass = classIn | 0x8000;
 		txt.ttl = cfg.ttl;
-		txt.txts = txts();
+		txt.txts = lines;
 		r.answers ~= txt;
+		if (ifIp.length && port != 0)
+		{
+			auto parts = ifIp.split(".");
+			if (parts.length == 4)
+			{
+				DnsRecord a;
+				a.name = hostname;
+				a.rtype = typeA;
+				a.rclass = classIn | 0x8000;
+				a.ttl = cfg.ttl;
+				try
+					foreach (p; parts)
+						a.raw ~= p.to!ubyte;
+				catch (Exception)
+					a.raw = null;
+				if (a.raw.length == 4)
+					r.answers ~= a;
+			}
+		}
 		return r;
 	}
 
@@ -814,8 +995,11 @@ final class MdnsBeacon
 				continue; // not DNS we can read; the network is full of those
 			if ((m.flags & 0x8000) == 0)
 			{
-				if (isOurEgress(from))
-					continue; // our own query, looped back through one of our interfaces
+				// Do NOT drop a query just because it shares our interface IP + port
+				// 5353: a conforming responder in ANOTHER process on this host looks
+				// identical, and self-suppression would silence it. Answering our own
+				// looped-back query is harmless — our own answer is excluded by the
+				// instance-name check on the receive side.
 				immutable ours = m.questions.canFind!(x => x.name.toLower == service && (x.qtype == typePtr || x.qtype == 255));
 				if (ours)
 					logInfo("libp2p: mdns beacon: query for %s from %s%s", service, from.toAddressString,
@@ -825,25 +1009,31 @@ final class MdnsBeacon
 					// Answer to the group (everyone on that network learns us) AND straight
 					// back to the asker: the unicast reply needs no interface selection at
 					// all and arrives whatever the multicast topology between us is.
-					auto reply = encodeMessage(answerMessage());
-					multicast(reply);
+					announceEach();
 					try
-						s.send(reply, &from);
+						s.send(encodeMessage(answerMessage(egressIp(s))), &from);
 					catch (Exception)
 					{
 					}
 				}
 				continue;
 			}
-			// An answer: ours (PTR to our service), from someone else.
-			bool forUs;
+			// An answer: ours (PTR to our service), from someone else. Only what is
+			// scoped to a LAN can be one (a unicast from across the internet is not),
+			// and only the TXT of the instance the PTR names counts — a record with
+			// any other owner riding in the same message is not that answer.
+			if (!isLanScoped(from))
+				continue;
+			bool[string] named;
 			foreach (a; m.answers)
-				if (a.rtype == typePtr && a.name.toLower == service && a.target.toLower != instance)
-					forUs = true;
-			if (!forUs)
+				if (a.rtype == typePtr && (a.rclass & 0x7fff) == classIn && a.ttl > 0
+					&& a.name.toLower == service && a.target.toLower != instance)
+					named[a.target.toLower] = true;
+			if (named.length == 0)
 				continue;
 			foreach (a; m.answers)
-				if (a.rtype == typeTxt && a.name.toLower != instance && onFound !is null)
+				if (a.rtype == typeTxt && (a.rclass & 0x7fff) == classIn && a.ttl > 0
+					&& (a.name.toLower in named) !is null && onFound !is null)
 				{
 					// The same answer reaches us once per interface path and once more by
 					// unicast; a query fans out the same way. One onFound per peer per 5 s.
@@ -852,7 +1042,7 @@ final class MdnsBeacon
 					if (auto t = key in recentlyFound)
 						if (now - *t < 5.seconds)
 							continue;
-					recentlyFound[key] = now;
+					rememberFound(key, now);
 					heard = true; // steady cadence from here, until the network changes
 					logInfo("libp2p: mdns beacon: %s answered from %s", service, from.toAddressString);
 					onFound(from, a.txts);
@@ -899,6 +1089,7 @@ final class LanRendezvous
 	private void delegate(NetworkAddress, string[]) nothrow[] listeners;
 	private string label;
 	private bool closed;
+	private size_t refs; // how many flavors hold this shared rendezvous
 
 	private static LanRendezvous[string] byLabel;
 
@@ -906,6 +1097,9 @@ final class LanRendezvous
 	static LanRendezvous forKey(string prefix, scope const(ubyte)[] key, MdnsBeaconConfig cfg = MdnsBeaconConfig.init)
 	{
 		immutable label = mdnsServiceFor(prefix, key);
+		// Ownership is counted by the holders (MdnsRendezvous ctor acquire / close
+		// release), NOT here — so a directly-constructed LanRendezvous and a forKey
+		// one behave the same, and the shared beacon dies only at the last holder.
 		if (auto p = label in byLabel)
 			if (!(*p).closed)
 				return *p;
@@ -940,6 +1134,27 @@ final class LanRendezvous
 	void addListener(void delegate(NetworkAddress from, string[] txts) nothrow listener)
 	{
 		listeners ~= listener;
+	}
+
+	/// Take a source back (the flavor that registered it is closing): the label
+	/// stops carrying its lines at the next announce.
+	void removeTxtSource(string[] delegate() source)
+	{
+		string[] delegate()[] rest;
+		foreach (s; sources)
+			if (s != source)
+				rest ~= s;
+		sources = rest;
+	}
+
+	/// Take a listener back: nothing of a closed flavor is called again.
+	void removeListener(void delegate(NetworkAddress from, string[] txts) nothrow listener)
+	{
+		void delegate(NetworkAddress, string[]) nothrow[] rest;
+		foreach (l; listeners)
+			if (l != listener)
+				rest ~= l;
+		listeners = rest;
 	}
 
 	private string[] txts()
@@ -990,6 +1205,26 @@ final class LanRendezvous
 		return beacon;
 	}
 
+	/// One holder is done with the shared rendezvous. The beacon (and its sockets
+	/// and fibers) is torn down and the label unregistered only when the LAST holder
+	/// releases it — so a process cycling through pairing keys does not leak a beacon
+	/// per key, and a still-active flavor is never cut off.
+	/// A new holder takes a reference to the shared rendezvous.
+	void acquire() nothrow
+	{
+		refs++;
+	}
+
+	void release() nothrow
+	{
+		if (closed)
+			return;
+		if (refs > 0)
+			refs--;
+		if (refs == 0)
+			close();
+	}
+
 	void close() nothrow
 	{
 		if (closed)
@@ -1006,6 +1241,7 @@ struct MdnsRendezvousConfig
 {
 	MdnsBeaconConfig beacon;
 	bool announce = true; /// answer queries with our id + ports (the desktop); false = browse only
+	size_t maxConcurrentDials = 4; /// LAN answers dialed at once; more wait for the next announce
 }
 
 /// The libp2p flavor's lines on a LanRendezvous: announces `id=<PeerId>` and one
@@ -1019,6 +1255,9 @@ final class MdnsRendezvous
 	private LanRendezvous lan;
 	private MdnsRendezvousConfig cfg;
 	private bool[PeerId] dialing;
+	private FiberGroup fibers; // the dials, owned: close() stops and joins them
+	private string[] delegate() source; // what we registered on the rendezvous, to take back
+	private bool closed;
 
 	/// A peer of this key was reached on the LAN (also in the peerstore now).
 	void delegate(PeerId peer, Connection conn) nothrow onConnected;
@@ -1036,9 +1275,15 @@ final class MdnsRendezvous
 		this.host = host;
 		this.lan = lan;
 		this.cfg = cfg;
+		lan.acquire(); // one hold per rendezvous; close() releases it
+
+		fibers = new FiberGroup((Exception e) nothrow { logDebug("libp2p: mdns rendezvous: %s", e.msg); });
 		auto h = host;
 		if (cfg.announce)
-			lan.addTxtSource(() => txtsFor(h));
+		{
+			source = () => txtsFor(h);
+			lan.addTxtSource(source);
+		}
 		lan.addListener(&found);
 	}
 
@@ -1119,22 +1364,27 @@ final class MdnsRendezvous
 		catch (Exception)
 		{
 		}
-		if (addrs.length == 0 || who in dialing)
+		if (closed || addrs.length == 0 || who in dialing)
 			return;
+		immutable dialCap = cfg.maxConcurrentDials < 1 ? 1 : cfg.maxConcurrentDials; // 0 would block all discovery
+		if (dialing.length >= dialCap)
+			return; // bounded fan-out: a flood of answers is not a flood of dials; it re-offers itself
 		dialing[who] = true;
 		try
-			runTask(() nothrow {
+			fibers.spawn({
 				scope (exit)
 					dialing.remove(who);
+				// A new path to a peer we may already talk to elsewhere (WAN): open it
+				// too — the application decides which connection carries what.
 				try
 				{
-					// A new path to a peer we may already talk to elsewhere (WAN): open it
-					// too — the application decides which connection carries what.
 					auto c = host.connectFresh(who, addrs);
 					logInfo("libp2p: mdns rendezvous: %s reached on the LAN via %s", who.toString, c.remoteAddr.toString);
 					if (onConnected !is null)
 						onConnected(who, c);
 				}
+				catch (InterruptException e)
+					throw e; // close() stopping us
 				catch (Exception e)
 					logInfo("libp2p: mdns rendezvous: dial of %s failed: %s", who.toString, e.msg);
 			});
@@ -1166,8 +1416,25 @@ final class MdnsRendezvous
 		return lan;
 	}
 
+	/// Leave the rendezvous: our lines and our listener come off it (it is shared
+	/// with other flavors, so it stays up — closing it is its owner's call) and
+	/// the dials in flight are stopped and joined. Nothing of this instance, or of
+	/// its host, is called by a later answer.
 	void close() nothrow
 	{
-		// The rendezvous is shared with other flavors; closing it is its owner's call.
+		if (closed)
+			return;
+		closed = true;
+		try
+		{
+			lan.removeListener(&found);
+			if (source !is null)
+				lan.removeTxtSource(source);
+			lan.release(); // drop our hold; the beacon dies with the last holder
+		}
+		catch (Exception)
+		{
+		}
+		fibers.stopAll();
 	}
 }
