@@ -137,12 +137,20 @@ final class WebRtcTransport : CapableTransport
 	private MonoTime punchGatheredAt;
 	private enum srflxMaxAge = 25.seconds;
 	private UdpMux punchMux; /// the single persistent mux on punchSock every punch shares
+	/// A STUN gather is reading punchSock: only ONE may (eventcore allows a single read
+	/// callback per socket — a second concurrent reader aborts the process with
+	/// "Overwriting notification callback"). A DCUtR offer and the warming loop both ask
+	/// for the address; the second one waits for the first gather instead of starting its
+	/// own, and a punch waits for it before putting the mux on the socket.
+	private bool gathering;
+	private LocalManualEvent gatherDone;
 
 	this(Keypair identity, WebRtcConfig cfg = WebRtcConfig.init)
 	{
 		this.identity = identity;
 		this.cfg = cfg;
 		cert = new Certificate;
+		gatherDone = createManualEvent();
 	}
 
 	Fingerprint fingerprint()
@@ -200,7 +208,18 @@ final class WebRtcTransport : CapableTransport
 		// traffic itself keeps that mapping alive.
 		if (punchGathered && (punchMux !is null || MonoTime.currTime - punchGatheredAt < srflxMaxAge))
 			return punchAddr;
+		if (gathering)
+		{
+			waitGathered();
+			return punchAddr;
+		}
 		punchGathered = true;
+		gathering = true;
+		scope (exit)
+		{
+			gathering = false;
+			gatherDone.emit();
+		}
 		try
 		{
 			if (punchSock == UDPConnection.init)
@@ -268,6 +287,17 @@ final class WebRtcTransport : CapableTransport
 		{
 		}
 		return punchAddr; // Multiaddr.init if nothing answered
+	}
+
+	/// Wait (bounded) for the gather in flight to finish.
+	private void waitGathered()
+	{
+		immutable until = MonoTime.currTime + 8.seconds;
+		while (gathering && MonoTime.currTime < until)
+		{
+			auto ec = gatherDone.emitCount;
+			gatherDone.wait(until - MonoTime.currTime, ec);
+		}
 	}
 
 	/// Begin warming our reflexive webrtc-direct address in the BACKGROUND so a
@@ -396,6 +426,10 @@ final class WebRtcTransport : CapableTransport
 		// without a second reader — a per-punch mux would either crash (concurrent)
 		// or, guarded, leave the socket claimed until the first connection died
 		// (so only the first peer could ever punch).
+		// a STUN gather still reading punchSock must finish first (one reader per socket)
+		if (gathering)
+			waitGathered();
+		enforce(!gathering, "webrtc: the reflexive gather is still reading the punch socket");
 		if (punchMux is null || punchMux.closed)
 			punchMux = new UdpMux(this, punchSock, false, true);
 		auto mux = punchMux;
