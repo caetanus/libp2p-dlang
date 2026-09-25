@@ -99,6 +99,10 @@ final class QuicPump
     /// Fires once, when this pump is closed (the connection died or was closed).
     void delegate() nothrow onClosed;
 
+    /// One send that never waits (see trySendNow), set by the socket's owner; used for
+    /// the terminal CONNECTION_CLOSE. Null = no farewell packet.
+    bool delegate(scope const(ubyte)[]) nothrow trySend;
+
     void waitForHandshake()
     {
         auto ec = _handshakeEvent.emitCount;
@@ -178,6 +182,8 @@ final class QuicPump
         while (_flushAgain && !_closed);
         if (_closed)
             return;
+        if (_conn.handshakeComplete)
+            _conn.tuneKeepAlive(); // before timeout(): the new keep-alive deadline must be armed on THIS pass
         immutable due = _conn.timeout();
         if (due == Duration.max)
             _timer.stop();
@@ -201,20 +207,81 @@ final class QuicPump
     {
         try
         {
-            _conn.handleTimeout();
+            immutable rv = _conn.handleTimeout();
+            if (rv != 0)
+            {
+                // Terminal (ngtcp2's contract): an idle timeout drops silently; any other
+                // ending tells a still-live peer with a CONNECTION_CLOSE, so it stops
+                // retransmitting now instead of at its own timeout. Sent BEFORE close()
+                // (a dedicated client's socket closes with its pump) through trySend,
+                // which never waits — busy lock or full buffer means skip — so the
+                // cleanup below is never held up. Best effort.
+                if (rv != QuicConnection.idleCloseErr && trySend !is null)
+                {
+                    ubyte[1500] scratch;
+                    try
+                    {
+                        auto farewell = _conn.terminalPacket(rv, scratch[]);
+                        if (farewell.length)
+                            cast(void) trySend(farewell);
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+                close(); // wake waiters, leave the demux
+                return;
+            }
             serviceOut();
         }
         catch (Exception)
         {
-            // A timer/expiry error must NOT tear down a live (still-handshaking)
-            // connection: ngtcp2 can report a transient expiry error that the next
-            // inbound packet resolves. Reclamation of a genuinely-dead pump is the
-            // muxer/close path's job, not the periodic timer's.
+            // A throw from serviceOut (a send error on a live connection) is not an
+            // ngtcp2 ending — those come back as handleTimeout's nonzero result above
+            // and close the pump — so the connection is left to its own timers.
         }
     }
 }
 
 /// A QUIC client on its own dedicated UDP socket.
+/// Send one datagram NOW or not at all: take the socket's send lock only if it is free
+/// and hand the kernel the packet with IOMode.immediate (eventcore returns wouldBlock
+/// instead of parking when the buffer is full). For a best-effort last packet that
+/// must never hold up a close. vibe's UDPConnection has no immediate send and no typed
+/// eventcore handle accessor, so the handle is read from its (only) DatagramSocketFD
+/// field — checked at compile time, so a vibe-core layout change fails the build
+/// instead of silently disabling the farewell.
+bool trySendNow(ref UDPConnection udp, TaskMutex lock, scope const(ubyte)[] pkt, NetworkAddress to) nothrow
+{
+    import eventcore.core : eventDriver;
+    import eventcore.driver : DatagramSocketFD, IOMode, IOStatus, RefAddress;
+
+    enum fdFields = () { size_t n; static foreach (T; typeof(UDPConnection.tupleof)) static if (is(T == DatagramSocketFD)) n++; return n; }();
+    static assert(fdFields == 1, "UDPConnection no longer has exactly one DatagramSocketFD field");
+    DatagramSocketFD fd;
+    static foreach (i, T; typeof(udp.tupleof))
+        static if (is(T == DatagramSocketFD))
+            fd = udp.tupleof[i];
+    if (fd == DatagramSocketFD.invalid)
+        return false;
+    try
+    {
+        if (!lock.tryLock())
+            return false; // another send is in flight: skip rather than wait
+        scope (exit)
+            lock.unlock();
+        bool ok;
+        scope addr = new RefAddress(to.sockAddr, to.sockAddrLen);
+        eventDriver.sockets.send(fd, pkt, IOMode.immediate, addr,
+            (DatagramSocketFD, IOStatus st, size_t n, scope RefAddress) @safe nothrow { ok = st == IOStatus.ok; });
+        return ok; // immediate: the callback has already run
+    }
+    catch (Exception)
+    {
+        return false;
+    }
+}
+
 final class QuicClient
 {
     private UDPConnection _udp;
@@ -239,6 +306,7 @@ final class QuicClient
         _sendLock = new TaskMutex;
         _conn = QuicConnection.dial(identity, addrBytes(_udp.localAddress), addrBytes(peer));
         _pump = new QuicPump(_conn, &send);
+        _pump.trySend = (scope const(ubyte)[] pkt) nothrow => trySendNow(_udp, _sendLock, pkt, _peer);
         // When the muxer above (or an idle/handshake timeout) closes the pump, close
         // OUR udp socket too: otherwise a swarm connection close frees the muxer but
         // leaks this socket and its recv-parked reader fiber until transport shutdown.
@@ -334,6 +402,11 @@ final class QuicListener
 
     // Build a send delegate bound to one peer — `peer` BY VALUE so each pump captures
     // its own address (a loop-local would be shared across iterations).
+    private bool delegate(scope const(ubyte)[]) nothrow trySender(NetworkAddress peer)
+    {
+        return (scope const(ubyte)[] pkt) nothrow => trySendNow(_udp, _sendLock, pkt, peer);
+    }
+
     private void delegate(scope const(ubyte)[]) sender(NetworkAddress peer)
     {
         return (scope const(ubyte)[] pkt) {
@@ -348,10 +421,19 @@ final class QuicListener
         ubyte[2048] buf;
         for (;;)
         {
+            NetworkAddress from;
+            const(ubyte)[] pkt;
+            try
+                pkt = _udp.recv(buf[], &from);
+            catch (Exception)
+                break; // the socket is gone: close() or a real socket error
+            // A bad or unacceptable datagram must not stop the listener for every peer:
+            // a late 1-RTT packet of a connection that already left the demux (idle
+            // expiry) arrives here as a "new peer" and ngtcp2_accept rightly rejects it.
+            QuicPump pump;
+            QuicConnection conn;
             try
             {
-                NetworkAddress from;
-                auto pkt = _udp.recv(buf[], &from);
                 immutable key = from.toString();
                 if (auto p = key in _pumps)
                 {
@@ -359,27 +441,21 @@ final class QuicListener
                     continue;
                 }
                 // New peer: build a server conn from its first Initial.
-                auto conn = QuicConnection.accept(_identity, pkt, addrBytes(_udp.localAddress), addrBytes(from));
-                auto pump = new QuicPump(conn, sender(from));
+                conn = QuicConnection.accept(_identity, pkt, addrBytes(_udp.localAddress), addrBytes(from));
+                pump = new QuicPump(conn, sender(from));
+                pump.trySend = trySender(from);
                 _pumps[key] = pump;
+                untrackOnClose(key, pump);
                 pump.deliver(pkt);
-                auto cb = onAccept;
-                auto peerAddr = from;
-                runTask(() nothrow {
-                    try
-                    {
-                        pump.waitForHandshake();
-                        if (cb !is null)
-                            cb(conn, peerAddr);
-                    }
-                    catch (Exception)
-                    {
-                    }
-                });
+                spawnAccept(pump, conn, from, onAccept);
             }
             catch (Exception)
             {
-                break;
+                if (pump !is null)
+                    try pump.close(); catch (Exception) {} // untrackOnClose drops it from the demux
+                else if (conn !is null)
+                    conn.close(); // accept() allocated ngtcp2/TLS state; free it
+                continue;
             }
             catch (Error e)
             {
@@ -390,9 +466,40 @@ final class QuicListener
         }
     }
 
+    // Leave the demux when the pump closes (idle expiry, a swarm close), so a later
+    // Initial from the same address starts a fresh connection instead of feeding a
+    // dead pump. Identity-checked: a newer pump under the same key stays.
+    private void untrackOnClose(string key, QuicPump pump)
+    {
+        pump.onClosed = () nothrow {
+            if (auto p = key in _pumps)
+                if (*p is pump)
+                    _pumps.remove(key);
+        };
+    }
+
+    // One call per new peer, so the accept task gets its OWN frame: captured straight
+    // from readLoop's loop body, the task would read the NEWEST pump/conn/address after
+    // waitForHandshake yields (D shares loop-body locals across iterations).
+    private void spawnAccept(QuicPump pump, QuicConnection conn, NetworkAddress peerAddr,
+        void delegate(QuicConnection, NetworkAddress) nothrow cb)
+    {
+        runTask(() nothrow {
+            try
+            {
+                pump.waitForHandshake();
+                if (cb !is null)
+                    cb(conn, peerAddr);
+            }
+            catch (Exception)
+            {
+            }
+        });
+    }
+
     void close()
     {
-        foreach (p; _pumps)
+        foreach (p; _pumps.values) // a snapshot: each close removes its own entry (untrackOnClose)
             p.close();
         _udp.close(); // ends the recv-parked readLoop fiber
     }

@@ -25,7 +25,7 @@ import webrtc.stun.message : Message, XorMappedAddress, isStunMessage, bindingRe
 
 import libp2p.crypto.keys : Keypair;
 import libp2p.transport.quic.connection : QuicConnection;
-import libp2p.transport.quic.udp : QuicPump, addrBytes;
+import libp2p.transport.quic.udp : QuicPump, addrBytes, trySendNow;
 
 /// A plausible-QUIC test: QUIC's long and short headers both set the fixed bit
 /// (0x40); a NAT-opener pad (a zero byte) does not, so junk never reaches ngtcp2.
@@ -79,6 +79,11 @@ final class QuicPunchSocket
     }
 
     // A send delegate bound to one peer (peer BY VALUE, per-pump).
+    private bool delegate(scope const(ubyte)[]) nothrow trySender(NetworkAddress peer)
+    {
+        return (scope const(ubyte)[] pkt) nothrow => trySendNow(_udp, _sendLock, pkt, peer);
+    }
+
     private void delegate(scope const(ubyte)[]) sender(NetworkAddress peer)
     {
         return (scope const(ubyte)[] pkt) {
@@ -191,6 +196,7 @@ final class QuicPunchSocket
         }
         auto conn = QuicConnection.dial(_identity, addrBytes(_udp.localAddress), addrBytes(peer));
         auto pump = new QuicPump(conn, sender(peer));
+        pump.trySend = trySender(peer);
         track(peer.toString(), pump);
         // kick() (the opening Initial send) can throw before the caller's own
         // scope(failure) is armed; close the pump here so it is never left demuxed.
@@ -295,6 +301,65 @@ final class QuicPunchSocket
         throw new Exception("quic punch: no inbound handshake from " ~ key);
     }
 
+    // One call per inbound handshake, so the accept task gets its OWN frame. Spawned
+    // straight from readLoop it would capture readLoop's loop-body locals, which D
+    // shares across iterations: after waitForHandshake yields, the task would see the
+    // NEWEST pump/conn/address — concurrent inbounds then handed one connection to
+    // onInbound N times and orphaned the rest.
+    private void spawnInboundAccept(QuicPump readyPump, QuicConnection readyConn, NetworkAddress peerAddr) nothrow
+    {
+        try
+        runTask(() nothrow {
+            bool slotReleased;
+            void releaseSlot() nothrow
+            {
+                if (!slotReleased)
+                {
+                    slotReleased = true;
+                    _pendingHandshakes--;
+                }
+            }
+            scope (exit)
+                releaseSlot();
+            try
+            {
+                readyPump.waitForHandshake(90.seconds); // bounded: reclaim a stalled inbound
+                // Authenticate BEFORE we hand it off or free the slot: a peer
+                // that completes a permissive TLS handshake but whose cert does
+                // not bind a libp2p peer id is dropped here, not hoarded.
+                cast(void) readyConn.remotePeerId();
+                immutable k = peerAddr.toString();
+                if (k in _expecting)
+                {
+                    _accepted[k] = readyPump; // punchServer consumes + removes it
+                    _acceptEvent.emit();
+                }
+                else if (onInbound !is null)
+                    onInbound(readyConn, peerAddr); // the swarm's limiter bounds it
+                else
+                    readyPump.close(); // nobody asked and nobody listens: don't hoard
+            }
+            catch (Exception)
+            {
+                try
+                    readyPump.close(); // dead / unauthenticated: drop it
+                catch (Exception)
+                {
+                }
+            }
+        });
+        catch (Exception)
+        {
+            // the accept task never spawned: release the slot and drop the pump
+            _pendingHandshakes--;
+            try
+                readyPump.close();
+            catch (Exception)
+            {
+            }
+        }
+    }
+
     private void readLoop() nothrow
     {
         ubyte[2048] buf;
@@ -352,6 +417,7 @@ final class QuicPunchSocket
                     inboundConn = QuicConnection.accept(_identity, pkt,
                         addrBytes(_udp.localAddress), addrBytes(from));
                     pump = new QuicPump(inboundConn, sender(from));
+                    pump.trySend = trySender(from);
                     track(key, pump);
                     pump.deliver(pkt); // may throw on a malformed Initial
                 }
@@ -372,59 +438,7 @@ final class QuicPunchSocket
                         }
                     continue;
                 }
-                auto peerAddr = from;
-                auto readyPump = pump;
-                auto readyConn = inboundConn;
-                try
-                runTask(() nothrow {
-                    bool slotReleased;
-                    void releaseSlot() nothrow
-                    {
-                        if (!slotReleased)
-                        {
-                            slotReleased = true;
-                            _pendingHandshakes--;
-                        }
-                    }
-                    scope (exit)
-                        releaseSlot();
-                    try
-                    {
-                        readyPump.waitForHandshake(90.seconds); // bounded: reclaim a stalled inbound
-                        // Authenticate BEFORE we hand it off or free the slot: a peer
-                        // that completes a permissive TLS handshake but whose cert does
-                        // not bind a libp2p peer id is dropped here, not hoarded.
-                        cast(void) readyConn.remotePeerId();
-                        immutable k = peerAddr.toString();
-                        if (k in _expecting)
-                        {
-                            _accepted[k] = readyPump; // punchServer consumes + removes it
-                            _acceptEvent.emit();
-                        }
-                        else if (onInbound !is null)
-                            onInbound(readyConn, peerAddr); // the swarm's limiter bounds it
-                        else
-                            readyPump.close(); // nobody asked and nobody listens: don't hoard
-                    }
-                    catch (Exception)
-                    {
-                        try
-                            readyPump.close(); // dead / unauthenticated: drop it
-                        catch (Exception)
-                        {
-                        }
-                    }
-                });
-                catch (Exception)
-                {
-                    // the accept task never spawned: release the slot and drop the pump
-                    _pendingHandshakes--;
-                    try
-                        readyPump.close();
-                    catch (Exception)
-                    {
-                    }
-                }
+                spawnInboundAccept(pump, inboundConn, from);
             }
             catch (Exception)
             {

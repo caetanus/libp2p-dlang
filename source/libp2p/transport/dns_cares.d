@@ -193,8 +193,15 @@ final class CaresDns : DnsResolver
 				// Several sockets (a TCP fallback alongside UDP): the first to wake wins.
 				void delegate()[] alts;
 				bool[] got = new bool[readable.length];
+				// Each waiter built by its own call: select() starts them AFTER this loop,
+				// and a delegate literal here would share `i`/`fd` across iterations
+				// (every waiter would watch the last socket and set got[last]).
+				static void delegate() waiter(bool[] got, size_t i, ares_socket_t fd, Duration wait)
+				{
+					return { got[i] = awaitReadable(fd, wait); };
+				}
 				foreach (i, fd; readable)
-					alts ~= { got[i] = awaitReadable(fd, wait); };
+					alts ~= waiter(got, i, fd, wait);
 				immutable winner = select(alts);
 				if (got[winner])
 					ready = readable[winner];

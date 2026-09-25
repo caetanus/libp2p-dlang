@@ -45,8 +45,8 @@ private void serveControl(Stream s)
 
 int main(string[] args)
 {
-    string role = "server", peerStr; ushort port = 4700; uint mib = 64; uint streams = 1; bool stats, ctrl, prod;
-    auto help = getopt(args, "role", &role, "port", &port, "peer", &peerStr, "mib", &mib, "streams", &streams, "stats", &stats, "ctrl", &ctrl, "prod", &prod);
+    string role = "server", peerStr; ushort port = 4700; uint mib = 64; uint streams = 1; bool stats, ctrl, prod; uint hold;
+    auto help = getopt(args, "role", &role, "port", &port, "peer", &peerStr, "mib", &mib, "streams", &streams, "stats", &stats, "ctrl", &ctrl, "prod", &prod, "hold", &hold);
     if (help.helpWanted || (role == "client" && peerStr.indexOf(':') <= 0))
     {
         writeln("quic-burn --role server [--port P] | --role client --peer ip:port [--mib N]");
@@ -95,7 +95,7 @@ int main(string[] args)
                             s.write([cast(ubyte) 1]);
                             s.close();
                         }
-                        catch (Exception e) { try writeln("server stream error: ", e.msg); catch (Exception) {} }
+                        catch (Exception e) { try { writeln("server stream error: ", e.msg); stdout.flush(); } catch (Exception) {} }
                     });
                 };
                 if (prod) psock.onInbound = onConn; else listener.onAccept = onConn;
@@ -122,6 +122,14 @@ int main(string[] args)
                             }
                         catch (Exception) {}
                     });
+                // --hold S: sit idle (no application traffic) before the burn and
+                // before --ctrl starts its pings — the burn
+                // then proves the link survived S seconds of quiet (QUIC keep-alive).
+                if (hold)
+                {
+                    writeln("holding the connection idle for ", hold, " s"); stdout.flush();
+                    sleep(hold.seconds);
+                }
                 result = 0;
                 Stream cs;
                 bool ctrlRun = ctrl;

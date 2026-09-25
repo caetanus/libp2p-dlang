@@ -158,6 +158,9 @@ final class QuicConnection : Muxer
         // stream then dies behind the bulk. BBR keeps bytes in flight near the
         // bandwidth-delay product and the queue, and the RTT, stay small.
         self._settings.cc_algo = NGTCP2_CC_ALGO_BBR;
+        // Same clock as every later timestamp (nowNanos): left at 0, ngtcp2 measures the
+        // idle timeout from the epoch and closes the connection mid-handshake.
+        self._settings.initial_ts = nowNanos();
         ngtcp2_transport_params_default(&self._params);
         setStreamLimits(self._params);
         auto dcid = randomCid();
@@ -165,6 +168,7 @@ final class QuicConnection : Muxer
         enforce(ngtcp2_conn_client_new(&self._conn, &dcid, &scid, &self._path,
                 NGTCP2_PROTO_VER_V1, &self._cb, &self._settings, &self._params, null,
                 cast(void*) self) == 0, "ngtcp2_conn_client_new failed");
+        ngtcp2_conn_set_keep_alive_timeout(self._conn, quicKeepAliveNs);
         self.wireTls();
         return self;
     }
@@ -202,6 +206,9 @@ final class QuicConnection : Muxer
         // stream then dies behind the bulk. BBR keeps bytes in flight near the
         // bandwidth-delay product and the queue, and the RTT, stay small.
         self._settings.cc_algo = NGTCP2_CC_ALGO_BBR;
+        // Same clock as every later timestamp (nowNanos): left at 0, ngtcp2 measures the
+        // idle timeout from the epoch and closes the connection mid-handshake.
+        self._settings.initial_ts = nowNanos();
         ngtcp2_transport_params_default(&self._params);
         setStreamLimits(self._params);
         if (retryToken.length && retryOdcid !is null && retryScid !is null)
@@ -227,6 +234,7 @@ final class QuicConnection : Muxer
         enforce(ngtcp2_conn_server_new(&self._conn, &hd.scid, &scid, &self._path,
                 hd.version_, &self._cb, &self._settings, &self._params, null,
                 cast(void*) self) == 0, "ngtcp2_conn_server_new failed");
+        ngtcp2_conn_set_keep_alive_timeout(self._conn, quicKeepAliveNs);
         self.wireTls();
         return self;
     }
@@ -297,11 +305,56 @@ final class QuicConnection : Muxer
         return expiry <= now ? Duration.zero : nsecs(cast(long)(expiry - now));
     }
 
-    void handleTimeout()
+    /// Run ngtcp2's timer work. Returns 0 while the connection lives; any other value
+    /// is terminal (ngtcp2's contract for handle_expiry): NGTCP2_ERR_IDLE_CLOSE means
+    /// drop silently, anything else (NGTCP2_ERR_HANDSHAKE_TIMEOUT — which
+    /// ngtcp2_err_is_fatal does NOT flag — and the fatal ones) means send the peer a
+    /// CONNECTION_CLOSE (terminalPacket) and then drop. Either way the caller closes.
+    /// NGTCP2_ERR_IDLE_CLOSE, for callers that do not import the binding.
+    enum int idleCloseErr = NGTCP2_ERR_IDLE_CLOSE;
+
+    int handleTimeout()
     {
         if (_conn is null)
+            return NGTCP2_ERR_IDLE_CLOSE;
+        return ngtcp2_conn_handle_expiry(_conn, nowNanos());
+    }
+
+    /// The CONNECTION_CLOSE carrying library error `liberr`, written into `scratch`;
+    /// empty if ngtcp2 cannot produce one (the connection is already closing/draining).
+    ubyte[] terminalPacket(int liberr, return ubyte[] scratch)
+    {
+        if (_conn is null)
+            return scratch[0 .. 0];
+        ngtcp2_ccerr ccerr;
+        ngtcp2_ccerr_default(&ccerr);
+        ngtcp2_ccerr_set_liberr(&ccerr, liberr, null, 0);
+        ngtcp2_pkt_info pi;
+        immutable n = ngtcp2_conn_write_connection_close(_conn, null, &pi, scratch.ptr, scratch.length,
+            &ccerr, nowNanos());
+        return n > 0 ? scratch[0 .. cast(size_t) n] : scratch[0 .. 0];
+    }
+
+    private bool _keepAliveTuned;
+
+    /// Once the handshake is done, fit the keep-alive to the NEGOTIATED idle timeout:
+    /// the effective one is the smaller of ours and the peer's, and a peer with a
+    /// shorter timeout that sends no PINGs itself would otherwise expire a healthy
+    /// idle link before our fixed interval fires. PING at a third of it (max
+    /// quicKeepAliveNs), so two may be lost before the link is declared dead.
+    void tuneKeepAlive()
+    {
+        if (_keepAliveTuned || _conn is null || !ngtcp2_conn_get_handshake_completed(_conn))
             return;
-        enforce(ngtcp2_conn_handle_expiry(_conn, nowNanos()) == 0, "ngtcp2_conn_handle_expiry failed");
+        _keepAliveTuned = true;
+        ulong idle = _params.max_idle_timeout;
+        auto rp = ngtcp2_conn_get_remote_transport_params(_conn);
+        if (rp !is null && rp.max_idle_timeout != 0 && (idle == 0 || rp.max_idle_timeout < idle))
+            idle = rp.max_idle_timeout;
+        ulong ka = quicKeepAliveNs;
+        if (idle != 0 && idle / 3 < ka)
+            ka = idle / 3;
+        ngtcp2_conn_set_keep_alive_timeout(_conn, ka);
     }
 
     // ---- Muxer: streams over the one QUIC connection --------------------------
@@ -310,6 +363,8 @@ final class QuicConnection : Muxer
     /// bytes go out on the next `collectOutgoing`.
     Stream open()
     {
+        if (_closed || _conn is null)
+            throw new ConnClosed("quic: connection closed");
         long id;
         enforce(ngtcp2_conn_open_bidi_stream(_conn, &id, null) == 0, "open_bidi_stream failed");
         auto s = new QuicStream(this, id);
@@ -496,10 +551,13 @@ final class QuicConnection : Muxer
                 break; // nothing more to send right now
             sink(buf[0 .. cast(size_t) n]);
             burst += cast(size_t) n;
+            if (_conn is null)
+                return; // the send yielded and the connection was closed meanwhile (idle
+                        // expiry, a swarm close): nothing native may be touched now
             if (burst >= budget)
                 break; // the quantum is spent; the pacing timer resumes us
         }
-        if (burst)
+        if (burst && _conn !is null)
             ngtcp2_conn_update_pkt_tx_time(_conn, nowNanos());
         if (ready.length)
             _rrNext = (_rrNext + turn) % ready.length; // next round starts after the last served
