@@ -1001,6 +1001,20 @@ private final class Session : Muxer
 	{
 		if (closed_)
 			throw cause;
+		// A full SCTP send buffer means "wait", not "fail": Stream.write blocks as needed.
+		// Room is made as the peer acknowledges: the reader fiber feeds each SACK in,
+		// pumps (which hands queued DATA to the wire) and emits `changed`; the ticker
+		// drives the retransmission timers. The writer only waits. It must not pump
+		// here: pump() emits `changed` itself, and a wait on a count taken before that
+		// emit returns at once without yielding — the writer would spin, starve the
+		// reader and the ticker, and no SACK (nor ICE consent) would ever be read.
+		while (!conn.channels().canSend(data.length))
+		{
+			if (closed_)
+				throw cause;
+			throwIfFailed();
+			changed.wait(transport.cfg.tick, changed.emitCount);
+		}
 		conn.channels().send(sid, data, false);
 		pump();
 	}
