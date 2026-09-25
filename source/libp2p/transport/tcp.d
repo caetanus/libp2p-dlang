@@ -97,11 +97,20 @@ final class TcpConn : RawConn
 			throw new ConnClosed("tcp: closed locally");
 		try
 		{
-			immutable avail = conn.leastSize; // blocks; 0 means the peer is done
+			// Our own reference to the socket for the whole operation: close() on another
+			// task nulls the MEMBER's context while this read is parked in leastSize, and
+			// the member's leastSize then dereferenced null on wake-up (a phone crashed in
+			// here after a network change). A copy holds the handle (its postblit takes a
+			// reference): close() still shuts the socket down at once (this read wakes), only
+			// the final release of the handle waits until this read is done with it.
+			auto io = conn;
+			immutable avail = io.leastSize; // blocks; 0 means the peer is done
+			if (closed)
+				throw new ConnClosed("tcp: closed locally");
 			if (avail == 0)
 				throw new EndOfStream("tcp: peer closed the connection");
 			immutable want = min(buf.length, avail);
-			immutable n = conn.read(buf[0 .. want], IOMode.once);
+			immutable n = io.read(buf[0 .. want], IOMode.once);
 			version (Libp2pReadTrace)
 			{
 				import core.stdc.stdio : fprintf, stderr;
@@ -124,7 +133,14 @@ final class TcpConn : RawConn
 		if (closed)
 			throw new ConnClosed("tcp: closed locally");
 		try
-			conn.write(data);
+		{
+			// same as read: a write parked on a full socket keeps its own handle, so a close
+			// meanwhile cannot leave its cancellation pointing at an invalidated socket (the
+			// callback then fired on a returned frame: "Notification fired after asyncAwait
+			// had already returned")
+			auto io = conn;
+			io.write(data);
+		}
 		catch (InterruptException e)
 			throw e;
 		catch (Exception e)
