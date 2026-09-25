@@ -33,7 +33,9 @@ private enum string[] defaultBootstrap = [
 int main(string[] args)
 {
     string[] bootstrap;
-    auto help = getopt(args, "bootstrap", &bootstrap);
+    string providersOf;   // a rendezvous secret: print who provides its key, and where
+    string prefix = "pw";
+    auto help = getopt(args, "bootstrap", &bootstrap, "providers", &providersOf, "prefix", &prefix);
     if (help.helpWanted)
     {
         writeln("kad-live [--bootstrap <multiaddr/p2p/id>]... (repeatable)");
@@ -93,6 +95,25 @@ int main(string[] args)
             immutable tableSize = kad.bootstrap(); // dials the seeds, self-lookup fills the table
             writeln("routing table after bootstrap: ", tableSize, " peers (seeds: ", seeded, ")");
 
+            if (providersOf.length)
+            {
+                import libp2p.discovery.rendezvous : rendezvousKeyFor;
+
+                auto rkey = rendezvousKeyFor(prefix, cast(const(ubyte)[]) providersOf);
+                auto provs = kad.getProviders(rkey);
+                writeln("providers of the key: ", provs.length);
+                foreach (pi; provs)
+                {
+                    writeln("  ", pi.peerId.toBase58, " — ", pi.addrs.length, " address(es)");
+                    foreach (a; pi.addrs)
+                        writeln("    ", a.toString);
+                }
+                stdout.flush();
+                result = provs.length ? 0 : 1;
+                host.close();
+                exitEventLoop();
+                return;
+            }
             ubyte[32] target;
             foreach (ref x; target)
                 x = cast(ubyte) uniform(0, 256);

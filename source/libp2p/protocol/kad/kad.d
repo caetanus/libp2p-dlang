@@ -307,7 +307,18 @@ final class Kademlia
 	/// our own copy): a responder's distance to the key says nothing about how
 	/// fresh or honest its record is, so no single answer may erase the others.
 	/// A dead address costs a dial that fails; a missing live one costs the meet.
-	PeerInfo[] getProviders(const(ubyte)[] key)
+	///
+	/// `soft`: after this long no further peer is asked — whether the last contact
+	/// answered or failed — and what was gathered is returned; the requests in flight
+	/// still finish, each within the per-peer timeout. A caller on a budget keeps the
+	/// providers found so far instead of losing them to an interrupted walk.
+	/// How long one request to a peer may take (a caller budgeting a lookup's drain).
+	Duration requestTimeout() const
+	{
+		return cfg.requestTimeout;
+	}
+
+	PeerInfo[] getProviders(const(ubyte)[] key, Duration soft = Duration.max)
 	{
 		auto rk = RecordKey.from(key);
 		auto target = Key.fromBytes(key);
@@ -337,7 +348,7 @@ final class Kademlia
 					host.peerstore.addAddrs(kp.nodeId, kp.multiaddrs);
 			}
 			return remember(p, reply);
-		});
+		}, null, soft);
 		PeerInfo[] providers;
 		foreach (id; order)
 			providers ~= found[id];
@@ -402,7 +413,8 @@ final class Kademlia
 
 	// --- the lookup machinery --------------------------------------------------------------
 
-	private PeerId[] lookup(Key target, PeerId[] delegate(PeerId) contact, bool delegate() satisfied = null)
+	private PeerId[] lookup(Key target, PeerId[] delegate(PeerId) contact, bool delegate() satisfied = null,
+		Duration limit = Duration.max)
 	{
 		PeerId[] seeds;
 		foreach (node; table.closest(target, cfg.replicationFactor))
@@ -413,7 +425,8 @@ final class Kademlia
 			if (satisfied !is null && satisfied())
 				it.finish();
 			return closer;
-		}, cfg.queryTimeout);
+		}, cfg.queryTimeout <= Duration.zero ? (limit == Duration.max ? Duration.zero : limit) // query timeout off: the caller's limit alone
+			: limit < cfg.queryTimeout ? limit : cfg.queryTimeout);
 	}
 
 	private size_t writeTo(PeerId[] peers, void delegate(PeerId) send)

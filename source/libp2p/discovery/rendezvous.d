@@ -61,13 +61,37 @@ Connection meetUnder(Host host, Kademlia kad, Relay relay, const(ubyte)[] key, D
 		return l < 1.msecs ? 1.msecs : l; // never 0: withTimeout reads 0 as "no deadline"
 	}
 
+	// A peer found late still gets a real attempt: the lookup may spend the budget only
+	// down to `reach`, which is kept for connecting and punching. Without it the DHT walk
+	// ate the budget — on 4G 27 of 30 s — and a found peer had 2.7 s to be reached
+	// through its relay, which it never was.
+	immutable reach = budget / 2 < 20.seconds ? budget / 2 : 20.seconds;
+	// A walk stops ASKING at `cutoff`; the requests still in flight drain within the
+	// DHT's request timeout, which is taken off too, so the reach share is really free.
+	// (A request timeout switched off still gets a bound here: 10 s.) A budget too short
+	// for both — cutoff before we even start — is split in half: walk, then reach.
+	immutable drain = kad.requestTimeout > Duration.zero ? kad.requestTimeout : 10.seconds;
+	immutable start = MonoTime.currTime;
+	immutable cutoff = deadline - reach - drain > start ? deadline - reach - drain : start + budget / 2;
+	Duration lookupLeft()
+	{
+		auto l = cutoff - MonoTime.currTime;
+		return l < 1.msecs ? 1.msecs : l;
+	}
+
 	Exception last;
+	bool looked; // a lookup ran (found someone or not, failed or not)
 	auto wait = 500.msecs;
 	while (MonoTime.currTime < deadline)
 	{
+		if (looked && MonoTime.currTime >= cutoff)
+			break; // past the cutoff a second walk would drain into the reach share
 		PeerInfo[] providers;
+		looked = true;
 		try
-			providers = withTimeout(left(), "rendezvous lookup", () => kad.getProviders(key));
+			// soft limit: at lookupLeft the walk stops asking and hands back what it found;
+			// the hard one (the whole budget) only guards a walk that would not return
+			providers = withTimeout(left(), "rendezvous lookup", () => kad.getProviders(key, lookupLeft()));
 		catch (InterruptException e)
 			throw e; // the caller gave up: not a failed lookup
 		catch (Exception e)
