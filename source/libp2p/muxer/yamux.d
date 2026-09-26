@@ -45,10 +45,17 @@ enum yamuxProtocolId = "/yamux/1.0.0";
 
 struct YamuxConfig
 {
-	uint receiveWindow = 256 * 1024; /// per stream, what we let the peer have in flight
+	/// Per stream, what we let the peer have in flight. The protocol starts every stream at
+	/// `initialWindow` (both sides assume it); the rest is granted with the SYN/ACK frame.
+	/// 256 KiB was a hard cap on a stream's speed — window/RTT: ~8 MB/s at 30 ms, whatever
+	/// the link — so a phone on Wi-Fi pushed at a fraction of it (photo-wagon, 2026-09-25).
+	uint receiveWindow = 4 * 1024 * 1024;
 	uint maxFrame = 16 * 1024; /// the largest data frame we write
 	size_t acceptBacklog = 256; /// inbound streams nobody has accepted yet
 }
+
+/// The window every yamux stream starts with, in both directions (the spec's 256 KiB).
+enum uint initialWindow = 256 * 1024;
 
 private enum ubyte version0 = 0;
 private enum ubyte typeData = 0, typeWindowUpdate = 1, typePing = 2, typeGoAway = 3;
@@ -97,6 +104,12 @@ final class YamuxConn : Muxer
 
 	// --- Muxer -------------------------------------------------------------------
 
+	/// What we grant above the protocol's initial window, with each stream's SYN or ACK.
+	private uint extraWindow() const
+	{
+		return cfg.receiveWindow > initialWindow ? cfg.receiveWindow - initialWindow : 0;
+	}
+
 	Stream open()
 	{
 		if (closed)
@@ -105,7 +118,7 @@ final class YamuxConn : Muxer
 		nextId += 2;
 		auto s = new YamuxStream(this, id);
 		streams[id] = s;
-		sendFrame(typeWindowUpdate, flagSyn, id, 0);
+		sendFrame(typeWindowUpdate, flagSyn, id, extraWindow);
 		return s;
 	}
 
@@ -123,7 +136,7 @@ final class YamuxConn : Muxer
 		auto s = backlog[0];
 		backlog = backlog[1 .. $];
 		if (!closed)
-			sendFrame(typeWindowUpdate, flagAck, s.id, 0); // a dead session has nobody to ack to
+			sendFrame(typeWindowUpdate, flagAck, s.id, extraWindow); // a dead session has nobody to ack to
 		return s;
 	}
 
@@ -412,8 +425,10 @@ private final class YamuxStream : Stream
 	{
 		this.conn = conn;
 		this.id = id;
-		recvWindow = conn.cfg.receiveWindow;
-		sendWindow = conn.cfg.receiveWindow; // the protocol's initial window, both ways
+		// ours: the protocol's initial window plus what our SYN/ACK grants (a smaller
+		// configured window is not below the protocol's: the peer assumes that much)
+		recvWindow = conn.cfg.receiveWindow > initialWindow ? conn.cfg.receiveWindow : initialWindow;
+		sendWindow = initialWindow; // theirs: the protocol's, until their SYN/ACK grants more
 		changed = createManualEvent();
 	}
 

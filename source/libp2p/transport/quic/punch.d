@@ -179,6 +179,7 @@ final class QuicPunchSocket
     /// role). Its opening Initial goes out at once; the read loop routes replies.
     QuicPump punchClient(NetworkAddress peer)
     {
+        refuseSecond(peer.toString(), false);
         // Open our NAT toward the peer NOW, before the QUIC/TLS setup below (tens
         // to hundreds of ms on a slow device): DCUtR timed this moment so that our
         // first packet leaves our NAT before the peer's first packet reaches it —
@@ -213,14 +214,67 @@ final class QuicPunchSocket
         return pump;
     }
 
+    /// One connection per peer tuple on this socket. The read loop demuxes by the peer's
+    /// source address, so a second connection to the same tuple — both sides running a
+    /// DCUtR at once, each punching the other — replaced the first in `_pumps`: every
+    /// packet of the first went to the second, and when the application closed the
+    /// second as a duplicate nothing received the first any more (a live 4G link went
+    /// mute both ways 0.6 s after it came up, 2026-09-25). The later punch fails at once
+    /// instead; the DCUtR that asked for it finds the direct connection the first one
+    /// made (awaitDirect).
+    /// When each tracked pump came to be: an unfinished one only counts as an EARLIER
+    /// round's leftover once it is old enough — a young one may be this round's handshake
+    /// (the peer's Initial can arrive before our own punchServer starts).
+    private MonoTime[string] _bornAt;
+    private enum staleHandshake = 5.seconds;
+
+    /// Returns true when an inbound handshake of this very round is already in progress
+    /// on `key` (punchServer then adopts it through `_accepted` instead of starting over).
+    private bool refuseSecond(string key, bool asServer)
+    {
+        // (a closed pump leaves _pumps by itself: see track)
+        auto p = key in _pumps;
+        if (p is null)
+            return false;
+        auto old = *p;
+        bool established;
+        try
+            established = old.connection !is null && old.connection.handshakeComplete();
+        catch (Exception)
+        {
+        }
+        if (established)
+            throw new Exception("quic punch: a connection to " ~ key ~ " already rides the punch socket");
+        auto born = key in _bornAt;
+        if (born is null || MonoTime.currTime - *born < staleHandshake)
+        {
+            // young: this round's own handshake, not a leftover
+            if (asServer)
+                return true;   // the peer's Initial beat us here: adopt it
+            throw new Exception("quic punch: a handshake with " ~ key ~ " is already under way");
+        }
+        // An attempt still in its handshake long after it began belongs to an EARLIER round
+        // (a punch that did not land, waiting out its budget): the new round supersedes it —
+        // refusing here left a 4G retry with nothing but that stuck attempt.
+        _pumps.remove(old);
+        try
+            old.close();
+        catch (Exception)
+        {
+        }
+        return false;
+    }
+
     // A pump is demuxed by its peer's source tuple until it closes (a connection
     // close by the muxer above, an idle/handshake timeout): then it drops out of
     // every map here, so nothing about a dead connection is kept.
     private void track(string key, QuicPump pump)
     {
+        _bornAt[key] = MonoTime.currTime;
         _pumps.add(key, pump);
         pump.onClosed = () nothrow {
             _pumps.remove(pump);
+            _bornAt.remove(key);
             if (auto p = key in _accepted)
                 if (*p is pump)
                     _accepted.remove(key);
@@ -239,6 +293,7 @@ final class QuicPunchSocket
     QuicPump punchServer(NetworkAddress peer, Duration budget)
     {
         immutable key = peer.toString();
+        cast(void) refuseSecond(key, true);   // a young inbound handshake is adopted via _accepted below
         // Mark this peer as an EXPECTED punch so the read loop routes its inbound
         // handshake here (via _accepted) rather than firing onInbound and admitting
         // it a second time as an ordinary listener connection.

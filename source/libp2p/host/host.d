@@ -60,6 +60,13 @@ final class Host
 	}
 
 	/// Reflexive addresses (webrtc-direct srflx) for a hole punch, for DCUtR.
+	/// The device moved networks: see Swarm.networkChanged. Returns how many
+	/// connections (dead paths on the old network) were closed.
+	size_t networkChanged()
+	{
+		return swarm.networkChanged();
+	}
+
 	Multiaddr[] reflexiveAddrs()
 	{
 		return swarm.reflexiveAddrs();

@@ -50,7 +50,7 @@ import libp2p.multiformats.multiaddr : Multiaddr, Component;
 import libp2p.multiformats.multibase : multibaseEncode;
 import libp2p.multiformats.multihash : Multihash;
 import libp2p.muxer.muxer : Muxer;
-import libp2p.swarm.swarm : CapableTransport, UpgradedConn;
+import libp2p.swarm.swarm : CapableTransport, NetworkAware, UpgradedConn;
 import libp2p.transport.webrtc.fingerprint;
 import libp2p.transport.webrtc.noise;
 import libp2p.transport.webrtc.sdp : randomUfrag, punchUfrag;
@@ -122,7 +122,7 @@ struct WebRtcConfig
 	string[] stunServers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
 }
 
-final class WebRtcTransport : CapableTransport
+final class WebRtcTransport : CapableTransport, NetworkAware
 {
 	private Keypair identity;
 	private Certificate cert;
@@ -151,6 +151,47 @@ final class WebRtcTransport : CapableTransport
 		this.cfg = cfg;
 		cert = new Certificate;
 		gatherDone = createManualEvent();
+	}
+
+	/// The network moved: the gathered reflexive address was the old network's
+	/// NAT mapping; the next offer gathers a fresh one.
+	private bool gatherStale; /// the network moved while a gather ran: its answer is the old network's
+
+	void networkChanged(bool lost) nothrow
+	{
+		// Only an address ADDED (a VPN, a new IPv6): a mux on the punch socket keeps its
+		// mapping alive and owns the socket's one reader — leave all of it as it is (clearing
+		// the gather state would let the next offer read the socket beside the mux)
+		if (!lost && punchMux !is null)
+			return;
+		punchAddr = Multiaddr.init;
+		punchGathered = false;
+		// A gather running now reads the punch socket (one reader per socket: never close
+		// it under that read); what it learns may be the old network's, so it is thrown away
+		// when it finishes and the next offer gathers again.
+		if (gathering)
+		{
+			gatherStale = true;
+			return;
+		}
+		// Only a LOST address kills what rides the punch socket; an added one (a VPN, a new
+		// IPv6) leaves the punched connections working.
+		if (!lost)
+			return;
+		// Retire the punch socket: its mapping was the old network's, and once a punch put
+		// the mux on it the socket can never be read for STUN again (the cached address
+		// would be served for good). The punched connections on it rode the old network.
+		if (punchMux !is null)
+			punchMux.close(); // also drops the gather state and closes punchSock
+		else if (punchSock != UDPConnection.init)
+			try
+				punchSock.close();
+			catch (Exception)
+			{
+			}
+		punchSock = UDPConnection.init;
+		punchAddr = Multiaddr.init;
+		punchGathered = false;
 	}
 
 	Fingerprint fingerprint()
@@ -215,9 +256,17 @@ final class WebRtcTransport : CapableTransport
 		}
 		punchGathered = true;
 		gathering = true;
+		gatherStale = false;
 		scope (exit)
 		{
 			gathering = false;
+			if (gatherStale)
+			{
+				// the network moved under this gather: its answer names the old mapping
+				gatherStale = false;
+				punchAddr = Multiaddr.init;
+				punchGathered = false;
+			}
 			gatherDone.emit();
 		}
 		try

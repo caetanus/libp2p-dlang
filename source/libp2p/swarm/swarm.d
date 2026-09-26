@@ -60,6 +60,12 @@ struct SwarmConfig
 	/// a redial of the same peer right after a close hits the TIME_WAIT tuple.
 	bool dialFromListenPort = false;
 	Duration dialStagger = 100.msecs; /// pause between launching two of them
+	/// With a QUIC address in the race, the first TCP/WebSocket/relay dial waits this long
+	/// behind it (go-libp2p's dial ranker does the same): on a LAN both come up in a few ms
+	/// and whichever won first carried everything — TCP + yamux, whose per-stream window caps a
+	/// transfer, where QUIC has native streams and its own flow control. A QUIC dial that fails
+	/// sooner lets the rest go at once.
+	Duration quicHeadStart = 250.msecs;
 	/// The most inbound substreams one connection will serve at once. A peer that
 	/// keeps opening streams would otherwise pile up an unbounded number of handler
 	/// fibers; at the ceiling the connection stops accepting, and the muxer resets
@@ -111,6 +117,16 @@ interface CapableTransport
 	/// still needs (the securing handshake's client vs. server).
 	UpgradedConn punch(const Multiaddr peerSrflx, PeerId remote, bool asDialer, Nullable!PeerId expected);
 	void close() nothrow;
+}
+
+/// A transport holding state tied to the network it runs on (a STUN-gathered
+/// reflexive address): told when that network changed, so nothing learned on the
+/// old one is advertised on the new one.
+interface NetworkAware
+{
+	/// `lost`: an address we had is gone (Wi-Fi → 4G). False when the change only
+	/// ADDED one (a VPN, a new IPv6): what is established still works.
+	void networkChanged(bool lost) nothrow;
 }
 
 /// Policy on who may connect. Every method answers true by default.
@@ -183,6 +199,11 @@ final class Swarm
 
 	this(Keypair identity, Transport[] transports, SwarmConfig cfg = SwarmConfig.init, ConnectionGater gater = null)
 	{
+		{
+			import libp2p.core.netif : localIps;
+
+			knownIps = localIps();
+		}
 		this.identity = identity;
 		this.localPeer_ = PeerId.fromPublicKey(identity.publicKey);
 		this.transports = transports;
@@ -406,6 +427,12 @@ final class Swarm
 	private Connection dialAny(Multiaddr[] addrs, PeerId peer)
 	{
 		import vibe.core.task : Task;
+		import std.algorithm : sort, SwapStrategy;
+
+		// QUIC first, then WebRTC, then TCP / WebSocket, relayed circuits last (stable: the
+		// caller's order within a rank stays)
+		addrs = addrs.dup;
+		addrs.sort!((a, b) => dialRank(a) < dialRank(b), SwapStrategy.stable);
 
 		auto race = new DialRace;
 		size_t next;
@@ -418,10 +445,13 @@ final class Swarm
 				if (next < addrs.length && inFlight < maxDials)
 				{
 					launchDial(race, addrs[next++], peer);
-					if (race.winner is null && next < addrs.length && cfg.dialStagger > Duration.zero)
+					// a QUIC dial's head start over the first slower-ranked one
+					immutable pause = next < addrs.length && dialRank(addrs[next - 1]) == 0 && dialRank(addrs[next]) > 0
+						&& quicHeadStart > cfg.dialStagger ? quicHeadStart : cfg.dialStagger;
+					if (race.winner is null && next < addrs.length && pause > Duration.zero)
 					{
 						auto ec = race.changed.emitCount;
-						race.changed.wait(cfg.dialStagger, ec); // a fast win or failure cuts the stagger short
+						race.changed.wait(pause, ec); // a fast win or failure cuts the stagger short
 					}
 					continue;
 				}
@@ -453,6 +483,28 @@ final class Swarm
 			throw new DialFailure("dial " ~ peer.toString ~ " failed: "
 				~ (race.last is null ? "no address worked" : race.last.msg), race.last);
 		return race.winner;
+	}
+
+	private Duration quicHeadStart() const
+	{
+		return cfg.quicHeadStart;
+	}
+
+	/// The order a race dials in: 0 QUIC, 1 WebRTC (UDP both), 2 TCP / WebSocket — the last
+	/// resort, for a network that blocks UDP — and 3 a relayed circuit.
+	static int dialRank(const Multiaddr a)
+	{
+		bool circuit, quic, webrtc;
+		foreach (c; a.components)
+		{
+			if (c.name == "p2p-circuit")
+				circuit = true;
+			else if (c.name == "quic-v1" || c.name == "quic")
+				quic = true;
+			else if (c.name == "webrtc-direct" || c.name == "webrtc")
+				webrtc = true;
+		}
+		return circuit ? 3 : quic ? 0 : webrtc ? 1 : 2;
 	}
 
 	// One dial of the race, on its own task. Everything it touches lives in `race`
@@ -643,6 +695,84 @@ final class Swarm
 	Connection[] connections()
 	{
 		return pool.dup;
+	}
+
+	private string[] knownIps; // our interface addresses as last seen (networkChanged diffs against it)
+	private void delegate() nothrow[] networkChangedHandlers;
+
+	/// Run `h` on every networkChanged (identify forgets what peers observed us at).
+	void addNetworkChangedHandler(void delegate() nothrow h)
+	{
+		networkChangedHandlers ~= h;
+	}
+
+	/// The device moved networks (Wi-Fi → cellular, a new Wi-Fi, a VPN up or down).
+	/// Every connection whose local IP is no longer on any interface is a dead path —
+	/// on Android its socket can linger "open" for minutes — so it is closed now, and
+	/// with it what peers observed us at over it (identify drops a closed
+	/// connection's observations). Transports forget their reflexive addresses. Left
+	/// alone, a phone that went from Wi-Fi to 4G kept offering its home Wi-Fi's
+	/// public IP as its own for the hole punch, and every punch aimed at it failed.
+	/// Returns how many connections were closed.
+	size_t networkChanged()
+	{
+		import libp2p.core.netif : localIps;
+
+		import vibe.core.log : logInfo;
+
+		auto ips = localIps();
+		if (ips.length == 0)
+		{
+			logInfo("libp2p: network changed — interface list unavailable; nothing closed");
+			return 0; // the kernel could not be asked: unknown, not "every address gone"
+		}
+		// gone = our addresses before the change that are not ours now. Only a connection
+		// whose local IP is among them is on a dead path: a local address that was never an
+		// interface's (a punched connection records its public STUN address) says nothing,
+		// and a network that only ADDED an address (a VPN coming up) kills nothing.
+		string[] gone;
+		foreach (a; knownIps)
+			if (!ips.canFind(a))
+				gone ~= a;
+		logInfo("libp2p: network changed — now %s; gone %s", ips, gone);
+		knownIps = ips;
+		foreach (t; capable)
+			if (auto na = cast(NetworkAware) t)
+				na.networkChanged(gone.length > 0);
+		foreach (t; transports)
+			if (auto na = cast(NetworkAware) t)
+				na.networkChanged(gone.length > 0);
+		foreach (h; networkChangedHandlers)
+			h();
+		size_t closed_;
+		foreach (c; pool.dup)
+		{
+			if (c.isClosed)
+				continue;
+			string ip;
+			foreach (comp; c.localAddr.components)
+				if (comp.name == "ip4" || comp.name == "ip6")
+				{
+					ip = comp.text;
+					break;
+				}
+			// no IP of its own (a relayed circuit rides another connection), or a
+			// wildcard: nothing to judge by here
+			if (ip.length == 0 || ip == "0.0.0.0" || ip == "::")
+				continue;
+			try
+				logInfo("libp2p: network changed — %s via %s (local %s): %s", c.remotePeer.toString,
+					c.remoteAddr.toString, ip, gone.canFind(ip) ? "on a gone address, closing" : "kept");
+			catch (Exception)
+			{
+			}
+			if (gone.canFind(ip))
+			{
+				c.close();
+				closed_++;
+			}
+		}
+		return closed_;
 	}
 
 	/// Fibers serving connections right now, across the swarm.

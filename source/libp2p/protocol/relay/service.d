@@ -102,6 +102,14 @@ final class Relay : Notifiee, Transport
 	/// peer must not make us connect to our own machine); on for loopback tests.
 	bool allowLoopbackCandidates = false;
 	private bool[PeerId] autoPunching; // initiator punches in flight, one per peer
+	/// ensureDirect punches in flight, one per peer: a second caller (the app's retry
+	/// loop beside a rendezvous) waits for it instead of punching over it — two punches
+	/// at once fight over the same sockets and mappings, and the loser's clean-up closed
+	/// the relayed connection the winner was still punching through.
+	private bool[PeerId] ensuring;
+	/// DCUtRs the peer started with us that we are answering (punching as the client):
+	/// ensureDirect waits for that one instead of starting a second, crossing exchange.
+	private bool[PeerId] responding;
 	private ubyte[][] observed;
 	private FiberGroup fibers;
 
@@ -172,7 +180,8 @@ final class Relay : Notifiee, Transport
 	/// public source IP:port and reported it via identify's `observedAddr`. So the
 	/// PRIMARY candidate is that observed public IP paired with each of our listen
 	/// ports (a port-preserving / cone NAT maps the listener to the same external
-	/// port — the go-libp2p reuseport recipe). Behind a VPN the observed IP is the
+	/// port — the go-libp2p reuseport recipe) — offered AFTER the STUN reflexive
+	/// addresses, which carry the real mapped port (see below). Behind a VPN the observed IP is the
 	/// tunnel exit's PUBLIC address (what the relay saw), which is exactly the punch
 	/// target — never the local 100.84.x tunnel IP, and no STUN round-trip. The STUN
 	/// server-reflexive address is a last-resort FALLBACK, offered only when identify
@@ -192,6 +201,18 @@ final class Relay : Notifiee, Transport
 				add(Multiaddr.decode(raw));
 			return out_; // an explicit override is exactly what we offer
 		}
+
+		// FIRST, always: the STUN server-reflexive addresses — the real NAT mapping of the
+		// very socket a QUIC / webrtc-direct punch leaves from, port included. Behind a
+		// carrier NAT the external port is NOT our listen port, so an observed IP paired
+		// with the listen port (below) names a port nobody holds, and every UDP punch at it
+		// timed out (a home CGNAT ↔ 4G CGNAT pair, 2026-09-25: the computer offered
+		// 181.233.106.5:41521 while its mapping was another port). Once only a fallback,
+		// used when identify had observed nothing — so a node with observations, i.e.
+		// every long-running one, never offered the one address that could be punched.
+		foreach (a; host.reflexiveAddrs())
+			if (isRoutable(a))
+				add(a);
 
 		bool haveDirectPublic = false;
 		auto observedSeen = host.observedAddrs();
@@ -249,14 +270,7 @@ final class Relay : Notifiee, Transport
 				add(a);
 				haveDirectPublic = true;
 			}
-		// FALLBACK ONLY: the STUN server-reflexive address, used solely when identify
-		// and our listeners gave us no public address at all. This keeps the
-		// proactive-gather machinery as a safety net rather than the primary path (and
-		// off the critical path on Android with the VPN down).
-		if (!haveDirectPublic)
-			foreach (a; host.reflexiveAddrs())
-				if (isRoutable(a))
-					add(a);
+		cast(void) haveDirectPublic;
 		return out_;
 	}
 
@@ -579,20 +593,30 @@ final class Relay : Notifiee, Transport
 	{
 		if (auto c = directConnection(peer))
 			return c;
+		if (peer in autoPunching || peer in ensuring || peer in responding)
+		{
+			// a punch of this peer is under way (connected()'s, or another caller's):
+			// its outcome is ours too — never a second punch over it
+			immutable deadline = MonoTime.currTime + host.swarm.config.dialTimeout
+				+ host.swarm.config.handshakeTimeout + 30.seconds;
+			while ((peer in autoPunching || peer in ensuring || peer in responding) && MonoTime.currTime < deadline)
+				sleep(20.msecs);
+			if (auto c = directConnection(peer))
+				return c;
+			throw new Exception("dcutr: no direct connection to " ~ peer.toString);
+		}
+		ensuring[peer] = true;
 		scope (exit)
+		{
+			ensuring.remove(peer);
+			// the relayed meeting point has served its purpose, punched or not (only the
+			// caller that punched closes it: a waiter above must not pull it out from under
+			// a punch still running)
 			foreach (c; host.swarm.connectionsTo(peer))
 				if (isRelayed(c))
 					c.close();
-		if (peer in autoPunching)
-		{
-			// connected() is already punching this peer; let that finish.
-			immutable deadline = MonoTime.currTime + host.swarm.config.dialTimeout
-				+ host.swarm.config.handshakeTimeout;
-			while (peer in autoPunching && MonoTime.currTime < deadline)
-				sleep(20.msecs);
 		}
-		else
-			holePunch(peer);
+		holePunch(peer);
 		if (auto c = directConnection(peer))
 			return c;
 		throw new Exception("dcutr: no direct connection to " ~ peer.toString);
@@ -767,7 +791,33 @@ final class Relay : Notifiee, Transport
 		auto race = new PunchRace;
 		race.changed = createManualEvent();
 		foreach (raw; ordered)
+			try
+				if (Multiaddr.decode(raw).components.canFind!(x => x.name == "quic-v1"))
+					race.quicLeft++;
+			catch (Exception)
+			{
+			}
+		foreach (raw; ordered)
 			race.tasks ~= runTask((PunchRace r, ubyte[] a, PeerId p, bool dialer) nothrow {
+				bool quicTask;
+				try
+					quicTask = Multiaddr.decode(a).components.canFind!(x => x.name == "quic-v1");
+				catch (Exception)
+				{
+				}
+				void quicDone() nothrow
+				{
+					if (!quicTask)
+						return;
+					r.quicLeft--;
+					try
+						r.changed.emit();
+					catch (Exception)
+					{
+					}
+				}
+				scope (exit)
+					quicDone();
 				Connection c;
 				Exception failure;
 				try
@@ -777,10 +827,26 @@ final class Relay : Notifiee, Transport
 				}
 				catch (Exception e)
 					failure = e;
-				if (c !is null && (r.done || r.winner !is null))
+				// One direct connection is enough — except that a QUIC one landing after
+				// another transport won is kept beside it: QUIC is the carrier (native
+				// streams, its own flow control), and the application moves onto it (a
+				// WebRTC path won the 4G race and then went mute under the transfer).
+				immutable lateQuic = c !is null && !r.done && r.winner !is null && isQuicConn(c)
+					&& !isQuicConn(r.winner);
+				if (c !is null && (r.done || r.winner !is null) && !lateQuic)
 				{
 					c.close(); // one direct connection is enough
 					c = null;
+				}
+				if (lateQuic)
+				{
+					r.finished++;
+					try
+						r.changed.emit();
+					catch (Exception)
+					{
+					}
+					return;
 				}
 				if (r.done)
 					return;
@@ -810,6 +876,17 @@ final class Relay : Notifiee, Transport
 				auto ec = race.changed.emitCount;
 				race.changed.wait(ec);
 			}
+			// Another transport won while a QUIC punch is still running: give QUIC a few
+			// seconds to land too (the task keeps it beside the winner; see above).
+			if (race.winner !is null && !isQuicConn(race.winner) && race.quicLeft > 0)
+			{
+				immutable until = MonoTime.currTime + 5.seconds;
+				while (race.quicLeft > 0 && MonoTime.currTime < until)
+				{
+					auto ec = race.changed.emitCount;
+					race.changed.wait(until - MonoTime.currTime, ec);
+				}
+			}
 		}
 		finally
 		{
@@ -827,6 +904,14 @@ final class Relay : Notifiee, Transport
 		}
 		last = race.last;
 		return race.winner;
+	}
+
+	private static bool isQuicConn(Connection c) nothrow
+	{
+		try
+			return c.remoteAddr.components.canFind!(x => x.name == "quic-v1");
+		catch (Exception)
+			return false;
 	}
 
 	// The candidates of a peer's offer we are willing to reach for: at most
@@ -909,9 +994,13 @@ final class Relay : Notifiee, Transport
 		logInfo("libp2p: dcutr from %s: their addrs [%s], ours [%s]", peer.toString, addrList(theirs),
 			addrList(punchAddrs()));
 		punches++;
+		responding[peer] = true;
 		fibers.spawn({
 			scope (exit)
+			{
 				punches--;
+				responding.remove(peer);
+			}
 			Exception last;
 			// The receiver of the SYNC is the CLIENT of the direct connection and
 			// dials the moment the SYNC lands (the initiator became the server half a
@@ -925,6 +1014,7 @@ final class Relay : Notifiee, Transport
 /// late punch task never touches a frame that is gone.
 private final class PunchRace
 {
+	size_t quicLeft; /// QUIC punches still running (a non-QUIC winner waits a little for them)
 	Connection winner;
 	Exception last;
 	size_t finished;

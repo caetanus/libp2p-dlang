@@ -29,14 +29,14 @@ import vibe.core.core : sleep;
 
 import libp2p.core.ending : ConnClosed, EndOfStream, StreamReset;
 import libp2p.core.stream;
-import libp2p.muxer.yamux : YamuxConn;
+import libp2p.muxer.yamux : YamuxConn, YamuxConfig;
 import tests.util.pipe : MemStream, memPair;
 import tests.util.loop : onLoop, spawn, Side;
 import fluent.asserts;
 
 private enum ubyte typeData = 0, typeWindowUpdate = 1, typePing = 2, typeGoAway = 3;
 private enum ushort flagSyn = 0x1, flagAck = 0x2, flagFin = 0x4, flagRst = 0x8;
-private enum uint window = 256 * 1024; // yamux's initial receive window
+private enum uint window = YamuxConfig.init.receiveWindow; // what a session grants each stream (SYN/ACK)
 
 // --- hand-written frames ----------------------------------------------------
 

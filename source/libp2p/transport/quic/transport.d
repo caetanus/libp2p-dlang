@@ -26,7 +26,7 @@ import vibe.core.net : NetworkAddress, resolveHost;
 import libp2p.crypto.keys : Keypair;
 import libp2p.core.peer_id : PeerId;
 import libp2p.multiformats.multiaddr : Multiaddr, Component;
-import libp2p.swarm.swarm : CapableTransport, UpgradedConn;
+import libp2p.swarm.swarm : CapableTransport, NetworkAware, UpgradedConn;
 import libp2p.transport.quic.connection : QuicConnection;
 import libp2p.transport.quic.udp : QuicClient, QuicListener, QuicPump;
 import libp2p.transport.quic.punch : QuicPunchSocket;
@@ -39,7 +39,7 @@ struct QuicConfig
     string[] stunServers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
 }
 
-final class QuicTransport : CapableTransport
+final class QuicTransport : CapableTransport, NetworkAware
 {
     private Keypair _identity;
     private QuicConfig _cfg;
@@ -269,6 +269,17 @@ final class QuicTransport : CapableTransport
 
     private enum srflxMaxAge = 25.seconds;
     private MonoTime _gatheredAt;
+
+    /// The network moved: the reflexive address was the old network's NAT mapping.
+    void networkChanged(bool lost) nothrow
+    {
+        // (the reflexive address is re-gathered on any change: an added VPN can move the
+        // default route, and a fresh STUN round costs one datagram)
+        _reflexive = Multiaddr.init;
+        _gathered = false;
+        if (!_closed && _keepalive)
+            gatherSoon();
+    }
     private bool _keepalive;
     private bool _gathering;
 
@@ -292,6 +303,13 @@ final class QuicTransport : CapableTransport
                 _reflexive = toQuicMultiaddr(srflx.get);
                 _gathered = true;
                 _gatheredAt = MonoTime.currTime;
+            }
+            else if (_gathered && MonoTime.currTime - _gatheredAt >= 3 * srflxMaxAge)
+            {
+                // unconfirmed for three rounds: not advertised any longer (it may
+                // belong to a network we have left)
+                _reflexive = Multiaddr.init;
+                _gathered = false;
             }
         }
         catch (Exception)

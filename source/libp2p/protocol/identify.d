@@ -120,6 +120,10 @@ final class IdentifyService : Notifiee
 		host.setStreamHandler(identifyPushProtocol, &servePush);
 		host.addNotifiee(this);
 		host.addObservedAddrSource(&observedAddrs);
+		// a new network: every observation is of the old one (QUIC connections on the
+		// wildcard socket are not closed by networkChanged, so theirs would linger);
+		// new connections observe us afresh
+		host.swarm.addNetworkChangedHandler(() nothrow { observedBy = null; });
 	}
 
 	/// Tell `peer` that our description changed (new listen address, new
