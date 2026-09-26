@@ -68,6 +68,29 @@ shared static this()
     quicTrace = getenv("LIBP2P_QUIC_TRACE") !is null;
 }
 
+// The raw sockaddr bytes of a path half.
+private const(ubyte)[] addrOf(ref const ngtcp2_addr a) @trusted pure nothrow @nogc
+{
+    return a.addr is null ? null : (cast(const(ubyte)*) a.addr)[0 .. a.addrlen];
+}
+
+/// Whether two raw sockaddrs name the same endpoint: family, port and address —
+/// not the padding (sin_zero) or IPv6 flow label a byte comparison would also see.
+bool sameEndpoint(scope const(ubyte)[] a, scope const(ubyte)[] b) @trusted pure nothrow @nogc
+{
+    import std.socket : AddressFamily;
+
+    // sa_family (host order) then the port, at the same place for v4 and v6
+    if (a.length < 4 || b.length < 4 || a[0 .. 4] != b[0 .. 4])
+        return false;
+    immutable fam = *cast(const(ushort)*) a.ptr;
+    if (fam == AddressFamily.INET)
+        return a.length >= 8 && b.length >= 8 && a[4 .. 8] == b[4 .. 8];
+    if (fam == AddressFamily.INET6) // address, then scope id; not the flow label
+        return a.length >= 28 && b.length >= 28 && a[8 .. 24] == b[8 .. 24] && a[24 .. 28] == b[24 .. 28];
+    return a == b;
+}
+
 final class QuicConnection : Muxer
 {
     private
@@ -114,6 +137,7 @@ final class QuicConnection : Muxer
         cb.recv_stream_data = &recvStreamDataCb;
         cb.stream_close = &streamCloseCb;
         cb.acked_stream_data_offset = &ackedStreamDataCb;
+        cb.path_validation = &pathValidationCb;
     }
 
     private void setPath(scope const(ubyte)[] local, scope const(ubyte)[] remote)
@@ -249,14 +273,199 @@ final class QuicConnection : Muxer
         SSL_set_ex_data(_ssl, 0, &_connRef);
     }
 
-    /// Feed one inbound datagram to ngtcp2.
-    void deliver(scope const(ubyte)[] packet)
+    /// Feed one inbound datagram to ngtcp2. `from` is the sockaddr it came from;
+    /// empty = the connection's original path.
+    ///
+    /// A source other than the peer's known address is a peer that moved — a NAT
+    /// rebinding, a 4G CGNAT handing the phone a new port mid-transfer:
+    /// - on the server side ngtcp2 validates the new path and migrates the
+    ///   connection onto it (RFC 9000 §9), which it can only do when told the
+    ///   address the packet really came from;
+    /// - on the client side QUIC has no such move (a server is meant to stay put)
+    ///   and ngtcp2 ignores a packet from an unknown path. In a hole punch both ends
+    ///   sit behind NATs and either may rebind, so the client follows its peer (see
+    ///   followPeer): an authenticated packet from a new address starts ngtcp2's own
+    ///   path validation toward it, and only a PATH_RESPONSE from there moves the
+    ///   connection.
+    void deliver(scope const(ubyte)[] packet, scope const(ubyte)[] from = null)
     {
         if (_conn is null)
             return;
+        if (_role == QuicRole.client)
+            return deliverAsClient(packet, from);
         ngtcp2_pkt_info pi;
-        immutable rv = ngtcp2_conn_read_pkt(_conn, &_path, &pi, packet.ptr, packet.length, nowNanos());
+        ngtcp2_path path = _path;
+        ubyte[128] fromSa = void;
+        if (from.length && from.length <= fromSa.length)
+        {
+            fromSa[0 .. from.length] = from[];
+            path.remote.addr = cast(ngtcp2_sockaddr*) fromSa.ptr;
+            path.remote.addrlen = cast(ngtcp2_socklen) from.length;
+        }
+        readPkt(path, packet);
+    }
+
+    private void readPkt(ref ngtcp2_path path, scope const(ubyte)[] packet)
+    {
+        ngtcp2_pkt_info pi;
+        immutable rv = ngtcp2_conn_read_pkt(_conn, &path, &pi, packet.ptr, packet.length, nowNanos());
         enforce(rv == 0, "ngtcp2_conn_read_pkt failed");
+    }
+
+    // ---- client side: following a server that moved ------------------------------
+    //
+    // ngtcp2 migrates a client only onto a path with a different LOCAL address (the
+    // client's own interface change). Ours stays the same socket; the peer's
+    // address is what changed. The local half of a path is only a name to ngtcp2 —
+    // nothing goes on the wire from it — so each move gets a fresh name: our real
+    // local address with a synthetic port (a "label"), and ngtcp2 sees an ordinary
+    // client migration it validates with PATH_CHALLENGE / PATH_RESPONSE on the new
+    // path. Validation is what makes the move safe: a replayed or reordered packet
+    // from some other address only starts a validation that address cannot answer
+    // (a victim, a dead mapping), and the connection stays where it is.
+
+    private ushort _labelGen; // local-name generation for the next move
+    private ubyte[128] _pvLocal; // the label of the move being validated
+    private ubyte[128] _pvRemote; // ... and where to
+    private ngtcp2_path _pvPath;
+    private bool _pvPending;
+
+    private void deliverAsClient(scope const(ubyte)[] packet, scope const(ubyte)[] from)
+    {
+        settleMove();
+        auto cur = ngtcp2_conn_get_path2(_conn);
+        ngtcp2_path_storage ps; // a copy: read_pkt may move the connection's path
+        if (cur is null)
+        {
+            ngtcp2_path_storage_init(&ps, _path.local.addr, _path.local.addrlen,
+                _path.remote.addr, _path.remote.addrlen, null);
+            return readPkt(ps.path, packet);
+        }
+        ngtcp2_path_storage_init(&ps, cur.local.addr, cur.local.addrlen, cur.remote.addr, cur.remote.addrlen, null);
+        if (from.length == 0 || sameEndpoint(from, addrOf(cur.remote)))
+            return readPkt(ps.path, packet); // the peer where ngtcp2 knows it
+        if (_pvPending && sameEndpoint(from, addrOf(_pvPath.remote)))
+        {
+            // on the path being validated: this may be its PATH_RESPONSE
+            ngtcp2_path_storage pv;
+            ngtcp2_path_storage_init(&pv, _pvPath.local.addr, _pvPath.local.addrlen,
+                _pvPath.remote.addr, _pvPath.remote.addrlen, null);
+            readPkt(pv.path, packet);
+            settleMove();
+            return;
+        }
+        // An unknown address. Read the packet as if it came on the current path —
+        // ngtcp2 would drop it unread otherwise — and if it authenticates (ngtcp2
+        // took it: decrypted and not a duplicate), the peer may live there now.
+        ngtcp2_conn_info before, after;
+        ngtcp2_conn_get_conn_info(_conn, &before);
+        readPkt(ps.path, packet);
+        if (_conn is null)
+            return;
+        ngtcp2_conn_get_conn_info(_conn, &after);
+        if (after.pkt_recv > before.pkt_recv && (packet[0] & 0x80) == 0)
+            followPeer(from);
+    }
+
+    // Start validating a move to `to`. One at a time: a move already being
+    // validated is left to finish (a late packet from an older address must not
+    // abort the validation of the current one).
+    private void followPeer(scope const(ubyte)[] to)
+    {
+        settleMove();
+        if (_pvPending || to.length > _pvRemote.length || _path.local.addrlen > _pvLocal.length)
+            return;
+        immutable llen = _path.local.addrlen;
+        _pvLocal[0 .. llen] = _localSa[0 .. llen];
+        // a synthetic port for the label (sin_port / sin6_port sit at bytes 2..3)
+        immutable realPort = cast(ushort)((_localSa[2] << 8) | _localSa[3]);
+        // (the generation only advances when a validation really starts, so labels
+        // are not burnt by refused attempts and do not come round to one still in
+        // ngtcp2's path history, which would skip the validation)
+        ushort gen = _labelGen;
+        ushort label;
+        do
+            label = cast(ushort)(realPort + ++gen);
+        while (label == realPort || label == 0);
+        _pvLocal[2] = cast(ubyte)(label >> 8);
+        _pvLocal[3] = cast(ubyte) label;
+        _pvRemote[0 .. to.length] = to[];
+        _pvPath.local.addr = cast(ngtcp2_sockaddr*) _pvLocal.ptr;
+        _pvPath.local.addrlen = llen;
+        _pvPath.remote.addr = cast(ngtcp2_sockaddr*) _pvRemote.ptr;
+        _pvPath.remote.addrlen = cast(ngtcp2_socklen) to.length;
+        immutable rv = ngtcp2_conn_initiate_migration(_conn, &_pvPath, nowNanos());
+        if (rv == 0)
+        {
+            _labelGen = gen;
+            _pvPending = true;
+            if (quicTrace)
+            {
+                import core.stdc.stdio : fprintf, stderr;
+                fprintf(stderr, "QUICTRACE client: the peer answered from a new address; validating the path\n");
+            }
+        }
+        // else: no spare connection id yet (NGTCP2_ERR_CONN_ID_BLOCKED) or not
+        // allowed now — the next authenticated packet from there tries again
+    }
+
+    // The validation ended when ngtcp2 says so — its path_validation callback, on
+    // success, failure or abort — or when the validated path is already current.
+    private void settleMove()
+    {
+        if (!_pvPending || _conn is null)
+            return;
+        auto cur = ngtcp2_conn_get_path2(_conn);
+        if (cur !is null && sameEndpoint(addrOf(cur.local), _pvLocal[0 .. _pvPath.local.addrlen])
+            && sameEndpoint(addrOf(cur.remote), _pvRemote[0 .. _pvPath.remote.addrlen]))
+            _pvPending = false; // moved: the validated path is current
+    }
+
+    // ngtcp2's verdict on a path validation (either role; only the client's own
+    // moves are tracked).
+    private void onPathValidation()
+    {
+        _pvPending = false;
+    }
+
+    /// The peer's address now (raw sockaddr bytes): the current path's remote.
+    /// Empty once closed.
+    ubyte[] remoteAddr()
+    {
+        if (_conn is null)
+            return null;
+        auto p = ngtcp2_conn_get_path2(_conn);
+        if (p is null || p.remote.addr is null)
+            return null;
+        return addrOf(p.remote).dup;
+    }
+
+    /// Whether the peer, as this connection knows it now, is at `addr`.
+    bool isPeerAt(scope const(ubyte)[] addr)
+    {
+        if (_conn is null)
+            return false;
+        auto p = ngtcp2_conn_get_path2(_conn);
+        return p !is null && sameEndpoint(addrOf(p.remote), addr);
+    }
+
+    /// Whether `dcid` is one of the connection ids this end issued — how a packet
+    /// arriving from an unknown address (a peer whose NAT rebound) is matched to its
+    /// connection.
+    bool ownsCid(scope const(ubyte)[] dcid)
+    {
+        if (_conn is null || dcid.length == 0 || dcid.length > NGTCP2_MAX_CIDLEN)
+            return false;
+        immutable n = ngtcp2_conn_get_scid2(_conn, null);
+        if (n == 0)
+            return false;
+        ngtcp2_cid[16] fixed;
+        auto ids = n <= fixed.length ? fixed[0 .. n] : new ngtcp2_cid[n];
+        immutable got = ngtcp2_conn_get_scid2(_conn, ids.ptr);
+        foreach (ref c; ids[0 .. got])
+            if (c.datalen == dcid.length && c.data[0 .. c.datalen] == dcid)
+                return true;
+        return false;
     }
 
     /// Drain one outbound packet into `scratch`; the returned slice is empty when
@@ -428,12 +637,18 @@ final class QuicConnection : Muxer
     /// into `sink`. This is the writing side of the whole connection: with no
     /// stream to offer it behaves exactly like `writeOne` (stream id -1). The
     /// driver calls it whenever it wants to service output.
-    void collectOutgoing(scope void delegate(scope const(ubyte)[]) sink)
+    void collectOutgoing(scope void delegate(scope const(ubyte)[] pkt, scope const(ubyte)[] to) sink)
     {
         if (_conn is null)
             return;
         ubyte[2048] buf;
         ngtcp2_pkt_info pi;
+        // Where each packet goes is ngtcp2's to say: after a peer migrates, the
+        // current path is the new address, and a path validation also probes the
+        // old one. A fixed destination would keep talking to a port the peer's NAT
+        // has already given up.
+        ngtcp2_path_storage ps;
+        ngtcp2_path_storage_zero(&ps);
         // Pacing: ngtcp2 tells us how many bytes may leave in one burst (the send
         // quantum, sized from cwnd and the pacing rate); past it we stop, stamp
         // the transmit time, and let the expiry timer bring us back. Without this
@@ -483,7 +698,7 @@ final class QuicConnection : Muxer
             }
 
             long written = -1;
-            immutable n = ngtcp2_conn_writev_stream(_conn, null, &pi, buf.ptr, buf.length,
+            immutable n = ngtcp2_conn_writev_stream(_conn, &ps.path, &pi, buf.ptr, buf.length,
                 &written, flags, streamId, datav, datavcnt, nowNanos());
 
             if (n == NGTCP2_ERR_STREAM_DATA_BLOCKED)
@@ -549,7 +764,7 @@ final class QuicConnection : Muxer
 
             if (n == 0)
                 break; // nothing more to send right now
-            sink(buf[0 .. cast(size_t) n]);
+            sink(buf[0 .. cast(size_t) n], addrOf(ps.path.remote));
             burst += cast(size_t) n;
             if (_conn is null)
                 return; // the send yielded and the connection was closed meanwhile (idle
@@ -709,6 +924,17 @@ extern (C) private int ackedStreamDataCb(ngtcp2_conn* conn, long streamId, ulong
     auto self = cast(QuicConnection) userData;
     try
         self.onAckedStreamData(streamId, offset, datalen);
+    catch (Exception)
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    return 0;
+}
+
+extern (C) private int pathValidationCb(ngtcp2_conn* conn, uint flags, const(ngtcp2_path)* path,
+    const(ngtcp2_path)* fallbackPath, ngtcp2_path_validation_result res, void* userData)
+{
+    auto self = cast(QuicConnection) userData;
+    try
+        self.onPathValidation();
     catch (Exception)
         return NGTCP2_ERR_CALLBACK_FAILURE;
     return 0;

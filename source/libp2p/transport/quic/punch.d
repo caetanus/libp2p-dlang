@@ -25,7 +25,7 @@ import webrtc.stun.message : Message, XorMappedAddress, isStunMessage, bindingRe
 
 import libp2p.crypto.keys : Keypair;
 import libp2p.transport.quic.connection : QuicConnection;
-import libp2p.transport.quic.udp : QuicPump, addrBytes, trySendNow;
+import libp2p.transport.quic.udp : QuicPump, PumpDemux, addrBytes, fromAddrBytes, sockBytes, trySendNow;
 
 /// A plausible-QUIC test: QUIC's long and short headers both set the fixed bit
 /// (0x40); a NAT-opener pad (a zero byte) does not, so junk never reaches ngtcp2.
@@ -38,7 +38,7 @@ final class QuicPunchSocket
 {
     private UDPConnection _udp;
     private Keypair _identity;
-    private QuicPump[string] _pumps; // by source address
+    private PumpDemux _pumps; // by source address, then by connection id (a peer that moved)
     private bool _closed;
     /// Inbound handshakes in progress at once; an Initial past this is dropped.
     /// One Initial from a fresh source tuple costs a connection, TLS state, a
@@ -78,16 +78,19 @@ final class QuicPunchSocket
         return _udp.localAddress;
     }
 
-    // A send delegate bound to one peer (peer BY VALUE, per-pump).
-    private bool delegate(scope const(ubyte)[]) nothrow trySender(NetworkAddress peer)
+    // A send delegate for one peer (peer BY VALUE, per-pump). The peer is only the
+    // default: each packet goes where ngtcp2's path for it says, so a connection
+    // whose peer's NAT rebound follows it to the new port.
+    private bool delegate(scope const(ubyte)[], scope const(ubyte)[]) nothrow trySender(NetworkAddress peer)
     {
-        return (scope const(ubyte)[] pkt) nothrow => trySendNow(_udp, _sendLock, pkt, peer);
+        return (scope const(ubyte)[] pkt, scope const(ubyte)[] to) nothrow
+            => trySendNow(_udp, _sendLock, pkt, fromAddrBytes(to, peer));
     }
 
-    private void delegate(scope const(ubyte)[]) sender(NetworkAddress peer)
+    private void delegate(scope const(ubyte)[], scope const(ubyte)[]) sender(NetworkAddress peer)
     {
-        return (scope const(ubyte)[] pkt) {
-            auto to = peer;
+        return (scope const(ubyte)[] pkt, scope const(ubyte)[] dst) {
+            auto to = fromAddrBytes(dst, peer);
             synchronized (_sendLock)
                 _udp.send(pkt, &to);
         };
@@ -215,11 +218,9 @@ final class QuicPunchSocket
     // every map here, so nothing about a dead connection is kept.
     private void track(string key, QuicPump pump)
     {
-        _pumps[key] = pump;
+        _pumps.add(key, pump);
         pump.onClosed = () nothrow {
-            if (auto p = key in _pumps)
-                if (*p is pump)
-                    _pumps.remove(key);
+            _pumps.remove(pump);
             if (auto p = key in _accepted)
                 if (*p is pump)
                     _accepted.remove(key);
@@ -394,9 +395,15 @@ final class QuicPunchSocket
                     continue; // NAT-opener pad or junk
 
                 immutable key = from.toString();
-                if (auto p = key in _pumps)
+                // By tuple, or by connection id: a peer whose NAT rebound (a 4G
+                // CGNAT moving the phone to a new port mid-transfer) arrives from a
+                // tuple no connection started on. Demuxed by tuple alone, every
+                // packet after the move matched nothing and the connection went
+                // mute one way; now the connection gets it and follows the peer.
+                if (auto p = _pumps.find(key, pkt))
                 {
-                    p.deliver(pkt);
+                    p.deliver(pkt, sockBytes(from));
+                    _pumps.noteMoved(key, p, sockBytes(from));
                     continue;
                 }
                 // A new peer sending QUIC: we are the server of this punch. Only so
@@ -419,7 +426,7 @@ final class QuicPunchSocket
                     pump = new QuicPump(inboundConn, sender(from));
                     pump.trySend = trySender(from);
                     track(key, pump);
-                    pump.deliver(pkt); // may throw on a malformed Initial
+                    pump.deliver(pkt, sockBytes(from)); // may throw on a malformed Initial
                 }
                 catch (Exception)
                 {
@@ -459,7 +466,7 @@ final class QuicPunchSocket
         if (_closed)
             return;
         _closed = true;
-        foreach (p; _pumps)
+        foreach (p; _pumps.pumps) // a snapshot: each close removes its own entries
             p.close();
         _udp.close();
     }

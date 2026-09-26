@@ -53,6 +53,9 @@ extern (C) int quicGetNewConnectionId(ngtcp2_conn* conn, ngtcp2_cid* cid, ubyte*
 /// no stream opens (STREAM_ID_BLOCKED) and no data flows.
 void setStreamLimits(ref ngtcp2_transport_params p) nothrow @nogc
 {
+    // Spare connection ids for the peer to move to: a connection that follows its
+    // peer through NAT rebindings spends one per move (RFC 9000 §9.5).
+    p.active_connection_id_limit = 4;
     p.initial_max_streams_bidi = 128;
     p.initial_max_streams_uni = 128;
     p.initial_max_stream_data_bidi_local = 1024 * 1024;

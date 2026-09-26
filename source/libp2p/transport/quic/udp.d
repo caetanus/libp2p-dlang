@@ -33,19 +33,191 @@ package ubyte[] addrBytes(NetworkAddress na) @trusted
     return (cast(const(ubyte)*) na.sockAddr)[0 .. na.sockAddrLen].dup;
 }
 
+/// And back: the NetworkAddress for raw sockaddr bytes (as ngtcp2 names a path's
+/// remote). `fallback` when the bytes are not an IPv4/IPv6 sockaddr.
+NetworkAddress fromAddrBytes(scope const(ubyte)[] sa, NetworkAddress fallback) @trusted nothrow
+{
+    import core.sys.posix.netinet.in_ : sockaddr_in, sockaddr_in6;
+    import std.socket : AddressFamily;
+
+    if (sa.length < 2)
+        return fallback;
+    NetworkAddress na;
+    immutable fam = (cast(const(ushort)*) sa.ptr)[0];
+    immutable want = fam == AddressFamily.INET ? sockaddr_in.sizeof
+        : fam == AddressFamily.INET6 ? sockaddr_in6.sizeof : 0;
+    if (want == 0 || sa.length < want)
+        return fallback;
+    (cast(ubyte*) na.sockAddr)[0 .. want] = sa[0 .. want];
+    return na;
+}
+
+// The raw sockaddr bytes of `na`, without a copy (valid while `na` is).
+package const(ubyte)[] sockBytes(return ref NetworkAddress na) @trusted nothrow
+{
+    return (cast(const(ubyte)*) na.sockAddr)[0 .. na.sockAddrLen];
+}
+
+/// Demux by source tuple, with a fallback by connection id: a socket shared by
+/// several connections routes each datagram by the address it came from, but a
+/// peer's NAT can rebind mid-connection (a 4G CGNAT does; the port changes, the
+/// connection ids do not). A datagram from an unknown tuple whose destination
+/// connection id belongs to a live connection is that connection's — delivered to
+/// it with the new source so ngtcp2 validates and migrates the path — and, once
+/// ngtcp2 has moved onto it, the new tuple is remembered as an alias.
+package struct PumpDemux
+{
+    private QuicPump[string] _byTuple; // the tuple each connection started on
+    private Moved[string] _moved; // tuples a connection migrated to
+    private ulong _movedSeq;
+    private enum size_t maxMovesPerPump = 4;
+
+    private static struct Moved
+    {
+        QuicPump pump;
+        ulong seq; // eviction order: the oldest move goes first
+    }
+
+    /// The connection for a datagram from tuple `key`, or null.
+    ///
+    /// The tuple a connection started on is its own. A tuple it later moved to is
+    /// only a routing hint: the peer may have moved on again and a new peer may be
+    /// using it, so a datagram from one goes to that connection only if it is a
+    /// short-header packet carrying one of the connection's ids; anything else
+    /// (a new peer's Initial) is left to the connection-id lookup and, failing
+    /// that, to accept. And a short-header packet on a started-on tuple that does
+    /// not carry the connection's id may belong to another connection whose peer
+    /// rebound onto that tuple: the connection-id lookup decides.
+    QuicPump find(string key, scope const(ubyte)[] pkt)
+    {
+        immutable shortHdr = pkt.length && (pkt[0] & 0x80) == 0;
+        if (auto q = key in _byTuple)
+        {
+            if (shortHdr && !(*q).connection.ownsCid(shortDcid(pkt)))
+                if (auto other = byConnectionId(pkt))
+                    return other;
+            return *q;
+        }
+        if (auto m = key in _moved)
+            if (shortHdr && m.pump.connection.ownsCid(shortDcid(pkt)))
+                return m.pump;
+        return byConnectionId(pkt);
+    }
+
+    /// The connection that started on tuple `key` (a connection's own tuple; not
+    /// one it moved to), or null.
+    inout(QuicPump)* opBinaryRight(string op : "in")(string key) inout
+    {
+        return key in _byTuple;
+    }
+
+    void add(string key, QuicPump pump)
+    {
+        _byTuple[key] = pump;
+    }
+
+    /// Drop every tuple of `pump` (it closed). Identity-checked: a newer pump under
+    /// the same tuple stays.
+    void remove(QuicPump pump) nothrow
+    {
+        try
+        {
+            string[] doomed;
+            foreach (k, p; _byTuple)
+                if (p is pump)
+                    doomed ~= k;
+            foreach (k; doomed)
+                _byTuple.remove(k);
+            doomed = null;
+            foreach (k, m; _moved)
+                if (m.pump is pump)
+                    doomed ~= k;
+            foreach (k; doomed)
+                _moved.remove(k);
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    size_t length() const nothrow @safe
+    {
+        return _byTuple.length;
+    }
+
+    QuicPump[] pumps()
+    {
+        return _byTuple.values;
+    }
+
+    private static const(ubyte)[] shortDcid(return scope const(ubyte)[] pkt)
+    {
+        // Short headers carry no id length: ours are always 16 bytes (randomCid,
+        // and ngtcp2 asks get_new_connection_id for the same length).
+        return pkt.length >= 17 ? pkt[1 .. 17] : null;
+    }
+
+    /// The live connection a datagram belongs to by its destination connection id;
+    /// null if none (a stranger, or a new connection's Initial). One scan over the
+    /// socket's connections — a punch socket carries a handful.
+    QuicPump byConnectionId(scope const(ubyte)[] pkt)
+    {
+        import libp2p.transport.quic.ngtcp2 : ngtcp2_version_cid, ngtcp2_pkt_decode_version_cid;
+
+        ngtcp2_version_cid vc;
+        if (ngtcp2_pkt_decode_version_cid(&vc, pkt.ptr, pkt.length, 16) != 0 || vc.dcidlen == 0)
+            return null;
+        auto dcid = vc.dcid[0 .. vc.dcidlen];
+        foreach (p; _byTuple.byValue)
+            if (p.connection.ownsCid(dcid))
+                return p;
+        return null;
+    }
+
+    /// After `pump` took a datagram from `key`, a tuple it was not demuxed under:
+    /// once the connection has moved onto that address, route the tuple straight
+    /// to it.
+    void noteMoved(string key, QuicPump pump, scope const(ubyte)[] from)
+    {
+        if (pump.isClosed || !pump.connection.isPeerAt(from))
+            return;
+        if (auto q = key in _byTuple)
+            if (*q is pump)
+                return; // its own starting tuple (it moved back)
+        string oldest;
+        ulong oldestSeq = ulong.max;
+        size_t mine;
+        foreach (k, m; _moved)
+            if (m.pump is pump)
+            {
+                mine++;
+                if (m.seq < oldestSeq)
+                {
+                    oldestSeq = m.seq;
+                    oldest = k;
+                }
+            }
+        if (mine >= maxMovesPerPump && (key in _moved) is null)
+            _moved.remove(oldest);
+        _moved[key] = Moved(pump, ++_movedSeq);
+    }
+}
+
 /// The per-connection engine: pushes whatever the QuicConnection wants to send through
 /// a `send` delegate, drives the timer, and signals handshake completion. Transport-
 /// neutral (no socket) — a driver feeds it inbound packets via `deliver`.
 final class QuicPump
 {
     private QuicConnection _conn;
-    private void delegate(scope const(ubyte)[]) _send;
+    private void delegate(scope const(ubyte)[] pkt, scope const(ubyte)[] to) _send;
     private Timer _timer;
     private LocalManualEvent _handshakeEvent;
     private bool _closed;
     private bool _flushing, _flushAgain; // one flusher at a time (see serviceOut)
 
-    this(QuicConnection conn, void delegate(scope const(ubyte)[]) send)
+    /// `send(pkt, to)`: put one datagram on the wire toward `to` (raw sockaddr bytes,
+    /// the path ngtcp2 chose for it; empty = the connection's original peer).
+    this(QuicConnection conn, void delegate(scope const(ubyte)[] pkt, scope const(ubyte)[] to) send)
     {
         _conn = conn;
         _send = send;
@@ -87,12 +259,13 @@ final class QuicPump
         serviceOut();
     }
 
-    /// Feed one received QUIC packet in, then flush any response.
-    void deliver(scope const(ubyte)[] packet)
+    /// Feed one received QUIC packet in, then flush any response. `from` is the
+    /// sender's raw sockaddr (see QuicConnection.deliver); empty = the original peer.
+    void deliver(scope const(ubyte)[] packet, scope const(ubyte)[] from = null)
     {
         if (_closed)
             return;
-        _conn.deliver(packet);
+        _conn.deliver(packet, from);
         serviceOut();
     }
 
@@ -100,8 +273,9 @@ final class QuicPump
     void delegate() nothrow onClosed;
 
     /// One send that never waits (see trySendNow), set by the socket's owner; used for
-    /// the terminal CONNECTION_CLOSE. Null = no farewell packet.
-    bool delegate(scope const(ubyte)[]) nothrow trySend;
+    /// the terminal CONNECTION_CLOSE, toward `to` (raw sockaddr; empty = the original
+    /// peer). Null = no farewell packet.
+    bool delegate(scope const(ubyte)[] pkt, scope const(ubyte)[] to) nothrow trySend;
 
     void waitForHandshake()
     {
@@ -136,6 +310,11 @@ final class QuicPump
     QuicConnection connection()
     {
         return _conn;
+    }
+
+    bool isClosed() const nothrow @safe
+    {
+        return _closed;
     }
 
     void close()
@@ -177,7 +356,7 @@ final class QuicPump
         do
         {
             _flushAgain = false;
-            _conn.collectOutgoing((scope const(ubyte)[] pkt) { _send(pkt); });
+            _conn.collectOutgoing((scope const(ubyte)[] pkt, scope const(ubyte)[] to) { _send(pkt, to); });
         }
         while (_flushAgain && !_closed);
         if (_closed)
@@ -223,7 +402,7 @@ final class QuicPump
                     {
                         auto farewell = _conn.terminalPacket(rv, scratch[]);
                         if (farewell.length)
-                            cast(void) trySend(farewell);
+                            cast(void) trySend(farewell, _conn.remoteAddr());
                     }
                     catch (Exception)
                     {
@@ -306,7 +485,8 @@ final class QuicClient
         _sendLock = new TaskMutex;
         _conn = QuicConnection.dial(identity, addrBytes(_udp.localAddress), addrBytes(peer));
         _pump = new QuicPump(_conn, &send);
-        _pump.trySend = (scope const(ubyte)[] pkt) nothrow => trySendNow(_udp, _sendLock, pkt, _peer);
+        _pump.trySend = (scope const(ubyte)[] pkt, scope const(ubyte)[] to) nothrow
+            => trySendNow(_udp, _sendLock, pkt, fromAddrBytes(to, _peer));
         // When the muxer above (or an idle/handshake timeout) closes the pump, close
         // OUR udp socket too: otherwise a swarm connection close frees the muxer but
         // leaks this socket and its recv-parked reader fiber until transport shutdown.
@@ -320,9 +500,9 @@ final class QuicClient
         return _udp.localAddress;
     }
 
-    private void send(scope const(ubyte)[] pkt)
+    private void send(scope const(ubyte)[] pkt, scope const(ubyte)[] dst)
     {
-        auto to = _peer;
+        auto to = fromAddrBytes(dst, _peer);
         synchronized (_sendLock)
             _udp.send(pkt, &to);
     }
@@ -336,7 +516,7 @@ final class QuicClient
             {
                 NetworkAddress from;
                 auto pkt = _udp.recv(buf[], &from);
-                _pump.deliver(pkt);
+                _pump.deliver(pkt, sockBytes(from));
             }
             catch (Exception)
             {
@@ -382,7 +562,7 @@ final class QuicClient
 final class QuicListener
 {
     private UDPConnection _udp;
-    private QuicPump[string] _pumps; // keyed by source address
+    private PumpDemux _pumps; // by source address, then by connection id
     private Keypair _identity;
     private TaskMutex _sendLock; // one send in flight on the shared socket
     void delegate(QuicConnection, NetworkAddress) nothrow onAccept;
@@ -400,17 +580,19 @@ final class QuicListener
         return _udp.localAddress;
     }
 
-    // Build a send delegate bound to one peer — `peer` BY VALUE so each pump captures
-    // its own address (a loop-local would be shared across iterations).
-    private bool delegate(scope const(ubyte)[]) nothrow trySender(NetworkAddress peer)
+    // Build a send delegate for one peer — `peer` BY VALUE so each pump captures its
+    // own address (a loop-local would be shared across iterations). The peer is only
+    // the default: each packet goes where ngtcp2's path for it says (a migration).
+    private bool delegate(scope const(ubyte)[], scope const(ubyte)[]) nothrow trySender(NetworkAddress peer)
     {
-        return (scope const(ubyte)[] pkt) nothrow => trySendNow(_udp, _sendLock, pkt, peer);
+        return (scope const(ubyte)[] pkt, scope const(ubyte)[] to) nothrow
+            => trySendNow(_udp, _sendLock, pkt, fromAddrBytes(to, peer));
     }
 
-    private void delegate(scope const(ubyte)[]) sender(NetworkAddress peer)
+    private void delegate(scope const(ubyte)[], scope const(ubyte)[]) sender(NetworkAddress peer)
     {
-        return (scope const(ubyte)[] pkt) {
-            auto to = peer;
+        return (scope const(ubyte)[] pkt, scope const(ubyte)[] dst) {
+            auto to = fromAddrBytes(dst, peer);
             synchronized (_sendLock)
                 _udp.send(pkt, &to);
         };
@@ -435,18 +617,20 @@ final class QuicListener
             try
             {
                 immutable key = from.toString();
-                if (auto p = key in _pumps)
+                // By tuple, or — a peer whose NAT rebound — by connection id.
+                if (auto p = _pumps.find(key, pkt))
                 {
-                    p.deliver(pkt);
+                    p.deliver(pkt, sockBytes(from));
+                    _pumps.noteMoved(key, p, sockBytes(from));
                     continue;
                 }
                 // New peer: build a server conn from its first Initial.
                 conn = QuicConnection.accept(_identity, pkt, addrBytes(_udp.localAddress), addrBytes(from));
                 pump = new QuicPump(conn, sender(from));
                 pump.trySend = trySender(from);
-                _pumps[key] = pump;
-                untrackOnClose(key, pump);
-                pump.deliver(pkt);
+                _pumps.add(key, pump);
+                untrackOnClose(pump);
+                pump.deliver(pkt, sockBytes(from));
                 spawnAccept(pump, conn, from, onAccept);
             }
             catch (Exception)
@@ -469,13 +653,9 @@ final class QuicListener
     // Leave the demux when the pump closes (idle expiry, a swarm close), so a later
     // Initial from the same address starts a fresh connection instead of feeding a
     // dead pump. Identity-checked: a newer pump under the same key stays.
-    private void untrackOnClose(string key, QuicPump pump)
+    private void untrackOnClose(QuicPump pump)
     {
-        pump.onClosed = () nothrow {
-            if (auto p = key in _pumps)
-                if (*p is pump)
-                    _pumps.remove(key);
-        };
+        pump.onClosed = () nothrow { _pumps.remove(pump); };
     }
 
     // One call per new peer, so the accept task gets its OWN frame: captured straight
@@ -499,7 +679,7 @@ final class QuicListener
 
     void close()
     {
-        foreach (p; _pumps.values) // a snapshot: each close removes its own entry (untrackOnClose)
+        foreach (p; _pumps.pumps) // a snapshot: each close removes its own entries (untrackOnClose)
             p.close();
         _udp.close(); // ends the recv-parked readLoop fiber
     }
