@@ -172,6 +172,35 @@
 			]
 		},
 		{
+			"name": "ut-no-quic",
+			"targetType": "executable",
+			"targetName": "libp2p-test-noquic",
+			"mainSourceFile": "tests/runner.d",
+			"sourcePaths": [
+				"source",
+				"tests"
+			],
+			"importPaths": [
+				"source",
+				"tests"
+			],
+			"dependencies": {
+				"unit-threaded": "~>2.2",
+				"fluent-asserts": "~>2.0",
+				"webrtc": {
+					"path": "../d-webrtc-v3"
+				}
+			},
+			"libs": [
+				"crypto",
+				"cares",
+				"ssl"
+			],
+			"dflags": [
+				"-unittest"
+			]
+		},
+		{
 			"name": "relay-node",
 			"targetType": "executable",
 			"targetName": "relay-node",

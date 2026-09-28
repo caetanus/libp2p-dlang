@@ -5,13 +5,14 @@ on:
     branches: [master]
   pull_request:
 
-# Core compile gate. The full unit suite (388 tests) links QUIC (ngtcp2 +
-# OpenSSL 3.5 QUIC-TLS) and the WebRTC engine (path dependency ../d-webrtc-v3),
-# a heavier toolchain built locally and exercised on the two-NAT rig; this gate
-# compiles the core library (no WebRTC, no QUIC) so a break in the common code
-# is caught on every push.
+# Runs the bulk of the unit suite (~389 tests). The QUIC handshake tests are
+# excluded here (ut-no-quic drops the Libp2pQuic version) because ngtcp2 +
+# OpenSSL 3.5 QUIC-TLS is a heavier toolchain built locally and exercised on the
+# two-NAT rig; everything else — TCP, Noise, yamux/mplex, swarm, identify, kad,
+# relay/DCUtR orchestration, mDNS, WebRTC — runs on every push. The WebRTC
+# engine is a path dependency (../d-webrtc-v3), cloned as a sibling below.
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,10 +20,15 @@ jobs:
       - name: System deps
         run: sudo apt-get update && sudo apt-get install -y libsodium-dev libssl-dev libc-ares-dev
 
+      - name: Fetch the WebRTC engine (path dependency ../d-webrtc-v3)
+        run: git clone --depth 1 --branch v3 https://github.com/caetanus/d-webrtc.git ../d-webrtc-v3
+
       - name: Install LDC
         uses: dlang-community/setup-dlang@v2
         with:
           compiler: ldc-latest
 
-      - name: Compile the core library
-        run: dub build -c library-no-webrtc --compiler=ldc2
+      - name: Build + run the unit suite (QUIC excluded)
+        run: |
+          dub build -c ut-no-quic --compiler=ldc2
+          ./bin/libp2p-test-noquic
